@@ -79,9 +79,17 @@
         } catch (_) {}
     }
 
-    function applyGalgameBodyClass(enabled) {
+    // composer 隐藏（请她离开）时强制视为 OFF：保留 state.galgameModeEnabled，
+    // 但摘掉 body class，让 chat.html / preload-chat-react 里依赖该 class 的
+    // 高最小高度 / 窗口最小高度 CSS 不再撑住空白输入区。
+    // body class 切换、change 事件 payload 都走这个 helper，避免逻辑分叉。
+    function getEffectiveGalgameEnabled() {
+        return !!state.galgameModeEnabled && !state.composerHidden;
+    }
+
+    function applyGalgameBodyClass() {
         if (typeof document === 'undefined' || !document.body) return;
-        document.body.classList.toggle('galgame-mode-enabled', !!enabled);
+        document.body.classList.toggle('galgame-mode-enabled', getEffectiveGalgameEnabled());
     }
 
     // 镜像 galgame 的 body class 策略：附件区（截图 / 导入图片）出现时贴
@@ -1166,13 +1174,16 @@
             // the 30s timeout (or finishes and is silently discarded).
             abortPendingGalgameFetch();
         }
-        applyGalgameBodyClass(next);
+        applyGalgameBodyClass();
         if ((!requestOptions || requestOptions.persist !== false) && !isGalgameModeTemporarilyDisabled()) {
             persistGalgameModePreference(next);
         }
         renderWindow();
         if (changed) {
-            dispatchHostEvent('galgame-mode-change', { enabled: next });
+            // 派发 effective 值（与 body class 一致）：composer 隐藏期间即使
+            // setGalgameModeEnabled(true) 也广播 enabled=false，避免监听器
+            // (chat.html syncWindowToGalgameMin 等) 与 body class 状态分歧。
+            dispatchHostEvent('galgame-mode-change', { enabled: getEffectiveGalgameEnabled() });
             // OFF→ON: if the chat overlay is currently visible, refetch the
             // latest turn's options so the user sees A/B/C immediately rather
             // than waiting for the next turn-end. Gating on overlay visibility
@@ -1706,7 +1717,19 @@
     }
 
     function setComposerHidden(hidden) {
-        state.composerHidden = !!hidden;
+        var next = !!hidden;
+        var changed = state.composerHidden !== next;
+        state.composerHidden = next;
+        if (changed) {
+            // composer 隐藏/显示切换会改变 effective galgame body class（参见
+            // applyGalgameBodyClass），同步刷新一次；否则在 galgame ON 期间
+            // 触发请她离开，body 仍带 galgame-mode-enabled，min-height:385px 撑住
+            // 窗口底部一片空白，被用户感知为"输入框没隐藏"。
+            applyGalgameBodyClass();
+            // 复用现有 change 事件通知 chat.html 的 syncWindowToGalgameMin 等监听器
+            // 重新评估窗口最小高度；effective OFF 时它会跳过撑高（b.height >= minH 兜底）。
+            dispatchHostEvent('galgame-mode-change', { enabled: getEffectiveGalgameEnabled() });
+        }
         renderWindow();
     }
 
