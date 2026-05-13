@@ -38,6 +38,7 @@
             proactiveVideoChatEnabled: S.proactiveVideoChatEnabled,
             proactivePersonalChatEnabled: S.proactivePersonalChatEnabled,
             proactiveMusicEnabled: S.proactiveMusicEnabled,
+            proactiveMemeEnabled: S.proactiveMemeEnabled,
             proactiveMiniGameInviteEnabled: S.proactiveMiniGameInviteEnabled,
             mergeMessagesEnabled: S.mergeMessagesEnabled,
             focusModeEnabled: S.focusModeEnabled,
@@ -336,7 +337,8 @@
                     settings.proactiveVideoChatEnabled !== undefined ||
                     settings.proactivePersonalChatEnabled !== undefined ||
                     settings.proactiveMusicEnabled !== undefined ||
-                    settings.proactiveMemeEnabled !== undefined;
+                    settings.proactiveMemeEnabled !== undefined ||
+                    settings.proactiveMiniGameInviteEnabled !== undefined;
                     if (!hasNewFlags) {
                         // 根据旧的视觉偏好决定迁移策略
                         if (settings.proactiveVisionEnabled === false) {
@@ -578,6 +580,8 @@
                     window.proactiveVideoChatEnabled = S.proactiveVideoChatEnabled;
                     window.proactivePersonalChatEnabled = S.proactivePersonalChatEnabled;
                     window.proactiveMusicEnabled = S.proactiveMusicEnabled;
+                    window.proactiveMemeEnabled = S.proactiveMemeEnabled;
+                    window.proactiveMiniGameInviteEnabled = S.proactiveMiniGameInviteEnabled;
                     window.mergeMessagesEnabled = S.mergeMessagesEnabled;
                     window.focusModeEnabled = S.focusModeEnabled;
                     window.avatarReactionBubbleEnabled = S.avatarReactionBubbleEnabled;
