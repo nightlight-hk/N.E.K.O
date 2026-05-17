@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import sys
 
 import pytest
 
@@ -124,6 +125,114 @@ def test_resolve_quantization_invalid_falls_back_to_auto():
         _resolve_quantization("garbage", has_vnni=False, vnni_absence_confirmed=False)
         == "int8"
     )
+
+
+def test_detect_avx_vnni_arm64_apple_short_circuits(monkeypatch):
+    """Apple Silicon ships only dotprod-capable cores (M1+ universally),
+    so detection must claim the INT8 fast path without inspecting flags.
+    Without this, M-series Macs fall into the "VNNI required for int8"
+    disable branch even though INT8 inference runs fine on them.
+    """
+    from memory import embeddings as emb_mod
+
+    monkeypatch.setattr(emb_mod.platform, "machine", lambda: "arm64")
+    monkeypatch.setattr(emb_mod.platform, "system", lambda: "Darwin")
+    assert emb_mod.detect_avx_vnni_details() == (True, True)
+
+
+def test_detect_avx_vnni_arm64_windows_uses_processor_feature(monkeypatch):
+    """Windows-on-ARM must call ``IsProcessorFeaturePresent`` rather than
+    assuming support — first-gen WoA (Snapdragon 835, 2017) is ARMv8-A
+    without dotprod, so hard-coding True would silently enable a slow
+    INT8 path on that hardware (Codex review on PR #1394)."""
+    import ctypes
+    from memory import embeddings as emb_mod
+
+    monkeypatch.setattr(emb_mod.platform, "machine", lambda: "ARM64")
+    monkeypatch.setattr(emb_mod.platform, "system", lambda: "Windows")
+
+    class _FakeKernel32:
+        def __init__(self, present: int) -> None:
+            self._present = present
+
+        def IsProcessorFeaturePresent(self, feature: int) -> int:  # noqa: N802
+            # 43 == PF_ARM_V82_DP_INSTRUCTIONS_AVAILABLE
+            assert feature == 43
+            return self._present
+
+    class _FakeWindll:
+        def __init__(self, present: int) -> None:
+            self.kernel32 = _FakeKernel32(present)
+
+    # Modern Snapdragon X / 8cx — kernel reports dotprod present.
+    monkeypatch.setattr(ctypes, "windll", _FakeWindll(present=1), raising=False)
+    assert emb_mod.detect_avx_vnni_details() == (True, True)
+
+    # API returning 0 is ambiguous (could be Snapdragon 835 lacking
+    # dotprod, could be an older Win10 ARM build that doesn't know
+    # feature 43). Stay inconclusive rather than false-disabling on
+    # capable hardware — Codex P1 on PR #1394.
+    monkeypatch.setattr(ctypes, "windll", _FakeWindll(present=0), raising=False)
+    assert emb_mod.detect_avx_vnni_details() == (False, False)
+
+
+def test_detect_avx_vnni_arm64_linux_checks_asimddp(monkeypatch):
+    """Linux ARM must verify the ``asimddp`` feature flag — old Cortex-A53
+    / A57 / A72 cores are aarch64 but predate ARMv8.2-A dotprod, so being
+    optimistic would silently run the slow path on a Raspberry Pi 3."""
+    from memory import embeddings as emb_mod
+
+    monkeypatch.setattr(emb_mod.platform, "machine", lambda: "aarch64")
+    monkeypatch.setattr(emb_mod.platform, "system", lambda: "Linux")
+
+    class _FakeCpuinfoModern:
+        @staticmethod
+        def get_cpu_info():
+            return {"flags": ["fp", "asimd", "asimddp", "sha2"]}
+
+    class _FakeCpuinfoOld:
+        @staticmethod
+        def get_cpu_info():
+            return {"flags": ["fp", "asimd", "sha2"]}  # pre-dotprod
+
+    monkeypatch.setitem(sys.modules, "cpuinfo", _FakeCpuinfoModern)
+    assert emb_mod.detect_avx_vnni_details() == (True, True)
+
+    monkeypatch.setitem(sys.modules, "cpuinfo", _FakeCpuinfoOld)
+    assert emb_mod.detect_avx_vnni_details() == (False, True)
+
+
+def test_detect_avx_vnni_arm64_linux_proc_cpuinfo_fallback(monkeypatch):
+    """Linux ARM falls back to /proc/cpuinfo when py-cpuinfo is
+    unavailable. Unlike x86 which uses ``flags``, ARM Linux exposes the
+    feature list under a capital-F ``Features`` line — make sure the
+    parser hits that branch and reads asimddp/dotprod correctly."""
+    from unittest.mock import mock_open
+    from memory import embeddings as emb_mod
+
+    monkeypatch.setattr(emb_mod.platform, "machine", lambda: "aarch64")
+    monkeypatch.setattr(emb_mod.platform, "system", lambda: "Linux")
+
+    class _BrokenCpuinfo:
+        @staticmethod
+        def get_cpu_info():
+            raise RuntimeError("simulated cpuinfo failure")
+
+    monkeypatch.setitem(sys.modules, "cpuinfo", _BrokenCpuinfo)
+
+    proc_modern = (
+        "processor\t: 0\n"
+        "Features\t: fp asimd evtstrm aes pmull sha2 crc32 asimddp\n"
+    )
+    monkeypatch.setattr("builtins.open", mock_open(read_data=proc_modern))
+    assert emb_mod.detect_avx_vnni_details() == (True, True)
+
+    proc_old = (
+        "processor\t: 0\n"
+        "Features\t: fp asimd evtstrm aes pmull sha2 crc32\n"  # pre-dotprod
+    )
+    monkeypatch.setattr("builtins.open", mock_open(read_data=proc_old))
+    assert emb_mod.detect_avx_vnni_details() == (False, True)
 
 
 def test_parse_dim_from_model_id_picks_runtime_dim_under_ambiguous_profile():
