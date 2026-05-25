@@ -339,8 +339,6 @@ psutil==7.2.2
     # via
     #   browser-use
     #   n-e-k-o
-py-cpuinfo==9.0.0
-    # via n-e-k-o
 pyasn1==0.6.1
     # via
     #   pyasn1-modules
