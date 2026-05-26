@@ -16,7 +16,7 @@ from .ocr_runtime_types import (
     _rapidocr_text_from_output,
     _store_rapidocr_runtime_cache,
 )
-from plugin.plugins._shared.rapidocr.rapidocr_support import (
+from .rapidocr_support import (
     inspect_rapidocr_installation,
     load_rapidocr_runtime,
 )
@@ -32,15 +32,17 @@ class RapidOcrBackend:
         lang_type: str,
         model_type: str,
         ocr_version: str,
+        plugin_id: str,
     ) -> None:
         self._install_target_dir_raw = install_target_dir_raw
         self._engine_type = engine_type
         self._lang_type = lang_type
         self._model_type = model_type
         self._ocr_version = ocr_version
+        self._plugin_id = plugin_id
         self._runtime = None
         self._runtime_lock = threading.Lock()
-        self._runtime_cache_key: tuple[str, str, str, str, str] | None = None
+        self._runtime_cache_key: tuple[str, str, str, str, str, str] | None = None
         self._runtime_last_used_at = 0.0
         self._warmup_started = False
         self._warmup_completed = False
@@ -53,7 +55,7 @@ class RapidOcrBackend:
             lang_type=self._lang_type,
             model_type=self._model_type,
             ocr_version=self._ocr_version,
-            plugin_id="galgame_plugin",
+            plugin_id=self._plugin_id,
         )
         return bool(inspection.get("installed"))
 
@@ -65,6 +67,7 @@ class RapidOcrBackend:
             lang_type=self._lang_type,
             model_type=self._model_type,
             ocr_version=self._ocr_version,
+            plugin_id=self._plugin_id,
         )
         with self._runtime_lock:
             if (
@@ -88,7 +91,7 @@ class RapidOcrBackend:
                         lang_type=self._lang_type,
                         model_type=self._model_type,
                         ocr_version=self._ocr_version,
-                        plugin_id="galgame_plugin",
+                        plugin_id=self._plugin_id,
                     )
                     _store_rapidocr_runtime_cache(key, runtime, now=now)
             self._runtime = runtime
@@ -117,7 +120,7 @@ class RapidOcrBackend:
                     except Exception:
                         pass
 
-        threading.Thread(target=_warmup, name="galgame-rapidocr-warmup", daemon=True).start()
+        threading.Thread(target=_warmup, name="shared-rapidocr-warmup", daemon=True).start()
 
     def extract_text(self, image: Any) -> str:
         import numpy as np
