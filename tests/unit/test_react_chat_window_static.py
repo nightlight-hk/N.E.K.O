@@ -282,6 +282,60 @@ def test_compact_surface_resize_handles_keep_width_in_dom_geometry_contract():
     assert "right: -4px;" in styles
 
 
+def test_mobile_web_compact_surface_respects_width_bounds_and_position_vars():
+    script = APP_REACT_CHAT_WINDOW_PATH.read_text(encoding="utf-8")
+    styles = STATIC_INDEX_CSS_PATH.read_text(encoding="utf-8")
+    app_source = REACT_CHAT_APP_PATH.read_text(encoding="utf-8")
+
+    mobile_compact_block = css_block(
+        styles,
+        'body:not(.electron-chat-window):where(:not(.lanlan-pet-mode)) #react-chat-window-shell[data-chat-surface-mode="compact"]:not(.is-minimized):not(.is-collapsing):not(.is-expanding) {',
+        'body:not(.electron-chat-window):where(:not(.lanlan-pet-mode)) #react-chat-window-shell #react-chat-window-root',
+    )
+    mobile_compact_overflow_block = css_block(
+        styles,
+        'body:not(.electron-chat-window):where(:not(.lanlan-pet-mode)) #react-chat-window-shell[data-chat-surface-mode="compact"]:not(.is-minimized):not(.is-collapsing):not(.is-expanding) #react-chat-window-root,',
+        'body:not(.electron-chat-window):where(:not(.lanlan-pet-mode)) #react-chat-window-shell .app-shell',
+    )
+    metrics_block = script.split("function getCompactSurfaceMetrics()", 1)[1].split(
+        "function clampCompactSurfacePosition(left, top, metrics)",
+        1,
+    )[0]
+    stored_width_block = script.split("function loadCompactSurfaceStoredWidth()", 1)[1].split(
+        "function saveCompactSurfacePosition",
+        1,
+    )[0]
+    resize_clamp_block = script.split("function clampCompactSurfaceResizeWidthForSide", 1)[1].split(
+        "function applyCompactSurfaceResizeRequest",
+        1,
+    )[0]
+    mobile_width_bounds_block = script.split("function getCompactSurfaceMobileWidthBounds()", 1)[1].split(
+        "function getCompactSurfaceResizeMaxWidth()",
+        1,
+    )[0]
+
+    assert "COMPACT_SURFACE_RESIZE_MOBILE_MIN_WIDTH = 280" in app_source
+    assert "COMPACT_SURFACE_RESIZE_MOBILE_VIEWPORT_GUTTER = 16" in app_source
+    assert "getCompactSurfaceResizeMinAvailableWidth" in app_source
+    assert "getCompactSurfaceResizeViewportGutter" in app_source
+    assert "maxAvailableWidth - viewportGutter" in app_source
+    assert "window.innerWidth <= 768" in app_source
+    assert "lanlan-pet-mode" in app_source
+    assert "__LANLAN_IS_ELECTRON_PET__" in app_source
+    assert "COMPACT_SURFACE_MOBILE_MIN_WIDTH = 280" in script
+    assert "COMPACT_SURFACE_MOBILE_VIEWPORT_GUTTER" in script
+    assert "COMPACT_SURFACE_RESIZE_MAX_WIDTH" in mobile_width_bounds_block
+    assert "viewportWidth - COMPACT_SURFACE_MOBILE_VIEWPORT_GUTTER" in mobile_width_bounds_block
+    assert "isMobileWidth() && storedWidth" in metrics_block
+    assert "getCompactSurfaceMobileWidthBounds().minWidth" in stored_width_block
+    assert "getCompactSurfaceMobileWidthBounds().minWidth" in resize_clamp_block
+    assert "width: var(--compact-surface-width, calc(100vw - 16px)) !important;" in mobile_compact_block
+    assert "left: var(--compact-surface-left, 8px) !important;" in mobile_compact_block
+    assert "right: auto;" in mobile_compact_block
+    assert ".chat-window.chat-surface-mode-compact" in mobile_compact_overflow_block
+    assert "overflow: visible;" in mobile_compact_overflow_block
+
+
 def test_compact_tool_fan_uses_shell_local_anchor_not_fixed_viewport_position():
     styles = REACT_CHAT_STYLES_PATH.read_text(encoding="utf-8")
     script = APP_REACT_CHAT_WINDOW_PATH.read_text(encoding="utf-8")
@@ -510,6 +564,10 @@ def test_compact_surface_drag_uses_declared_surface_and_no_drag_exclusions():
     )[0]
     assert "if (!isCompactDragSurfaceTarget(event.target)) return;" in touch_block
     assert "compactSurface: true" in touch_block
+    assert "compact capsule must still synthesize click" in touch_block
+    assert "event.preventDefault();" not in touch_block
+    assert "event.stopPropagation();" not in touch_block
+    assert "}, { capture: true, passive: true });" in touch_block
 
 
 def test_moved_drag_suppresses_trailing_release_click():
@@ -811,41 +869,43 @@ def test_compact_history_hit_contract_keeps_transparent_wrappers_out_of_hit_regi
 def test_subtitle_web_host_keeps_compact_history_transparent_wrappers_click_through():
     styles = STATIC_INDEX_CSS_PATH.read_text(encoding="utf-8")
 
-    broad_surface_selector = (
+    compact_surface_prefix = (
         'body.subtitle-web-host #react-chat-window-shell[data-chat-surface-mode="compact"]:not(.is-minimized):'
-        'not(.is-collapsing):not(.is-expanding) [data-compact-geometry-owner="surface"] *'
+        'not(.is-collapsing):not(.is-expanding)'
     )
-    history_anchor_selector = (
-        'body.subtitle-web-host #react-chat-window-shell[data-chat-surface-mode="compact"]:not(.is-minimized):'
-        'not(.is-collapsing):not(.is-expanding) .compact-export-history-anchor'
+    broad_surface_rule = (
+        f'{compact_surface_prefix} [data-compact-geometry-owner="surface"],\n'
+        f'{compact_surface_prefix} [data-compact-geometry-owner="surface"] *,\n'
+        f'{compact_surface_prefix} #reactChatWindowMinimizeButton,\n'
+        f'{compact_surface_prefix} #reactChatWindowMinimizeButton *,\n'
+        f'{compact_surface_prefix} .compact-input-tool-fan[data-compact-input-tool-fan-open="true"],\n'
+        f'{compact_surface_prefix} .compact-input-tool-fan[data-compact-input-tool-fan-open="true"] * {{\n'
+        "    pointer-events: auto;\n"
+        "}"
     )
-    history_bubble_selector = (
-        'body.subtitle-web-host #react-chat-window-shell[data-chat-surface-mode="compact"]:not(.is-minimized):'
-        'not(.is-collapsing):not(.is-expanding) .compact-export-history-bubble'
+    history_passthrough_rule = (
+        f'{compact_surface_prefix} .compact-export-history-anchor,\n'
+        f'{compact_surface_prefix} .compact-export-history-panel,\n'
+        f'{compact_surface_prefix} .compact-export-history-scroll,\n'
+        f'{compact_surface_prefix} .compact-export-history-scroll-content,\n'
+        f'{compact_surface_prefix} .compact-export-history-message {{\n'
+        "    pointer-events: none;\n"
+        "}"
+    )
+    history_interactive_rule = (
+        f'{compact_surface_prefix} .compact-export-history-bubble,\n'
+        f'{compact_surface_prefix} .compact-export-history-controls,\n'
+        f'{compact_surface_prefix} .compact-export-preview-region {{\n'
+        "    pointer-events: auto;\n"
+        "}"
     )
 
-    assert broad_surface_selector in styles
-    assert history_anchor_selector in styles
-    assert history_bubble_selector in styles
-    assert styles.index(broad_surface_selector) < styles.index(history_anchor_selector)
-
-    passthrough_block = styles.split(history_anchor_selector, 1)[1].split(history_bubble_selector, 1)[0]
-    interactive_block = styles.split(history_bubble_selector, 1)[1].split(
-        'body.subtitle-web-host #react-chat-window-shell[data-chat-surface-mode="compact"]:not(.is-minimized):not(.is-collapsing):not(.is-expanding) #reactChatWindowMinimizeButton',
-        1,
-    )[0]
-
-    for selector in (
-        ".compact-export-history-panel",
-        ".compact-export-history-scroll",
-        ".compact-export-history-scroll-content",
-        ".compact-export-history-message",
-    ):
-        assert selector in passthrough_block
-    assert "pointer-events: none;" in passthrough_block
-    assert ".compact-export-history-controls" in interactive_block
-    assert ".compact-export-preview-region" in interactive_block
-    assert "pointer-events: auto;" in interactive_block
+    assert broad_surface_rule in styles
+    assert history_passthrough_rule in styles
+    assert history_interactive_rule in styles
+    assert styles.index(broad_surface_rule) < styles.index(history_passthrough_rule)
+    assert styles.index(history_passthrough_rule) < styles.index(history_interactive_rule)
+    assert ".compact-export-history-scroll,\n" in history_passthrough_rule
 
 
 def test_compact_inline_export_uses_windowless_app_chat_export_api():
