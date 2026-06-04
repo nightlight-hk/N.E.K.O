@@ -1745,6 +1745,13 @@
         }
     }
 
+    function appendYuiGuideChatMessage(message) {
+        if (!isStandaloneChatPage()) return;
+        if (!message || typeof message !== 'object') return;
+        _pendingYuiGuideChatMessages.push(message);
+        scheduleYuiGuideChatMessageFlush(0);
+    }
+
     function updatePendingYuiGuideChatMessage(messageId, patch) {
         var targetId = String(messageId || '');
         if (!targetId || !patch || typeof patch !== 'object') {
@@ -1760,13 +1767,6 @@
             return Object.assign({}, message, patch);
         });
         return updated;
-    }
-
-    function appendYuiGuideChatMessage(message) {
-        if (!isStandaloneChatPage()) return;
-        if (!message || typeof message !== 'object') return;
-        _pendingYuiGuideChatMessages.push(message);
-        scheduleYuiGuideChatMessageFlush(0);
     }
 
     function updateYuiGuideChatMessage(messageId, patch) {
@@ -2291,7 +2291,11 @@
         }
 
         if (kind === 'input') {
-            return document.querySelector('#react-chat-window-root .composer-panel')
+            return document.querySelector('#react-chat-window-root [data-compact-geometry-owner="surface"][data-compact-geometry-item="input"]')
+                || document.querySelector('#react-chat-window-root [data-compact-geometry-owner="surface"][data-compact-geometry-item="capsule"]')
+                || document.querySelector('#react-chat-window-root .compact-chat-surface-frame')
+                || document.querySelector('#react-chat-window-root .compact-chat-surface-shell')
+                || document.querySelector('#react-chat-window-root .composer-panel')
                 || document.querySelector('#react-chat-window-root .composer-input-shell')
                 || document.getElementById('text-input-area');
         }
@@ -2328,7 +2332,7 @@
         }
 
         var padding = kind === 'window' ? 10 : 8;
-        var radius = kind === 'window' ? 26 : 18;
+        var radius = kind === 'window' ? 26 : Math.min(34, Math.max(18, Math.round((rect.height + padding * 2) / 2)));
         spotlight.hidden = false;
         spotlight.classList.remove('is-window', 'is-input');
         spotlight.classList.add(kind === 'window' ? 'is-window' : 'is-input');

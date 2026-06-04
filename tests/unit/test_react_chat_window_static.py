@@ -322,6 +322,7 @@ def test_compact_tool_fan_uses_shell_local_anchor_not_fixed_viewport_position():
     assert "top: calc(var(--compact-tool-toggle-center-y) - var(--compact-tool-fan-focus-y));" in fan_block
     assert "width: calc(var(--compact-tool-wheel-hover-radius) * 2);" in fan_block
     assert "height: calc(var(--compact-tool-wheel-hover-radius) * 2);" in fan_block
+    assert "--compact-tool-wheel-orbit-radius: 80px;" in fan_block
     assert "touch-action: none;" in fan_block
     assert "position: fixed;" not in fan_block
     assert "--compact-input-tool-fan-origin-left" not in fan_block
