@@ -1,4 +1,18 @@
 # -*- coding: utf-8 -*-
+# Copyright 2025-2026 Project N.E.K.O. Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 Capture Router
 
@@ -15,18 +29,18 @@ Endpoints:
 
 URL convention: routes declared WITHOUT trailing slash. See
 ``main_routers/characters_router.py`` docstring or
-``.agent/rules/neko-guide.md`` (§"API URL 末尾不带斜杠") for rationale;
+``.agent/rules/neko-guide.md`` (section "API URL 末尾不带斜杠", no trailing API URL slash) for rationale;
 enforced by ``scripts/check_api_trailing_slash.py``.
-"""
+"""  # noqa: DOCSTRING_CJK
 
 from __future__ import annotations
 
 import asyncio
-import ipaddress
 from typing import Any
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
+from main_routers.local_access import is_direct_loopback_request as _is_loopback_request
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from utils.logger_config import get_module_logger
@@ -35,17 +49,6 @@ from utils import capture_bridge
 
 router = APIRouter(prefix="/api/capture", tags=["capture"])
 logger = get_module_logger(__name__, "Main")
-
-
-def _is_loopback_request(request: Request) -> bool:
-    client_host = request.client.host if request.client else ""
-    if client_host == "localhost":
-        return True
-    normalized_host = str(client_host or "").removeprefix("::ffff:")
-    try:
-        return ipaddress.ip_address(normalized_host).is_loopback
-    except ValueError:
-        return False
 
 
 class CaptureRequestBody(BaseModel):
@@ -74,6 +77,43 @@ async def capture_health(request: Request):
             status_code=503,
         )
     return JSONResponse({"success": True, "available": True})
+
+
+@router.post("/computer-use")
+async def capture_computer_use_screen(request: Request):
+    """Local Agent bridge for one full-screen ComputerUse frame."""
+    if not _is_loopback_request(request):
+        return JSONResponse({"success": False, "error": "loopback_only"}, status_code=403)
+    # Browser pages cannot trigger background desktop capture through localhost.
+    if request.headers.get("origin") is not None or request.headers.get("referer") is not None:
+        return JSONResponse({"success": False, "error": "browser_request_denied"}, status_code=403)
+    if not capture_bridge.has_computer_use_capture_client():
+        return JSONResponse({"success": False, "error": "no_renderer"}, status_code=503)
+    capture_task = asyncio.create_task(capture_bridge.request_computer_use_screenshot())
+
+    async def watch_disconnect() -> None:
+        while not await request.is_disconnected():
+            await asyncio.sleep(0.05)
+
+    disconnect_task = asyncio.create_task(watch_disconnect())
+    try:
+        done, _ = await asyncio.wait(
+            (capture_task, disconnect_task), return_when=asyncio.FIRST_COMPLETED,
+        )
+        if disconnect_task in done:
+            capture_task.cancel()
+            return JSONResponse({"success": False, "error": "client_disconnected"}, status_code=499)
+        result = await capture_task
+    except capture_bridge.CaptureBridgeError as exc:
+        message = str(exc)
+        status = 504 if "timeout" in message else 502
+        return JSONResponse({"success": False, "error": message}, status_code=status)
+    finally:
+        disconnect_task.cancel()
+        if not capture_task.done():
+            capture_task.cancel()
+        await asyncio.gather(capture_task, disconnect_task, return_exceptions=True)
+    return JSONResponse({"success": True, "image": result["image"]})
 
 
 @router.post("/screenshot")

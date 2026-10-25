@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 import time
 import uuid
 from typing import TYPE_CHECKING, Any, Coroutine, Dict, List, Optional, Sequence, TypeVar, Union
 
-from plugin.settings import MESSAGE_PLANE_ZMQ_RPC_ENDPOINT
+from plugin.settings import resolve_message_plane_rpc_endpoint
 from .types import BusList, BusOp, BusRecord, GetNode
 
 from plugin.core.message_plane_transport import MessagePlaneRpcClient as _MessagePlaneRpcClient
@@ -29,12 +30,45 @@ def _is_in_event_loop() -> bool:
 
 
 def _ensure_rpc(ctx: "PluginContext") -> _MessagePlaneRpcClient:
+    """The plugin's RPC client, rebuilt if the plane has moved underneath it.
+
+    Resolving at call time is only half the job while the client is cached on
+    the context: the cached one keeps the endpoint it was built with, and its
+    sockets are already connected there. In the ordinary startup order the
+    first resolution happens after the runner has chosen, so the cache is
+    correct -- but a plane restarted mid-session can land on a different
+    fallback port, and a plugin holding a client from before would keep
+    connecting to the old one and simply time out (CodeRabbit).
+
+    Comparing is cheap: it is an environment read and a string compare per bus
+    call, against a socket round trip.
+    """
+    endpoint = resolve_message_plane_rpc_endpoint()
     rpc = getattr(ctx, "_mp_rpc_client", None)
+    # Rebuild only clients created here. Do not touch injected clients: in-process end-to-end
+    # tests connect ctx to a temporary port this way. Comparing against environment values would
+    # replace it with the default endpoint, where nobody listens, hanging the entire test suite (as my first version did).
+    # This is the same rationale as plane_bridge not rereading environment in start().
+    if (
+        rpc is not None
+        and getattr(rpc, "_neko_endpoint_autoresolved", False)
+        and getattr(rpc, "_endpoint", None) != endpoint
+    ):
+        # Endpoint changed: old client sockets remain connected to the old address and would only keep timing out.
+        #
+        # Drop the reference only; no close() exists. _MessagePlaneRpcClient exposes no close interface;
+        # pyzmq closes its socket during object finalization. A try: rpc.close() here
+        # would be decorative: the method does not exist, its exception is swallowed, and no actual cleanup occurs.
+        # Endpoint changes are rare (plane restarts on another port); brief retention until GC is acceptable.
+        rpc = None
     if rpc is None:
         rpc = _MessagePlaneRpcClient(
             plugin_id=getattr(ctx, "plugin_id", ""),
-            endpoint=str(MESSAGE_PLANE_ZMQ_RPC_ENDPOINT),
+            endpoint=endpoint,
         )
+        with suppress(Exception):
+            # Mark it as locally created so a future endpoint change may replace it.
+            rpc._neko_endpoint_autoresolved = True
         try:
             ctx._mp_rpc_client = rpc
         except Exception:
@@ -84,18 +118,9 @@ class _PluginBusList(BusList[TRecord]):
         ctx: Optional[Any] = None,
         trace: Optional[Sequence[BusOp]] = None,
         plan: Optional[Any] = None,
-        fast_mode: bool = False,
     ):
-        super().__init__(items, ctx=ctx, trace=trace, plan=plan, fast_mode=fast_mode)
+        super().__init__(items, ctx=ctx, trace=trace, plan=plan)
         self.plugin_id = plugin_id
-
-    def merge(self, other: "BusList[TRecord]") -> "_PluginBusList[TRecord]":
-        merged = super().merge(other)
-        other_pid = getattr(other, "plugin_id", None)
-        if self.plugin_id != other_pid:
-            merged.plugin_id = "*"  # type: ignore[attr-defined]
-        return merged  # type: ignore[return-value]
-
 
 # ── BusRpcClientBase ───────────────────────────────────────────────────
 
@@ -178,7 +203,7 @@ class BusRpcClientBase:
             "plugin_id": plugin_id, "max_count": max_count,
             "filter": dict(filter) if isinstance(filter, dict) else None,
             "strict": bool(strict), "since_ts": since_ts,
-            "timeout": timeout, "via": "message_plane.rpc",
+            "timeout": timeout,
         }
         trace = [BusOp(name="get", params=get_params, at=time.time())]
         plan = GetNode(op="get", params={"bus": self._store_name, "params": get_params}, at=time.time())

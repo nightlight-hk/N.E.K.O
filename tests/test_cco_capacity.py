@@ -1,12 +1,12 @@
 """
-CCO (Context Cache Optimization) 完整测试
+Complete CCO (Context Cache Optimization) tests
 
-测试所有 API 提供商的 Context Cache：
-1. 阿里云 DashScope (qwen)
+Test Context Cache for all API providers:
+1. Alibaba Cloud DashScope (qwen)
 2. OpenAI
-3. 智谱 GLM
-4. 阶跃星辰 Step
-5. 硅基流动 Silicon
+3. Zhipu GLM
+4. StepFun Step
+5. SiliconFlow Silicon
 6. Google Gemini
 7. Moonshot Kimi
 
@@ -20,7 +20,7 @@ from config.providers import CACHE_PROVIDERS as PROVIDER_CACHE_CONFIG
 
 
 def test_all_providers_config():
-    """测试所有提供商的缓存配置"""
+    """Test cache configuration for all providers."""
     print("\n" + "="*70)
     print("测试: 所有 API 提供商缓存配置")
     print("="*70)
@@ -35,7 +35,7 @@ def test_all_providers_config():
 
 
 def test_token_extraction_all_providers():
-    """测试所有提供商的 Token 提取"""
+    """Test token extraction for all providers."""
     print("\n" + "="*70)
     print("测试: Token Tracker 缓存字段提取")
     print("="*70)
@@ -74,7 +74,7 @@ def test_token_extraction_all_providers():
 
 
 def test_cost_calculation_all_providers():
-    """测试所有提供商的费用计算"""
+    """Test cost calculation for all providers."""
     print("\n" + "="*70)
     print("测试: 费用计算 (90% 缓存命中率)")
     print("="*70)
@@ -112,7 +112,7 @@ def test_cost_calculation_all_providers():
 
 
 def test_cache_hit_rate_scenarios():
-    """测试不同缓存命中率场景"""
+    """Test different cache-hit ratios."""
     print("\n" + "="*70)
     print("测试: 不同缓存命中率场景 (以 qwen 为例)")
     print("="*70)
@@ -138,32 +138,34 @@ def test_cache_hit_rate_scenarios():
 
 
 def test_provider_compatibility():
-    """测试提供商兼容性"""
+    """enable_cache_control tracks requires_body_flag only, orthogonal to
+    requires_header. Header-only providers (qwen) must now report False."""
     print("\n" + "="*70)
     print("测试: 提供商兼容性检查")
     print("="*70)
 
     from config.providers import get_cache_kwargs
 
-    results = []
-
     for provider_id, config in PROVIDER_CACHE_CONFIG.items():
         cache_config = get_cache_kwargs(config["base_url"])
 
-        if provider_id in ("qwen", "qwen_intl", "qwen_us"):
-            expected = True
-        else:
-            expected = False
+        # requires_body_flag, not requires_header, controls body-level cache flags.
+        expected = config["requires_body_flag"]
 
         actual = cache_config["enable_cache_control"]
-        passed = actual == expected
         status = "[PASS]" if (actual == expected) else "[FAIL]"
         print(f"  {status} {config['name']}: 缓存控制 = {actual}")
         assert actual == expected, f"{config['name']}: expected {expected}, got {actual}"
 
+    # Without a body-flag provider, all should be False; header behavior is unaffected.
+    assert all(
+        not get_cache_kwargs(c["base_url"])["enable_cache_control"]
+        for c in PROVIDER_CACHE_CONFIG.values()
+    ), "当前没有 provider 需要 body 级 flag，enable_cache_control 应全为 False"
+
 
 def test_min_cache_tokens_all_providers():
-    """测试所有提供商的最小缓存限制"""
+    """Test minimum cache limits for all providers."""
     print("\n" + "="*70)
     print("测试: 各提供商最小缓存 Token 限制")
     print("="*70)
@@ -179,7 +181,13 @@ def test_min_cache_tokens_all_providers():
 
 
 def test_session_cache_header():
-    """测试 Session Cache Header (仅 qwen)"""
+    """Session Cache Header (qwen only).
+
+    qwen takes the header path: default_headers carries the session-cache
+    header, but enable_cache_control must be False -- it needs no body-level
+    cache_control marker, and stamping an Anthropic-style cache_control onto
+    DashScope (an OpenAI-compatible endpoint) would be wrong.
+    """
     print("\n" + "="*70)
     print("测试: Session Cache Header 配置")
     print("="*70)
@@ -193,12 +201,160 @@ def test_session_cache_header():
     print(f"    default_headers: {qwen_config['default_headers']}")
 
     expected_header = {"x-dashscope-session-cache": "enable"}
-    passed = qwen_config["enable_cache_control"] is True and qwen_config["default_headers"] == expected_header
+    passed = qwen_config["enable_cache_control"] is False and qwen_config["default_headers"] == expected_header
 
     status = "[PASS]" if passed else "[FAIL]"
     print(f"\n  {status} Session Cache Header 正确配置")
-    assert qwen_config["enable_cache_control"] is True, "enable_cache_control should be True"
+    assert qwen_config["enable_cache_control"] is False, "header-only provider 不应打 body flag"
     assert qwen_config["default_headers"] == expected_header, f"headers mismatch: {qwen_config['default_headers']}"
+
+
+def test_body_flag_drives_enable_cache_control():
+    """Only a provider with requires_body_flag=True gets enable_cache_control=True,
+    fully orthogonal to requires_header (both can coexist). Verified via a
+    temporary synthetic provider."""
+    print("\n" + "="*70)
+    print("测试: requires_body_flag 驱动 enable_cache_control")
+    print("="*70)
+
+    from config.providers import CACHE_PROVIDERS, CacheProviderConfig, get_cache_kwargs
+
+    fake = CacheProviderConfig(
+        provider_id="anthropic_test",
+        name="Anthropic (test)",
+        base_url="https://anthropic-test.example/v1",
+        base_url_pattern="anthropic-test.example",
+        cache_mode="auto",
+        requires_header=True,           # Enable both intentionally to verify independence.
+        requires_body_flag=True,
+        header_name="x-test-cache",
+        header_value="on",
+    )
+    CACHE_PROVIDERS["anthropic_test"] = fake
+    try:
+        kw = get_cache_kwargs("https://anthropic-test.example/v1/messages")
+        print(f"  body-flag provider → {kw}")
+        assert kw["enable_cache_control"] is True, "requires_body_flag 应驱动 enable_cache_control"
+        assert kw["default_headers"] == {"x-test-cache": "on"}, "header 与 body flag 正交，应同时注入"
+        print("  [PASS] requires_body_flag 正确驱动 enable_cache_control 且与 header 正交")
+    finally:
+        del CACHE_PROVIDERS["anthropic_test"]
+
+
+def test_inject_cache_control_helper():
+    """_inject_cache_control / _attach_cache_control: breakpoint selection,
+    string promotion, idempotency, and defensive no-mutation behavior."""
+    print("\n" + "="*70)
+    print("测试: body 级 cache_control 注入逻辑")
+    print("="*70)
+
+    from utils.llm_client import _inject_cache_control
+
+    EPH = {"type": "ephemeral"}
+
+    # 1) With system messages, mark the last system message; promote string content to a text part.
+    msgs = [
+        {"role": "system", "content": "you are a cat"},
+        {"role": "user", "content": "hi"},
+    ]
+    out = _inject_cache_control(msgs)
+    assert out[0]["content"] == [{"type": "text", "text": "you are a cat", "cache_control": EPH}]
+    assert out[1] == {"role": "user", "content": "hi"}, "非断点消息不应被改"
+    # Do not mutate the original list or dict.
+    assert msgs[0]["content"] == "you are a cat", "原始消息被 mutate 了"
+    print("  [PASS] system 断点：字符串提升为带 cache_control 的 text part，原对象不变")
+
+    # 2) Without system messages, mark the last message.
+    msgs2 = [
+        {"role": "user", "content": "a"},
+        {"role": "assistant", "content": "b"},
+    ]
+    out2 = _inject_cache_control(msgs2)
+    assert out2[0] == {"role": "user", "content": "a"}
+    assert out2[1]["content"] == [{"type": "text", "text": "b", "cache_control": EPH}]
+    print("  [PASS] 无 system：回退到最后一条消息")
+
+    # 3) For content already represented as parts, mark the last text part.
+    msgs3 = [{
+        "role": "system",
+        "content": [
+            {"type": "text", "text": "p1"},
+            {"type": "image_url", "image_url": {"url": "x"}},
+            {"type": "text", "text": "p2"},
+        ],
+    }]
+    out3 = _inject_cache_control(msgs3)
+    parts = out3[0]["content"]
+    assert parts[2] == {"type": "text", "text": "p2", "cache_control": EPH}
+    assert parts[0] == {"type": "text", "text": "p1"}, "非最后 text part 不应带标记"
+    assert parts[1] == {"type": "image_url", "image_url": {"url": "x"}}, "图片 part 不应带标记"
+    print("  [PASS] parts list：只标最后一个 text part，图片/前置 part 不动")
+
+    # 4) Place the breakpoint at the end of the leading contiguous system block; trailing system status/archive notices
+    #    must not steal it, caching one useless sentence instead of the long context.
+    msgs4 = [
+        {"role": "system", "content": "BIG STABLE SYSTEM PROMPT"},
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": "a"},
+        {"role": "system", "content": "你已断开连接"},  # Trailing noisy system message.
+    ]
+    out4 = _inject_cache_control(msgs4)
+    assert out4[0]["content"] == [{"type": "text", "text": "BIG STABLE SYSTEM PROMPT", "cache_control": EPH}]
+    assert out4[3] == {"role": "system", "content": "你已断开连接"}, "trailing system 不应被标记"
+    print("  [PASS] leading system 段末尾被选中，trailing system 噪声不抢断点")
+
+    # 5) Idempotence: rerun marked output without marking twice or clobbering existing markers.
+    once = _inject_cache_control([{"role": "system", "content": "s"}])
+    twice = _inject_cache_control(once)
+    assert twice is once, "已打标 → 原样返回，幂等"
+    rich = [{"role": "system", "content": [{"type": "text", "text": "s", "cache_control": {"type": "ephemeral", "ttl": "1h"}}]}]
+    assert _inject_cache_control(rich) is rich, "已有更丰富的 marker → 不覆盖"
+    print("  [PASS] 幂等：重复调用不二次打标，既有 marker 不被 clobber")
+
+    # 6) Defensive branches: non-dict / None content / image-only system / empty list / empty string.
+    assert _inject_cache_control([]) == []
+    img_only = [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}]
+    assert _inject_cache_control(img_only) is img_only, "无可标记 text → 原样返回"
+    empty_str = [{"role": "system", "content": ""}]
+    assert _inject_cache_control(empty_str) is empty_str, "空字符串 → 不造空 part"
+    none_content = [{"role": "system", "content": None}, {"role": "user", "content": "u"}]
+    # A leading system message with content=None cannot be marked: no-op entirely without falling back to user.
+    assert _inject_cache_control(none_content) is none_content, "system content=None → no-op"
+    sys_img_only = [{"role": "system", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}]
+    assert _inject_cache_control(sys_img_only) is sys_img_only, "纯图片 system → idx 为 None → no-op"
+    with_nondict = [{"role": "system", "content": "s"}, None, {"role": "user", "content": "u"}]
+    out6 = _inject_cache_control(with_nondict)
+    assert out6[0]["content"] == [{"type": "text", "text": "s", "cache_control": EPH}]
+    assert out6[1] is None, "非 dict 成员原样保留，不崩"
+    print("  [PASS] 防御分支：非 dict / None content / 纯图片 system 均安全 no-op 或跳过")
+
+
+def test_params_consumes_enable_cache_control():
+    """End-to-end: ChatOpenAI._params actually reads self.enable_cache_control
+    and stamps the marker, and changes nothing when off -- proving the field is
+    no longer dead."""
+    print("\n" + "="*70)
+    print("测试: _params 消费 enable_cache_control")
+    print("="*70)
+
+    from utils.llm_client import ChatOpenAI
+
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "hello"},
+    ]
+
+    on = ChatOpenAI(model="claude-x", base_url="https://x/v1", api_key="k", enable_cache_control=True)
+    p_on = on._params(msgs)
+    assert p_on["messages"][0]["content"] == [
+        {"type": "text", "text": "sys", "cache_control": {"type": "ephemeral"}}
+    ], "enable_cache_control=True 时应打标"
+    print("  [PASS] enable_cache_control=True：system 消息被打上 cache_control")
+
+    off = ChatOpenAI(model="qwen-x", base_url="https://y/v1", api_key="k", enable_cache_control=False)
+    p_off = off._params(msgs)
+    assert p_off["messages"][0]["content"] == "sys", "关闭时不应改动消息"
+    print("  [PASS] enable_cache_control=False：消息原样下发")
 
 
 def main():
@@ -214,6 +370,9 @@ def main():
         ("提供商兼容性", test_provider_compatibility),
         ("最小缓存限制", test_min_cache_tokens_all_providers),
         ("Session Header", test_session_cache_header),
+        ("body-flag 驱动 enable_cache_control", test_body_flag_drives_enable_cache_control),
+        ("cache_control 注入逻辑", test_inject_cache_control_helper),
+        ("_params 消费 enable_cache_control", test_params_consumes_enable_cache_control),
     ]
 
     results = []

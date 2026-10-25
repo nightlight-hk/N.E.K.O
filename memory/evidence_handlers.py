@@ -1,4 +1,18 @@
 # -*- coding: utf-8 -*-
+# Copyright 2025-2026 Project N.E.K.O. Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 Reconciler apply-handlers for the three evidence event types
 (memory-evidence-rfc §3.3.6).
@@ -35,11 +49,11 @@ _EVIDENCE_SNAPSHOT_KEYS = (
     'reinforcement', 'disputation',
     'rein_last_signal_at', 'disp_last_signal_at',
     'sub_zero_days',
-    # 防抖字段（archive sweep 写入）：与 sub_zero_days 一对，必须随其
-    # 一起 replay，否则重放后 view 同一天可能再被 +1（破坏防抖语义）。
+    # Debounce fields written by archive sweep pair with sub_zero_days and must be
+    # replayed together, or the view may increment again on the same day after replay.
     'sub_zero_last_increment_date',
-    # user_fact combo counter (RFC §3.1.8) — 必须走 event log 的 replay
-    # 路径才能让重放后 view 的 combo 状态一致
+    # user_fact combo counter (RFC section 3.1.8) must follow event-log replay
+    # so the view's combo state remains consistent after reconstruction.
     'user_fact_reinforce_count',
 )
 # Reflection-side evidence events also carry promote throttle counters
@@ -48,7 +62,10 @@ _EVIDENCE_SNAPSHOT_KEYS = (
 _REFLECTION_EVIDENCE_SNAPSHOT_KEYS = _EVIDENCE_SNAPSHOT_KEYS + (
     'last_promote_attempt_at', 'promote_attempt_count',
 )
-_PERSONA_ENTRY_SNAPSHOT_KEYS = _EVIDENCE_SNAPSHOT_KEYS + ('merged_from_ids',)
+_PERSONA_ENTRY_SNAPSHOT_KEYS = _EVIDENCE_SNAPSHOT_KEYS + (
+    'merged_from_ids',
+    'event_when_raw', 'event_start_at', 'event_end_at',
+)
 
 
 def make_reflection_evidence_handler(reflection_engine):
@@ -209,9 +226,10 @@ def make_persona_evidence_handler(persona_manager):
 def make_persona_entry_handler(persona_manager):
     """Build the `persona.entry_updated` apply handler.
 
-    RFC §3.3.6: text 不在 payload；通过 rewrite_text_sha256 核对 view 是否
-    已 apply。mismatch → raise，让 reconciler 暂停等人工。PR-1 只处理
-    evidence 字段；PR-3 的 merge-on-promote 会实际改写 text。
+    RFC §3.3.6: text is not in the payload; rewrite_text_sha256 verifies whether
+    the view has already applied it. Mismatch → raise, pausing the reconciler
+    for manual intervention. PR-1 only handles evidence fields; PR-3's
+    merge-on-promote will actually rewrite the text.
     """
 
     def _apply(name: str, payload: dict) -> bool:
@@ -259,6 +277,28 @@ def make_persona_entry_handler(persona_manager):
                 if k in payload and e.get(k) != payload[k]:
                     e[k] = payload[k]
                     changed = True
+            if 'speaker_provenance' in payload:
+                provenance = payload.get('speaker_provenance')
+                if not isinstance(provenance, dict):
+                    provenance = {}
+                provenance_keys = (
+                    'speaker_id', 'speaker_trust', 'speaker_label',
+                    'speaker_provenance_mixed',
+                )
+                before = {
+                    key: e.get(key) for key in provenance_keys if key in e
+                }
+                for key in provenance_keys:
+                    e.pop(key, None)
+                e.update({
+                    key: provenance[key]
+                    for key in provenance_keys
+                    if key in provenance
+                })
+                after = {
+                    key: e.get(key) for key in provenance_keys if key in e
+                }
+                changed = changed or before != after
             if changed:
                 persona_manager._personas[name] = persona
                 atomic_write_json(path, persona, indent=2, ensure_ascii=False)
@@ -357,11 +397,12 @@ def make_reflection_archive_handler(reflection_engine):
 def make_persona_archive_handler(persona_manager):
     """Build the `persona.fact_added` apply handler for archive events.
 
-    RFC §3.5.6: persona archive 复用 fact_added 事件，用 payload 里的
-    `archive_shard_path` 字段区分主路径的 fact_added（该路径未来可能由
-    PR-3 emit，但当前代码未使用）。PR-2 handler 只对带 archive_shard_path
-    的 payload 做归档。不带该字段的 payload 当前视为 no-op — 正向
-    fact_added 还没走事件路径。
+    RFC §3.5.6: persona archiving reuses the fact_added event; the
+    `archive_shard_path` field in the payload distinguishes it from the
+    main-path fact_added (that path may be emitted by PR-3 in the future, but
+    current code doesn't use it). The PR-2 handler only archives payloads
+    carrying archive_shard_path. Payloads without that field are currently a
+    no-op — forward fact_added doesn't go through the event path yet.
 
     Self-healing semantics (coderabbit PR #934 round-2 Major #3 — twin
     of `make_reflection_archive_handler`):

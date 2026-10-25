@@ -1,11 +1,19 @@
 /**
  * neko-plugin-cli 相关 API
  */
-import { get, post } from './index'
+import type { AxiosRequestConfig } from 'axios'
+import { del, get, post } from './index'
 import { API_BASE_URL } from '@/utils/constants'
 
-export type PluginCliConflictStrategy = 'rename' | 'fail'
+export type PluginCliConflictStrategy = 'fail'
 export type PluginCliBuildMode = 'selected' | 'single' | 'bundle' | 'all'
+export type PluginCliInstallAction =
+  | 'install'
+  | 'upgrade'
+  | 'reinstall'
+  | 'downgrade'
+  | 'override_builtin'
+  | 'blocked'
 
 export interface PluginCliPluginRef {
   root_id: 'builtin' | 'user'
@@ -16,6 +24,8 @@ export interface PluginCliPluginRef {
 
 export interface PluginCliBuildRequest {
   mode: PluginCliBuildMode
+  development_ref?: { registration_id: string; revision: number }
+  development_refs?: Array<{ registration_id: string; revision: number }>
   plugin?: string
   plugins?: string[]
   plugin_ref?: PluginCliPluginRef
@@ -94,6 +104,29 @@ export interface PluginCliInstallRequest {
   plugins_root?: string
   profiles_root?: string
   on_conflict?: PluginCliConflictStrategy
+  install_source?: 'imported'
+  confirm_upgrade?: boolean
+  confirmation_token?: string
+}
+
+export interface PluginCliInstallPlanRequest {
+  package: string
+  plugins_root?: string
+  profiles_root?: string
+}
+
+export interface PluginCliInstallPlanResponse {
+  action: PluginCliInstallAction
+  package_type: 'plugin' | 'bundle'
+  plugin_id: string
+  directory_name: string
+  current_version: string
+  target_version: string
+  confirmation_token: string
+  reason: string
+  legacy_plugin_ids: string[]
+  current_source?: string
+  target_source?: string
 }
 
 export interface PluginCliInstalledPlugin {
@@ -111,11 +144,16 @@ export interface PluginCliInstallResponse {
   profiles_root?: string | null
   installed_plugins: PluginCliInstalledPlugin[]
   profile_dir?: string | null
+  profile_reused?: boolean
   metadata_found: boolean
   payload_hash: string
   payload_hash_verified: boolean | null
   conflict_strategy: PluginCliConflictStrategy
   installed_plugin_count: number
+  operation: 'install' | 'upgrade' | 'reinstall' | 'downgrade' | 'override_builtin'
+  restarted: boolean
+  rollback_status: 'not_needed' | 'completed' | 'incomplete'
+  install_source_warning?: string | null
 }
 
 export interface PluginCliAnalyzeRequest {
@@ -172,8 +210,8 @@ export interface PluginCliLocalPackagesResponse {
 /**
  * 列出当前本地可构建插件
  */
-export function getPluginCliPlugins(): Promise<PluginCliLocalPluginsResponse> {
-  return get('/plugin-cli/plugins')
+export function getPluginCliPlugins(config?: AxiosRequestConfig & { preserveMessagesOn404?: boolean }): Promise<PluginCliLocalPluginsResponse> {
+  return get('/plugin-cli/plugins', config)
 }
 
 /**
@@ -186,29 +224,46 @@ export function getPluginCliPackages(): Promise<PluginCliLocalPackagesResponse> 
 /**
  * 构建一个或多个插件
  */
-export function buildPluginCli(payload: PluginCliBuildRequest): Promise<PluginCliBuildResponse> {
-  return post('/plugin-cli/build', payload)
+export function buildPluginCli(payload: PluginCliBuildRequest, config?: Pick<AxiosRequestConfig, 'timeout'>): Promise<PluginCliBuildResponse> {
+  if (payload.development_ref || payload.development_refs?.length || payload.mode === 'all') {
+    // Staging, metadata probing and archive validation can outlast a normal API request.
+    return post('/plugin-cli/build', payload, { timeout: 300_000, headers: { 'X-Neko-Development': '1' } })
+  }
+  return config ? post('/plugin-cli/build', payload, config) : post('/plugin-cli/build', payload)
 }
 
 /**
  * 检查包内容
  */
 export function inspectPluginPackage(payload: PluginCliPackageRef): Promise<PluginCliInspectResponse> {
-  return post('/plugin-cli/inspect', payload)
+  return post('/plugin-cli/inspect', payload, { suppressErrorMessage: true })
 }
 
 /**
  * 校验包的 payload hash
  */
 export function verifyPluginPackage(payload: PluginCliPackageRef): Promise<PluginCliVerifyResponse> {
-  return post('/plugin-cli/verify', payload)
+  return post('/plugin-cli/verify', payload, { suppressErrorMessage: true })
 }
 
 /**
  * 安装插件包或整合包
  */
 export function installPluginPackage(payload: PluginCliInstallRequest): Promise<PluginCliInstallResponse> {
-  return post('/plugin-cli/install', payload)
+  return post('/plugin-cli/install', payload, {
+    timeout: 300_000,
+    suppressErrorMessage: true,
+  })
+}
+
+/**
+ * 检查本地包将执行首次安装、原位升级，还是因冲突被阻止
+ */
+export function planPluginInstall(payload: PluginCliInstallPlanRequest): Promise<PluginCliInstallPlanResponse> {
+  return post('/plugin-cli/install-plan', payload, {
+    timeout: 300_000,
+    suppressErrorMessage: true,
+  })
 }
 
 /**
@@ -227,6 +282,12 @@ export interface PluginCliUploadResult {
   modified_at: string
 }
 
+export interface PluginCliDiscardUploadResult {
+  success: boolean
+  removed: boolean
+  name: string
+}
+
 export interface PluginCliUploadAndInstallResult {
   upload: PluginCliUploadResult
   install: PluginCliInstallResponse
@@ -239,7 +300,15 @@ export function uploadPluginPackage(file: File): Promise<PluginCliUploadResult> 
   const formData = new FormData()
   formData.append('file', file)
   return post('/plugin-cli/upload', formData, {
-    timeout: 120_000,
+    timeout: 300_000,
+    suppressErrorMessage: true,
+  })
+}
+
+export function discardUploadedPluginPackage(packagePath: string): Promise<PluginCliDiscardUploadResult> {
+  const query = new URLSearchParams({ package: packagePath })
+  return del(`/plugin-cli/upload?${query.toString()}`, {
+    suppressErrorMessage: true,
   })
 }
 
@@ -259,7 +328,8 @@ export function uploadAndInstallPlugin(
   const query = params.toString()
   const url = `/plugin-cli/upload-and-install${query ? `?${query}` : ''}`
   return post(url, formData, {
-    timeout: 120_000,
+    timeout: 300_000,
+    suppressErrorMessage: true,
   })
 }
 

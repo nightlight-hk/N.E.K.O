@@ -1,4 +1,9 @@
+import HtmlCardBlock from './HtmlCardBlock';
+import MusicRecommendationBlock from './MusicRecommendationBlock';
+import ProactiveRecommendationBlock from './ProactiveRecommendationBlock';
+import type { SyntheticEvent } from 'react';
 import SmartTextBlock from './SmartTextBlock';
+import MessageImageBlock from './MessageImageBlock';
 import { normalizeExternalUrlHref, openExternalUrl } from './openExternal';
 import {
   type ChatMessage,
@@ -10,8 +15,24 @@ type MessageBlockViewProps = {
   block: MessageBlock;
   message: ChatMessage;
   isStreaming?: boolean;
+  interactive?: boolean;
+  presentation?: 'card' | 'bubble';
   onAction?: (message: ChatMessage, action: MessageAction) => void;
 };
+
+const MUSIC_COVER_PLACEHOLDER_URL = '/static/assets/music/music-cover-placeholder.png';
+
+function handleLinkThumbnailLoadError(
+  event: SyntheticEvent<HTMLImageElement>,
+  messageId: ChatMessage['id'],
+) {
+  if (typeof messageId !== 'string' || !messageId.startsWith('music-')) return;
+
+  const image = event.currentTarget;
+  const placeholderUrl = new URL(MUSIC_COVER_PLACEHOLDER_URL, window.location.href).href;
+  if (image.src === placeholderUrl) return;
+  image.src = MUSIC_COVER_PLACEHOLDER_URL;
+}
 
 export function isGuideMessage(message: ChatMessage) {
   return typeof message.id === 'string' && message.id.startsWith('yui-guide-');
@@ -22,8 +43,22 @@ export default function MessageBlockView({
   message,
   isStreaming,
   onAction,
+  interactive = true,
+  presentation = 'card',
 }: MessageBlockViewProps) {
+  if (block.type === 'proactive_recommendation') {
+    return <ProactiveRecommendationBlock block={block} message={message} interactive={interactive} onAction={onAction} presentation={presentation} />;
+  }
+  if (block.type === 'music_recommendation') {
+    return <MusicRecommendationBlock block={block} message={message} interactive={interactive} onAction={onAction} presentation={presentation} />;
+  }
+  if (block.type === 'html_card') {
+    return interactive ? <HtmlCardBlock block={block} /> : <div className="message-block message-block-text">{block.summary}</div>;
+  }
+
   if (block.type === 'text') {
+    // 纯文本分支在最前面：文本节点直出，不经 SmartTextBlock / ReactMarkdown（§3.6.6，串门台词）
+    if (block.plain_text) return <div className="message-block message-block-text message-block-text-plain">{block.text}</div>;
     return (
       <SmartTextBlock
         text={block.text}
@@ -34,14 +69,7 @@ export default function MessageBlockView({
   }
 
   if (block.type === 'image') {
-    return (
-      <figure
-        className="message-block message-block-image"
-        style={block.width && block.height ? { aspectRatio: `${block.width} / ${block.height}` } : undefined}
-      >
-        <img src={block.url} alt={block.alt || ''} loading="lazy" />
-      </figure>
-    );
+    return <MessageImageBlock key={block.url} block={block} interactive={interactive} />;
   }
 
   if (block.type === 'link') {
@@ -59,7 +87,13 @@ export default function MessageBlockView({
       >
         {block.thumbnailUrl ? (
           <div className="message-link-thumb">
-            <img src={block.thumbnailUrl} alt="" loading="lazy" />
+            <img
+              key={block.thumbnailUrl}
+              src={block.thumbnailUrl}
+              alt=""
+              loading="lazy"
+              onError={(event) => handleLinkThumbnailLoadError(event, message.id)}
+            />
           </div>
         ) : null}
         <div className="message-link-copy">
@@ -87,8 +121,8 @@ export default function MessageBlockView({
             key={action.id}
             className={`message-action-button variant-${action.variant || 'secondary'}`}
             type="button"
-            disabled={action.disabled}
-            onClick={() => onAction?.(message, action)}
+            disabled={action.disabled || !interactive}
+            onClick={interactive ? () => onAction?.(message, action) : undefined}
           >
             {action.label}
           </button>

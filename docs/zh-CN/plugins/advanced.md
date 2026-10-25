@@ -1,46 +1,4 @@
-# 高级主题
-
-## 扩展（Extension）
-
-扩展可以在不修改现有插件的情况下，为其添加路由和钩子。扩展运行在宿主插件的进程内（而非独立进程）。
-
-### 何时使用扩展
-
-- 你想为现有插件添加新命令
-- 你想钩住另一个插件的入口点
-- 你想在插件内实现模块化的代码组织
-
-### 创建扩展
-
-```python
-from plugin.sdk.extension import (
-    NekoExtensionBase, extension, extension_entry, extension_hook,
-    Ok, Err,
-)
-
-@extension
-class MyExtension(NekoExtensionBase):
-    """为宿主插件添加额外命令。"""
-
-    @extension_entry(id="extra_command", description="An extra command added by extension")
-    def extra_command(self, param: str = "", **_):
-        return Ok({"extended": True, "param": param})
-
-    @extension_hook(target="original_entry", timing="before")
-    def validate(self, *, args, **_):
-        # 在宿主插件的 "original_entry" 之前运行
-        if not args.get("required_field"):
-            return Err("Missing required_field")
-```
-
-### 扩展的工作原理
-
-1. 宿主在其配置中注册扩展
-2. 启动时，宿主将扩展作为 `PluginRouter` 实例注入
-3. 扩展的入口点在宿主插件的命名空间下变为可访问
-4. 扩展的钩子会拦截宿主的入口点
-
----
+# Adapter 与并发编程
 
 ## 适配器（Adapter）
 
@@ -118,58 +76,11 @@ class MyProtocolAdapter(NekoAdapterPlugin):
 - 自定义序列化器（`MCPResponseSerializer`）
 - 自定义传输层（`MCPTransportAdapter`）
 
----
-
-## 跨插件通信
-
-### 直接入口调用
-
-```python
-# 调用另一个插件的入口点
-result = await self.plugins.call_entry("target_plugin:entry_id", {"arg": "value"})
-
-if isinstance(result, Ok):
-    data = result.value
-else:
-    self.logger.error(f"Call failed: {result.error}")
-```
-
-### 发现
-
-```python
-# 列出所有可用的插件
-plugins = await self.plugins.list(enabled=True)
-
-# 检查依赖是否存在
-exists = await self.plugins.exists("required_plugin")
-
-# 要求某个插件存在（如果缺失则快速失败）
-dep = await self.plugins.require_enabled("required_plugin")
-```
-
-### 事件总线
-
-```python
-# 通过总线发布事件
-self.bus.emit("my_event", {"key": "value"})
-
-# 订阅事件（通常在 startup 中进行）
-self.bus.on("some_event", self._handle_event)
-```
-
----
-
 ## 异步编程
 
-入口点可以是同步或异步的：
+运行时入口必须使用 `async def`。同步辅助函数仍可使用，但应通过异步入口暴露：
 
 ```python
-# 同步入口（在线程池中运行）
-@plugin_entry(id="sync_task")
-def sync_task(self, **_):
-    return Ok({"result": "done"})
-
-# 异步入口（在事件循环中运行）
 @plugin_entry(id="async_task")
 async def async_task(self, url: str, **_):
     async with aiohttp.ClientSession() as session:
@@ -194,68 +105,14 @@ class ThreadSafePlugin(NekoPluginBase):
         self._counter = 0
 
     @plugin_entry(id="increment")
-    def increment(self, **_):
+    async def increment(self, **_):
         with self._lock:
             self._counter += 1
             return Ok({"count": self._counter})
 
     @timer_interval(id="report", seconds=60, auto_start=True)
-    def report(self, **_):
+    async def report(self, **_):
         with self._lock:
             count = self._counter
         self.report_status({"count": count})
-```
-
----
-
-## 自定义配置
-
-```python
-import json
-
-class ConfigurablePlugin(NekoPluginBase):
-    def __init__(self, ctx):
-        super().__init__(ctx)
-        config_file = self.config_dir / "config.json"
-        if config_file.exists():
-            self.config = json.loads(config_file.read_text())
-        else:
-            self.config = {"timeout": 30}
-```
-
-或使用 `PluginConfig` 进行带配置文件的结构化配置：
-
-```python
-from plugin.sdk.plugin import PluginConfig
-
-config = PluginConfig(self.ctx)
-timeout = config.get("timeout", default=30)
-```
-
----
-
-## 使用 SQLite 进行数据持久化
-
-```python
-import sqlite3
-
-class PersistentPlugin(NekoPluginBase):
-    def __init__(self, ctx):
-        super().__init__(ctx)
-        self.db_path = self.data_path("records.db")
-        self.data_path().mkdir(parents=True, exist_ok=True)
-        self._init_db()
-
-    def _init_db(self):
-        conn = sqlite3.connect(self.db_path)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS records (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                key TEXT UNIQUE,
-                value TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        conn.commit()
-        conn.close()
 ```

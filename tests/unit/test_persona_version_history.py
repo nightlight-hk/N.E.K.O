@@ -3,7 +3,7 @@
 
 When resolve_corrections decides `replace`, the old text must be
 preserved in `version_history` on the replacing entry, chained across
-multiple corrections so temporal context (e.g., 主人以前住东京 → 搬到大阪)
+multiple corrections so temporal context (e.g., the owner used to live in Tokyo → moved to Osaka)
 stays traceable. `replace` is an in-place edit: id / source / evidence
 counters must survive the rewrite — only `text` and the history tail
 change."""
@@ -28,6 +28,7 @@ def _mock_cm(tmpdir: str):
     cm.get_model_api_config = MagicMock(return_value={
         "model": "fake", "base_url": "http://fake", "api_key": "sk-fake",
     })
+    cm.aget_model_api_config = AsyncMock(side_effect=lambda mt, **_: cm.get_model_api_config(mt))
     return cm
 
 
@@ -37,7 +38,7 @@ def _install(tmpdir: str):
 
     cm = _mock_cm(tmpdir)
     with patch("memory.event_log.get_config_manager", return_value=cm), \
-         patch("memory.persona.get_config_manager", return_value=cm):
+         patch("memory.persona.manager.get_config_manager", return_value=cm):
         event_log = EventLog()
         event_log._config_manager = cm
         pm = PersonaManager(event_log=event_log)
@@ -80,7 +81,7 @@ async def _seed_master_fact(pm, name: str, text: str, **overrides) -> dict:
 
 @pytest.mark.asyncio
 async def test_replace_records_old_text_in_version_history(tmp_path):
-    """replace 动作必须把旧文本压进 version_history，新 entry 的 text 是 merged。"""
+    """The replace action must push old text into version_history; the new entry's text is merged."""
     pm, _ = _install(str(tmp_path))
     await _seed_master_fact(pm, "小天", "主人住在东京")
 
@@ -104,7 +105,7 @@ async def test_replace_records_old_text_in_version_history(tmp_path):
 
 @pytest.mark.asyncio
 async def test_replace_chains_history_across_multiple_corrections(tmp_path):
-    """连续两次 replace：history 应保留全链路，不覆盖。"""
+    """Two consecutive replace actions must retain the entire history chain rather than overwrite it."""
     pm, _ = _install(str(tmp_path))
     await _seed_master_fact(pm, "小天", "主人住在东京")
 
@@ -171,7 +172,7 @@ async def test_replace_preserves_id_source_and_evidence_metadata(tmp_path):
 
 @pytest.mark.asyncio
 async def test_replace_invalidates_token_count_cache(tmp_path):
-    """text 变了 → token_count / sha / tokenizer 三元组必须重置。"""
+    """When text changes, reset the token_count / sha / tokenizer triple."""
     pm, _ = _install(str(tmp_path))
     await _seed_master_fact(
         pm, "小天", "主人住在东京",
@@ -195,7 +196,7 @@ async def test_replace_invalidates_token_count_cache(tmp_path):
 
 @pytest.mark.asyncio
 async def test_non_replace_actions_do_not_record_version_history(tmp_path):
-    """keep_new / keep_old / keep_both: 不写 version_history（§2 明确范围）。"""
+    """keep_new / keep_old / keep_both do not write version_history (scope explicitly defined in §2)."""
     pm, _ = _install(str(tmp_path))
     await _seed_master_fact(pm, "小天", "主人喜欢绿茶")
 

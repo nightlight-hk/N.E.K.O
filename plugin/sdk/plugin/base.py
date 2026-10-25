@@ -14,8 +14,15 @@ from plugin.sdk.shared.constants import EVENT_META_ATTR, NEKO_PLUGIN_META_ATTR, 
 from plugin.sdk.shared.core.base import DEFAULT_PLUGIN_VERSION as _DEFAULT_PLUGIN_VERSION
 from plugin.sdk.shared.core.base import NekoPluginBase as _SharedNekoPluginBase
 from plugin.sdk.shared.core.base import PluginMeta as _SharedPluginMeta
-from plugin.sdk.shared.core.base_runtime import resolve_plugin_data_dir
+from plugin.sdk.shared.core.base_runtime import (
+    resolve_plugin_cache_dir,
+    resolve_plugin_data_dir,
+    resolve_plugin_dir,
+    resolve_plugin_runtime_config_path,
+    resolve_plugin_storage_dir,
+)
 from plugin.sdk.shared.core.events import EventHandler, EventMeta
+from plugin.sdk.shared.core.types import PushMessageResult
 from plugin.sdk.shared.i18n import PluginI18n, load_plugin_i18n_from_meta
 from plugin.sdk.shared.models.exceptions import EntryConflictError
 
@@ -42,7 +49,6 @@ class NekoPluginBase(_SharedNekoPluginBase):
         from .runtime import Plugins
 
         self.plugins = Plugins(self.ctx)
-        self._memory_client = None
         self._system_info_client = None
         self.i18n = self._load_plugin_i18n()
         self._static_ui_config: dict[str, Any] | None = None
@@ -107,12 +113,31 @@ class NekoPluginBase(_SharedNekoPluginBase):
         return str(getattr(self.ctx, "plugin_id", "plugin"))
 
     @property
+    def plugin_dir(self) -> Path:
+        """Return the installed plugin payload directory."""
+        return resolve_plugin_dir(self.ctx)
+
+    @property
     def config_dir(self) -> Path:
-        config_path = getattr(self.ctx, "config_path", None)
-        return Path(config_path).parent if config_path is not None else Path.cwd()
+        """Compatibility alias for :attr:`plugin_dir`."""
+        return self.plugin_dir
+
+    @property
+    def storage_dir(self) -> Path:
+        """Return the user storage directory assigned to this plugin."""
+        return resolve_plugin_storage_dir(self.ctx)
+
+    @property
+    def runtime_config_path(self) -> Path:
+        """Return the plugin's persistent runtime configuration path."""
+        return resolve_plugin_runtime_config_path(self.ctx)
 
     def data_path(self, *parts: str) -> Path:
         base = resolve_plugin_data_dir(self.ctx)
+        return base.joinpath(*parts) if parts else base
+
+    def cache_path(self, *parts: str) -> Path:
+        base = resolve_plugin_cache_dir(self.ctx)
         return base.joinpath(*parts) if parts else base
 
     @property
@@ -123,14 +148,6 @@ class NekoPluginBase(_SharedNekoPluginBase):
     @property
     def bus(self):
         return self.ctx.bus
-
-    @property
-    def memory(self):
-        if self._memory_client is None:
-            from .runtime import MemoryClient
-
-            self._memory_client = MemoryClient(self.ctx)
-        return self._memory_client
 
     @property
     def system_info(self):
@@ -158,14 +175,14 @@ class NekoPluginBase(_SharedNekoPluginBase):
         host-side.
 
         Use this for character-aware text like
-        ``"立即基于最新画面向 {MASTER_NAME} 叙述..."`` instead of hardcoded
-        ``"用户"`` / ``"master"`` / ``"主人"``, which feel generic and
+        ``\"Immediately describe the latest screen to {MASTER_NAME}...\"`` instead of hardcoded
+        ``\"user\"`` / ``\"master\"`` / ``\"owner\"``, which feel generic and
         misbehave on multi-character setups. See PLUGIN_DEVELOPMENT_GUIDE.md
         ("Writing role-aware text") for details.
         """
         return await self.ctx.finish(**kwargs)
 
-    def push_message(self, **kwargs: Any) -> object:
+    def push_message(self, **kwargs: Any) -> PushMessageResult:
         """Stream a message from the plugin into the dialog channel.
 
         Role-aware text contract: ``text`` / ``summary`` / ``detail`` (and
@@ -174,6 +191,9 @@ class NekoPluginBase(_SharedNekoPluginBase):
         injection boundary, per session. See :meth:`finish` for the rationale
         and PLUGIN_DEVELOPMENT_GUIDE.md ("Writing role-aware text") for the
         full guide.
+
+        The returned receipt only reports immediate local submission.  It is
+        not a host-consumption, generation, or playback acknowledgement.
         """
         return self.ctx.push_message(**kwargs)
 
@@ -240,6 +260,14 @@ class NekoPluginBase(_SharedNekoPluginBase):
         llm_fields = getattr(meta, "llm_result_fields", None)
         if llm_fields:
             meta_dict["llm_result_fields"] = list(llm_fields)
+        # Forward control fields with registration so the host uses declared budgets and result schemas.
+        for name in ("timeout", "model_validate", "persist"):
+            value = getattr(meta, name, None)
+            if value is not None:
+                meta_dict[name] = value
+        llm_schema = getattr(meta, "llm_result_schema", None)
+        if isinstance(llm_schema, Mapping):
+            meta_dict["llm_result_schema"] = dict(llm_schema)
         self._notify_host_comm({
             "type": "ENTRY_UPDATE",
             "action": "register",
@@ -528,6 +556,7 @@ class NekoPluginBase(_SharedNekoPluginBase):
         handler: Any,
         timeout: float = 30.0,
         role: str | None = None,
+        reply_tail: bool = False,
     ) -> bool:
         """Register an LLM tool at runtime.
 
@@ -564,6 +593,7 @@ class NekoPluginBase(_SharedNekoPluginBase):
             parameters=dict(parameters) if isinstance(parameters, dict) else {"type": "object", "properties": {}},
             timeout_seconds=float(timeout),
             role=role,
+            reply_tail=reply_tail,
         )
         self._register_llm_tool_internal(meta, handler)
         return True
@@ -591,6 +621,7 @@ class NekoPluginBase(_SharedNekoPluginBase):
                 "parameters": dict(meta.parameters),
                 "timeout_seconds": meta.timeout_seconds,
                 "role": meta.role,
+                **({"reply_tail": True} if meta.reply_tail else {}),
             }
             for meta in self._llm_tools.values()
         ]

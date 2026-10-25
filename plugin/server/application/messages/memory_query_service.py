@@ -3,10 +3,9 @@ from __future__ import annotations
 import math
 from urllib.parse import quote
 
-import httpx
-
 from plugin.logging_config import get_logger
 from plugin.server.domain.errors import ServerDomainError
+from plugin.utils.http_imports import ensure_httpx
 
 logger = get_logger("server.application.messages.memory_query")
 
@@ -56,12 +55,18 @@ class MemoryQueryService:
         normalized_query = _normalize_non_empty_str(query, field="query")
         normalized_timeout = _coerce_timeout(timeout)
         query_len = len(normalized_query)
+        httpx = await ensure_httpx()
 
         try:
             url = _build_memory_search_url(
                 lanlan_name=normalized_lanlan_name,
                 query=normalized_query,
             )
+            # No language param: this GET is a deprecated placeholder endpoint
+            # (semantic recall was removed from it long ago) and the plugin
+            # server has no session locale to contribute. Letting the memory
+            # server resolve its own locale keeps the plugin process's
+            # fallback from propagating across the boundary.
             async with httpx.AsyncClient(timeout=normalized_timeout, proxy=None, trust_env=False) as client:
                 response = await client.get(url)
                 response.raise_for_status()

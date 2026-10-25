@@ -1,4 +1,18 @@
 # -*- coding: utf-8 -*-
+# Copyright 2025-2026 Project N.E.K.O. Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 Agent Router
 
@@ -10,10 +24,11 @@ Handles agent-related endpoints including:
 
 URL convention: routes declared WITHOUT trailing slash (no ``@router.get('/')``).
 See ``main_routers/characters_router.py`` docstring or
-``.agent/rules/neko-guide.md`` (§"API URL 末尾不带斜杠") for the rationale;
+``.agent/rules/neko-guide.md`` (§\"API URLs have no trailing slash\") for the rationale;
 enforced by ``scripts/check_api_trailing_slash.py``.
 """
 
+import os
 import time
 import uuid
 from pathlib import Path
@@ -23,10 +38,12 @@ from utils.logger_config import get_module_logger
 from fastapi import APIRouter, Body, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 import httpx
+from .pages_router import _static_assets_ctx
 from .shared_state import get_session_manager, get_config_manager, get_templates
 from config import TOOL_SERVER_PORT, USER_PLUGIN_BASE
 from main_logic.agent_event_bus import publish_session_event
 from main_logic.activity.system_signals import is_remote_backend_deployment
+from utils.desktop_capture import native_wayland_capture_available
 
 router = APIRouter(prefix="/api/agent", tags=["agent"])
 logger = get_module_logger(__name__, "Main")
@@ -53,7 +70,7 @@ _AGENT_OFF_FLAGS = {
     "browser_use_enabled": False,
     "user_plugin_enabled": False,
     "openclaw_enabled": False,
-    "openfang_enabled": False,
+    "openclaw_ready": False,
 }
 
 
@@ -89,7 +106,7 @@ def _remote_backend_block() -> JSONResponse | None:
 
 
 async def force_disable_agent_for_character_switch(current_lanlan: str, previous_lanlan: str | None = None) -> bool:
-    """角色切换后强制关闭猫爪，避免工具服务的全局旧状态串到新角色。"""
+    """Force-disable the agent (cat paw) after a character switch so stale global tool-service state cannot leak into the new character."""
     names = {
         str(name or "").strip()
         for name in (current_lanlan, previous_lanlan)
@@ -112,7 +129,7 @@ async def force_disable_agent_for_character_switch(current_lanlan: str, previous
             "enabled": False,
             "lanlan_name": current_lanlan,
         }
-        # 工具服务会先落关闭状态再收尾任务，短超时避免角色切换被长任务清理拖住。
+        # Tool services mark themselves closed before finalizing tasks; a short timeout keeps long-task cleanup from delaying character switching.
         response = await client.post(f"{TOOL_SERVER_BASE}/agent/command", json=payload, timeout=1.2)
         if response.is_success:
             return True
@@ -222,13 +239,21 @@ def _get_http_client() -> httpx.AsyncClient:
 async def _close_http_client():
     global _HTTP_CLIENT
     if _HTTP_CLIENT is not None:
-        await _HTTP_CLIENT.aclose()
-        _HTTP_CLIENT = None
+        # Connection-close failures must not abort shutdown: this handler participates in the merged lifespan chain,
+        # so propagating an exception would skip every later router's cleanup. A common cause is a client created on another
+        # already-closed event loop (aclose calls call_soon on that loop). Regardless of outcome,
+        # clear the reference so the next startup recreates it on the current loop.
+        try:
+            await _HTTP_CLIENT.aclose()
+        except Exception as exc:
+            logger.warning(f"关闭 agent_router HTTP client 失败，继续收尾: {exc}")
+        finally:
+            _HTTP_CLIENT = None
 
 
 @router.post('/flags')
 async def update_agent_flags(request: Request):
-    """来自前端的Agent开关更新，级联到各自的session manager。"""
+    """Agent flag updates from the frontend, cascaded to each session manager."""
     blocked = _remote_backend_block()
     if blocked is not None:
         return blocked
@@ -258,8 +283,6 @@ async def update_agent_flags(request: Request):
                 forward_payload['user_plugin_enabled'] = bool(flags['user_plugin_enabled'])
             if 'openclaw_enabled' in flags:
                 forward_payload['openclaw_enabled'] = bool(flags['openclaw_enabled'])
-            if 'openfang_enabled' in flags:
-                forward_payload['openfang_enabled'] = bool(flags['openfang_enabled'])
             if forward_payload:
                 client = _get_http_client()
                 r = await client.post(f"{TOOL_SERVER_BASE}/agent/flags", json=forward_payload, timeout=0.7)
@@ -273,7 +296,6 @@ async def update_agent_flags(request: Request):
                 'browser_use_enabled': False,
                 'user_plugin_enabled': False,
                 'openclaw_enabled': False,
-                'openfang_enabled': False,
             })
             return JSONResponse({"success": False, "error": f"tool_server forward failed: {e}"}, status_code=502)
         return {"success": True, "is_free_version": _config_manager.is_agent_free()}
@@ -284,7 +306,7 @@ async def update_agent_flags(request: Request):
 
 @router.get('/flags')
 async def get_agent_flags():
-    """获取当前 agent flags 状态（供前端同步）"""
+    """Get the current agent flags state (for frontend sync)."""
     try:
         client = _get_http_client()
         r = await client.get(f"{TOOL_SERVER_BASE}/agent/flags", timeout=0.7)
@@ -297,7 +319,7 @@ async def get_agent_flags():
 
 @router.get('/state')
 async def get_agent_state():
-    """获取 Agent 的权威状态快照（revision + flags + capabilities）。"""
+    """Get the authoritative agent state snapshot (revision + flags + capabilities)."""
     try:
         client = _get_http_client()
         r = await client.get(f"{TOOL_SERVER_BASE}/agent/state", timeout=1.2)
@@ -308,9 +330,18 @@ async def get_agent_state():
         return JSONResponse({"success": False, "error": str(e)}, status_code=502)
 
 
+@router.get('/computer-use/native-capture-available')
+async def get_computer_use_native_capture_available():
+    """Let a local Wayland UI fall back when screen sharing cannot start."""
+    blocked = _remote_backend_block()
+    if blocked is not None:
+        return blocked
+    return {"success": True, "available": native_wayland_capture_available()}
+
+
 @router.post('/command')
 async def post_agent_command(request: Request):
-    """统一命令入口，前端只发送 command，不直接操作多路开关。"""
+    """Unified command entry point; the frontend only sends commands and never toggles the individual switches directly."""
     blocked = _remote_backend_block()
     if blocked is not None:
         return blocked
@@ -344,12 +375,15 @@ async def post_agent_command(request: Request):
                     "browser_use_enabled": False,
                     "user_plugin_enabled": False,
                     "openclaw_enabled": False,
-                    "openfang_enabled": False,
+                    "openclaw_ready": False,
                 })
         elif mgr and command == "set_flag":
             key = data.get("key")
-            if key in {"computer_use_enabled", "browser_use_enabled", "user_plugin_enabled", "openclaw_enabled", "openfang_enabled"}:
-                mgr.update_agent_flags({key: bool(data.get("value"))})
+            if key in {"computer_use_enabled", "browser_use_enabled", "user_plugin_enabled", "openclaw_enabled"}:
+                flag_update = {key: bool(data.get("value"))}
+                if key == "openclaw_enabled":
+                    flag_update["openclaw_ready"] = False
+                mgr.update_agent_flags(flag_update)
 
         t_proxy = time.perf_counter()
         client = _get_http_client()
@@ -436,8 +470,16 @@ async def proxy_mcp_availability():
 
 @router.get('/user_plugin/dashboard')
 async def redirect_plugin_dashboard(request: Request):
-    user_plugin_base = await _resolve_user_plugin_base()
-    target_url = f"{user_plugin_base}/ui"
+    # Docker deployment behind an Nginx reverse proxy: use relative path /ui,
+    # proxied by Nginx to the plugin service (48916), avoiding the container's internal 127.0.0.1
+    behind_proxy = os.environ.get("NEKO_BEHIND_PROXY", "").strip().lower() in ("1", "true", "yes")
+    if behind_proxy:
+        target_url = "/ui"
+    else:
+        user_plugin_base = await _resolve_user_plugin_base()
+        target_url = f"{user_plugin_base}/ui"
+    if request.query_params.get("page") == "model-api":
+        target_url += "/model-api"
     query_params: dict[str, str] = {}
     if "v" in request.query_params:
         v = request.query_params["v"].strip()
@@ -455,8 +497,9 @@ async def redirect_plugin_dashboard(request: Request):
 @router.get('/openclaw/guide', response_class=HTMLResponse)
 async def openclaw_guide_page(request: Request):
     templates = get_templates()
-    return templates.TemplateResponse("templates/openclaw_guide.html", {
+    return templates.TemplateResponse(request, "templates/openclaw_guide.html", {
         "request": request,
+        **_static_assets_ctx(),
     })
 
 
@@ -503,7 +546,7 @@ async def proxy_up_availability():
 
 @router.get('/openclaw/availability')
 async def openclaw_availability():
-    """检查 OpenClaw Agent 能力是否可用"""
+    """Check whether the OpenClaw agent capability is available."""
     try:
         client = _get_http_client()
         # OpenClaw availability may perform a downstream health probe and can
@@ -566,8 +609,19 @@ async def proxy_task_cancel(task_id: str):
         client = _get_http_client()
         r = await client.post(f"{TOOL_SERVER_BASE}/tasks/{task_id}/cancel", timeout=5.0)
         if not r.is_success:
-            return JSONResponse({"success": False, "error": f"tool_server responded {r.status_code}"}, status_code=502)
+            # Pass the tool server's status through (e.g. 404 task-not-found)
+            # so the HUD can tell an orphan card from a proxy-layer failure.
+            return JSONResponse({"success": False, "error": f"tool_server responded {r.status_code}"}, status_code=r.status_code)
         return r.json()
+    except httpx.ReadTimeout as e:
+        # Timed out waiting for the response: the tool server received the
+        # cancel but responded too slowly. 504 tells the HUD the request did
+        # land, so its local terminal fallback is safe to apply.
+        return JSONResponse({"success": False, "error": f"proxy timeout: {e}"}, status_code=504)
+    except (httpx.ConnectError, httpx.TimeoutException) as e:
+        # Connect failure or connect/write/pool timeout: the request cannot
+        # be proven to have reached the tool server.
+        return JSONResponse({"success": False, "error": f"proxy error: {e}"}, status_code=502)
     except Exception as e:
         return JSONResponse({"success": False, "error": f"proxy error: {e}"}, status_code=502)
 
@@ -583,11 +637,26 @@ async def proxy_admin_control(payload: dict = Body(...)):
         r = await client.post(f"{TOOL_SERVER_BASE}/admin/control", json=payload, timeout=5.0)
         if not r.is_success:
             return JSONResponse({"success": False, "error": f"tool_server responded {r.status_code}"}, status_code=502)
-        
+
         result = r.json()
         logger.info(f"Admin control result: {result}")
         return result
-        
+
+    except httpx.ReadTimeout as e:
+        # Timed out waiting for the response: end_all keeps running to
+        # completion on the tool server. 504 tells the HUD the request did
+        # land, so its local terminal fallback is safe to apply.
+        return JSONResponse({
+            "success": False,
+            "error": f"admin control timed out after forwarding: {str(e)}"
+        }, status_code=504)
+    except (httpx.ConnectError, httpx.TimeoutException) as e:
+        # Connect failure or connect/write/pool timeout: the request cannot
+        # be proven to have reached the tool server — nothing was cancelled.
+        return JSONResponse({
+            "success": False,
+            "error": f"Failed to execute admin control: {str(e)}"
+        }, status_code=500)
     except Exception as e:
         return JSONResponse({
             "success": False,

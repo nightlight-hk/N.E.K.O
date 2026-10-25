@@ -7,16 +7,22 @@ Covers:
   - PersonaManager._score_trim_entries / _ascore_trim_entries:
       * preserves protected entries regardless of budget (S12)
       * sorts by (evidence_score, importance) DESC
-      * stops at first overflow (kept text token sum ≤ budget)
+      * keeps the token sum within budget, skipping what does not fit
+        (the skip-don't-stop rule itself lives in
+        tests/unit/test_memory_render_token_budget.py)
   - 3-phase render: persona budget independent from reflection budget (S11)
 """
 from __future__ import annotations
 
 import logging
+import sys
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+from config import PERSONA_RENDER_ENCODING
+from utils.tokenize import count_tokens
 
 
 # ── utils.tokenize ──────────────────────────────────────────────────
@@ -30,6 +36,26 @@ def test_count_tokens_uses_tiktoken_for_chinese():
     assert n > 0, "tiktoken should produce non-zero tokens for non-empty text"
     # Empty string short-circuits to 0 — independent of encoder.
     assert count_tokens("") == 0
+
+
+def test_token_helpers_treat_special_token_strings_as_literal_text():
+    from utils.tokenize import (
+        _reset_fallback_warned_for_tests,
+        count_tokens,
+        truncate_to_tokens,
+    )
+
+    _reset_fallback_warned_for_tests()
+    text = "user note contains <|endoftext|> literally"
+    special = "<|endoftext|>"
+
+    assert count_tokens(text) > 0
+    assert count_tokens(special) > 0
+    # The special-token string must be treated as literal text (not a tokenizer
+    # sentinel that raises/strips): it round-trips, and a high budget leaves the
+    # full text untouched.
+    assert truncate_to_tokens(special, count_tokens(special)) == special
+    assert truncate_to_tokens(text, 10_000) == text
 
 
 @pytest.mark.asyncio
@@ -116,6 +142,166 @@ def test_heuristic_floor_for_short_non_empty_text(monkeypatch):
     _reset_fallback_warned_for_tests()
 
 
+# ── Fallback counts are upper bounds, not estimates (#2574) ────────────────
+#
+# #2574 reported old heuristic (~0.25 token/char for non-CJK) systematically
+# undercounting packed high-entropy URLs/base64/code: actual tokens reached
+# 2.5–2.7 times budget without warnings. Fix uses UTF-8 byte
+# length (#2626): each BPE token maps at least one byte, merges only reduce
+# tokens, making byte count a strict upper bound on actual tokens.
+#
+# This property underpins the fix but lacked direct tests: existing cases covered
+# one-time warnings, empty strings and short-string minima. Three tests below pin
+# counting → entry truncation → whole-block budget at every layer using
+# high-entropy samples named in the issue.
+
+# Three issue-named high-entropy types plus CJK/mixed/combining-character edges.
+_HIGH_ENTROPY_SAMPLES = [
+    # URLs: worst old-heuristic case; punctuation/path characters nearly each form a token.
+    "https://github.com/Project-N-E-K-O/N.E.K.O/blob/main/utils/tokenize.py#L112",
+    # base64: no mergeable natural-language chunks.
+    "aGVsbG8gd29ybGQgdGhpcyBpcyBiYXNlNjQgcGFkZGluZyBkYXRhIQ==",
+    # Code fragments.
+    "def _heuristic_char_weight(c): return float(len(c.encode('utf-8')))",
+    # Pure CJK: byte weights most conservative here (3 bytes/character vs actual ~1 token/character).
+    "主人今天心情不错，说想吃辣条",
+    # Mixed Chinese/English + URL.
+    "主人发了个链接 https://example.com/a?b=1&c=2 说让我看看",
+    # Emoji (four bytes) and combining characters.
+    "辣条好吃🌶️🔥 café é",
+    # Short strings: max(1, ...) lower-bound edge.
+    "ok",
+    "a",
+]
+
+
+def _real_encoder():
+    """The genuine tiktoken encoder — the reference these assertions are
+    measured against. Skip when the encoding data file is unavailable:
+    without it we would be comparing the heuristic to itself.
+
+    Must be called *before* the fallback patch goes in, or `import
+    tiktoken` hands back the MagicMock.
+    """
+    try:
+        import tiktoken
+        enc = tiktoken.get_encoding(PERSONA_RENDER_ENCODING)
+    except Exception as e:  # noqa: BLE001
+        pytest.skip(f"tiktoken encoding data unavailable: {e}")
+    return enc
+
+
+@pytest.fixture
+def force_heuristic(monkeypatch):
+    """Force `_get_encoder` to fail so every counter in `utils.tokenize`
+    takes the heuristic branch, and yield the real encoder captured before
+    the patch as the reference.
+
+    Clears `_ENCODERS` on the way out: that cache stores the *failure* too
+    (which is what keeps the fallback from retrying disk IO on every call),
+    so leaving it would pin the rest of the process into fallback mode.
+    """
+    real_enc = _real_encoder()
+
+    from utils.tokenize import _reset_fallback_warned_for_tests
+
+    fake_tiktoken = MagicMock()
+    fake_tiktoken.get_encoding.side_effect = RuntimeError(
+        "encoding file missing — packaging bug simulation"
+    )
+    monkeypatch.setitem(sys.modules, 'tiktoken', fake_tiktoken)
+    _reset_fallback_warned_for_tests()
+    yield real_enc
+    _reset_fallback_warned_for_tests()
+
+
+@pytest.mark.parametrize("text", _HIGH_ENTROPY_SAMPLES)
+def test_heuristic_never_undercounts_real_tokens(text):
+    """The heuristic count must be >= the real tiktoken count — #2574's
+    core invariant.
+
+    Calls `_count_tokens_heuristic` directly, so no fallback patch is
+    needed and both numbers are available in the same test. The other
+    direction (how much it over-estimates) is deliberately unbounded: byte
+    weights run ~3x for CJK and ~4x for latin, which means rendering
+    *less* in fallback mode — the chosen trade-off (see the `utils
+    /tokenize.py` module docstring), not a regression.
+    """
+    from utils.tokenize import _count_tokens_heuristic
+
+    enc = _real_encoder()
+    real = len(enc.encode(text, disallowed_special=()))
+    heuristic = _count_tokens_heuristic(text)
+    assert heuristic >= real, (
+        f"降级计数低估了真实 token：{text!r} 启发式 {heuristic} < 真实 "
+        f"{real}——#2574 的预算突破就是这么来的"
+    )
+
+
+@pytest.mark.parametrize("text", _HIGH_ENTROPY_SAMPLES)
+@pytest.mark.parametrize("budget", [1, 5, 20])
+def test_heuristic_truncate_output_fits_real_budget(force_heuristic, text, budget):
+    """In fallback mode, what `truncate_to_tokens` returns must still fit
+    the budget when measured with the real tokenizer. This is the layer
+    the per-entry recall cap (L21, 400 tokens each) rests on."""
+    from utils.tokenize import truncate_to_tokens
+
+    enc = force_heuristic
+    out = truncate_to_tokens(text, budget)
+    real = len(enc.encode(out, disallowed_special=())) if out else 0
+    assert real <= budget, (
+        f"降级截断的输出超预算：{text!r} → {out!r} 真实 {real} > {budget}"
+    )
+
+
+@pytest.mark.parametrize("budget", [40, 120, 2200])
+def test_heuristic_line_budget_holds_against_real_tokenizer(force_heuristic, budget):
+    """In fallback mode, what `take_lines_within_token_budget` emits —
+    including the separator it will be joined with — must still fit the
+    budget when measured with the real tokenizer.
+
+    2200 is the L21 recall-block budget from #2563, the one #2574 measured
+    at 2.5-2.7x over under the old heuristic; 40 / 120 are tight enough
+    that trimming actually happens.
+
+    The single exemption is the always-keep-the-first-line rule, and it
+    only covers a first line that genuinely does not fit. So the cut is
+    also asserted to be *tight*: whatever was dropped first must be
+    something that really would have overflowed. Without that, an
+    implementation that returned only the first line no matter the budget
+    would satisfy every "within budget" assertion here. (The keep/drop
+    semantics themselves are covered in
+    `tests/unit/test_recall_render_token_budget.py`; this test only owns
+    the heuristic-vs-real half.)
+    """
+    from utils.tokenize import _count_tokens_heuristic, take_lines_within_token_budget
+
+    enc = force_heuristic
+    separator = "\n"
+    kept, dropped = take_lines_within_token_budget(
+        _HIGH_ENTROPY_SAMPLES, budget, separator=separator,
+    )
+    assert kept, "非零预算下至少要留一行"
+    assert dropped == len(_HIGH_ENTROPY_SAMPLES) - len(kept)
+
+    real = len(enc.encode(separator.join(kept), disallowed_special=()))
+    # Two or more retained lines must fit budget; single line exempt because first always kept.
+    if len(kept) > 1:
+        assert real <= budget, (
+            f"降级整段预算被突破：留了 {len(kept)} 行，真实 {real} > {budget}"
+        )
+
+    if dropped:
+        # Trimming must hug budget: adding next entry back must exceed it. Measure with heuristic,
+        # the actual fallback ruler callers use, because this asserts when to stop,
+        # not actual token count at stopping.
+        with_next = separator.join(kept + [_HIGH_ENTROPY_SAMPLES[len(kept)]])
+        assert _count_tokens_heuristic(with_next) > budget, (
+            f"裁剪提前收手：留了 {len(kept)} 行、丢了 {dropped} 行，但加上"
+            f"下一条才 {_count_tokens_heuristic(with_next)} ≤ {budget}"
+        )
+
+
 # ── PersonaManager._score_trim_entries ─────────────────────────────
 
 
@@ -130,7 +316,7 @@ def _persona_manager():
     cm.get_character_data = MagicMock(return_value=(
         "主人", "小天", {}, {}, {"human": "主人"}, {}, {}, {}, {},
     ))
-    with patch("memory.persona.get_config_manager", return_value=cm):
+    with patch("memory.persona.manager.get_config_manager", return_value=cm):
         pm = PersonaManager()
     pm._config_manager = cm
     return pm
@@ -152,10 +338,14 @@ def _entry(eid: str, text: str, *, rein: float = 0.0, disp: float = 0.0,
     }
 
 
-def test_score_trim_breaks_at_budget():
-    """Sorted by (score, importance) DESC, stop at first entry whose
-    cumulative tokens would exceed budget. Lower-score entries are
-    silently dropped — they don't sneak in via fallback."""
+def test_score_trim_stays_within_budget():
+    """Sorted by (score, importance) DESC; the accumulated token count
+    never crosses the cap. Lower-score entries that don't fit are dropped
+    — they don't sneak in via fallback.
+
+    (An entry that doesn't fit is skipped rather than ending the loop; the
+    same-size fixture here can't tell the two apart, so that rule has its
+    own guard in `test_memory_render_token_budget.py`.)"""
     pm = _persona_manager()
     now = datetime.now()
     entries = [
@@ -165,7 +355,7 @@ def test_score_trim_breaks_at_budget():
         _entry('e4', 'D' * 40, rein=0.0),
     ]
     # tiny budget that fits ~1.5 entries given the all-latin text
-    kept = pm._score_trim_entries(entries, budget=15, now=now)
+    kept, used = pm._score_trim_entries(entries, budget=15, now=now)
 
     # At minimum the highest-score entry survives; nothing past the budget
     assert kept, "expected at least one entry under non-zero budget"
@@ -174,6 +364,11 @@ def test_score_trim_breaks_at_budget():
     )
     assert all(k['id'] != 'e4' for k in kept), (
         "lowest-score entry must be dropped under tight budget"
+    )
+    assert used <= 15, "kept token sum must respect the cap it was given"
+    assert used == sum(count_tokens(k['text']) for k in kept), (
+        "reported usage must match what the kept entries actually cost — "
+        "the per-subject allocator hands the remainder to the next subject"
     )
 
 
@@ -185,7 +380,7 @@ def test_score_trim_importance_breaks_score_ties():
         _entry('b', 'short', rein=2.0, importance=9),  # higher importance
         _entry('c', 'short', rein=2.0, importance=5),
     ]
-    kept = pm._score_trim_entries(entries, budget=10**6, now=now)
+    kept, _used = pm._score_trim_entries(entries, budget=10**6, now=now)
     # All fit; ordering must be by importance DESC inside the same score
     assert [k['id'] for k in kept] == ['b', 'c', 'a']
 
@@ -248,6 +443,103 @@ def test_split_promotes_legacy_string_facts(tmp_path):
     )
 
 
+def test_split_drops_whitespace_only_string_facts(tmp_path):
+    """Whitespace gate for bare strings (#2578 fixed dict entries only): '   ' is truthy,
+    and promotion bypassed dict-path _renderable_text validation, rendering empty bullets.
+    Match dict semantics with strip."""  # noqa: DOCSTRING_CJK
+    pm = _persona_manager()
+    persona = {
+        'master': {'facts': [
+            '   ',
+            '  \t ',
+            # Nonstr false-like values: bare str() emptiness checks render "None"/"False"/"0"
+            # as text (caught in review). Legacy form accepts bare strings only,
+            # discarding all others.
+            None,
+            False,
+            0,
+            _entry('m1', 'normal dict entry', rein=1.0),
+            'legacy string fact about master',
+        ]},
+    }
+    protected, by_entity = pm._split_persona_for_render(persona)
+    assert protected == []
+    texts = [e.get('text', '') for e in by_entity.get('master', [])]
+    assert texts == ['normal dict entry', 'legacy string fact about master'], (
+        f"纯空格裸字符串 / 非 str 假值不得被 promote 成可渲染条目: {texts!r}"
+    )
+
+
+def test_compose_skips_blank_dict_entries_even_if_split_missed_them():
+    """Independent compose guard: split already rejects blank entries, but compose must
+    independently use _renderable_text, not truthiness; loosened upstream invariants would
+    otherwise inject '- ' empty bullets. Bypass split and invoke compose directly."""  # noqa: DOCSTRING_CJK
+    pm = _persona_manager()
+    blank = _entry('b1', '   ')
+    good = _entry('g1', '主人喜欢辣条', rein=1.0)
+    persona = {'master': {'facts': [blank, good]}}
+    md = pm._compose_markdown_from_trimmed(
+        '小天', persona, {'human': '主人'},
+        [], [blank, good],
+        {id(blank): 'master', id(good): 'master'},
+        [], [],
+    )
+    assert '主人喜欢辣条' in md
+    blank_bullets = [
+        line for line in md.splitlines()
+        if line.startswith('- ') and not line[2:].strip()
+    ]
+    assert blank_bullets == [], (
+        f"compose 渲染出了空 bullet 行: {blank_bullets!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_render_emits_no_blank_bullets_for_legacy_blank_strings(tmp_path):
+    """End-to-end: facts containing whitespace-only bare strings (legacy pre-PR-1 form)
+    must produce Markdown without empty bullets. Compose must also use
+    _renderable_text, never truthiness."""  # noqa: DOCSTRING_CJK
+    from memory.persona import PersonaManager
+
+    cm = MagicMock()
+    cm.memory_dir = str(tmp_path)
+    cm.aget_character_data = AsyncMock(return_value=(
+        "主人", "小天", {}, {}, {"human": "主人"}, {}, {}, {}, {},
+    ))
+    cm.get_character_data = MagicMock(return_value=(
+        "主人", "小天", {}, {}, {"human": "主人"}, {}, {}, {}, {},
+    ))
+    cm.get_config_value.return_value = False
+    with patch("memory.persona.manager.get_config_manager", return_value=cm):
+        pm = PersonaManager()
+    pm._config_manager = cm
+
+    persona = {
+        'master': {'facts': [
+            '   ',
+            '  \t ',
+            _entry('m1', '主人喜欢辣条', rein=1.0),
+        ]},
+    }
+    pm._personas['小天'] = persona
+
+    async def _aensure(name):
+        return persona
+    pm.aensure_persona = _aensure  # type: ignore[assignment]
+    pm.aupdate_suppressions = AsyncMock()
+
+    md = await pm.arender_persona_markdown('小天')
+
+    assert '主人喜欢辣条' in md
+    blank_bullets = [
+        line for line in md.splitlines()
+        if line.startswith('- ') and not line[2:].strip()
+    ]
+    assert blank_bullets == [], (
+        f"渲染出了空 bullet 行: {blank_bullets!r}"
+    )
+
+
 @pytest.mark.asyncio
 async def test_render_persona_independent_from_reflection_budget(tmp_path):
     """S11: persona overflow must not crowd reflection rendering, and
@@ -263,7 +555,7 @@ async def test_render_persona_independent_from_reflection_budget(tmp_path):
         "主人", "小天", {}, {}, {"human": "主人"}, {}, {}, {}, {},
     ))
     cm.get_config_value.return_value = False
-    with patch("memory.persona.get_config_manager", return_value=cm):
+    with patch("memory.persona.manager.get_config_manager", return_value=cm):
         pm = PersonaManager()
     pm._config_manager = cm
 
@@ -324,7 +616,7 @@ async def test_render_protected_always_emitted_under_tight_budget(tmp_path):
     cm.get_character_data = MagicMock(return_value=(
         "主人", "小天", {}, {}, {"human": "主人"}, {}, {}, {}, {},
     ))
-    with patch("memory.persona.get_config_manager", return_value=cm):
+    with patch("memory.persona.manager.get_config_manager", return_value=cm):
         pm = PersonaManager()
     pm._config_manager = cm
 
@@ -342,7 +634,7 @@ async def test_render_protected_always_emitted_under_tight_budget(tmp_path):
     pm.aupdate_suppressions = AsyncMock()
 
     # Force the persona budget to 1 so non-protected entries cannot fit.
-    with patch('memory.persona.PERSONA_RENDER_TOKEN_BUDGET', 1):
+    with patch('memory.persona.rendering.PERSONA_RENDER_MAX_TOKENS', 1):
         md = await pm.arender_persona_markdown('小天')
 
     assert '主人是一只猫娘的主人' in md, (
@@ -391,7 +683,7 @@ async def test_arender_preserves_reflection_score_order(tmp_path):
     cm.get_character_data = MagicMock(return_value=(
         "主人", "小天", {}, {}, {"human": "主人"}, {}, {}, {}, {},
     ))
-    with patch("memory.persona.get_config_manager", return_value=cm):
+    with patch("memory.persona.manager.get_config_manager", return_value=cm):
         pm = PersonaManager()
     pm._config_manager = cm
 
@@ -425,8 +717,8 @@ async def test_arender_preserves_reflection_score_order(tmp_path):
     assert pending_header in md
     assert confirmed_header in md
 
-    # Within pending section: 高分pending (rein=5.0) must appear before
-    # 低分pending (rein=0.5).
+    # Within pending section: high-score pending (rein=5.0) must appear before
+    # low-score pending (rein=0.5).
     pending_section = md.split(pending_header, 1)[1]
     # Next section starts with '\n\n### ' — cut there.
     pending_body = pending_section.split('\n\n### ', 1)[0]
@@ -439,8 +731,8 @@ async def test_arender_preserves_reflection_score_order(tmp_path):
         f"pending must be score-DESC; got 高分@{high_pos} vs 低分@{low_pos}"
     )
 
-    # Within confirmed section: 最高confirmed (rein=9.0) must appear
-    # before 中分confirmed (rein=2.0).
+    # Within confirmed section: highest confirmed (rein=9.0) must appear
+    # before medium-score confirmed (rein=2.0).
     confirmed_section = md.split(confirmed_header, 1)[1]
     confirmed_body = confirmed_section.split('\n\n### ', 1)[0]
     top_pos = confirmed_body.find('最高confirmed')

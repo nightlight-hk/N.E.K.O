@@ -1,18 +1,32 @@
 # -*- coding: utf-8 -*-
+# Copyright 2025-2026 Project N.E.K.O. Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
-Telemetry Server — SQLite 存储
+Telemetry Server — SQLite storage
 
-设计：
-- events 表：append-only 原始事件日志（审计追踪，不可篡改）
-- daily_aggregates 表：预聚合统计（UPSERT 累加）
-- devices 表：设备活跃度追踪
-- WAL 模式：写不阻塞读
+Design:
+- events table: append-only raw event log (audit trail, tamper-evident)
+- daily_aggregates table: pre-aggregated stats (UPSERT accumulation)
+- devices table: device activity tracking
+- WAL mode: writes do not block reads
 
-容量评估（20k DAU）：
-- 3 进程/设备 × 6 req/h × 8h ≈ 144 req/设备/天
-- 20k × 144 ≈ 2.88M events/天（峰值 ~50 req/s）
-- SQLite WAL 单线程写入 ~500 req/s，单实例足够
-- events 表按 180 天清理，聚合表永久保留
+Capacity estimate (20k DAU):
+- 3 processes/device × 6 req/h × 8h ≈ 144 req/device/day
+- 20k × 144 ≈ 2.88M events/day (peak ~50 req/s)
+- SQLite WAL single-threaded writes ~500 req/s; a single instance is enough
+- events table pruned at 180 days; aggregate tables kept forever
 """
 from __future__ import annotations
 
@@ -31,16 +45,16 @@ _logger = logging.getLogger("telemetry.storage")
 
 
 def _bucket_quantile(buckets: list, bounds: list, q: float) -> dict:
-    """近似分位数：找累计样本数首次 >= q*total 的桶，返回该桶上界。
+    """Approximate quantile: find the first bucket whose cumulative sample count >= q*total; return that bucket's upper bound.
 
     Args:
-        buckets: 桶 count 列表，最后一个是溢出桶（>最右 bound）
-        bounds: 桶上界列表，len(bounds) == len(buckets) - 1
-        q: 分位数（0~1）
+        buckets: list of bucket counts; the last one is the overflow bucket (> rightmost bound)
+        bounds: list of bucket upper bounds, len(bounds) == len(buckets) - 1
+        q: quantile (0~1)
 
     Returns:
-        {"upper_bound": 数值或 None, "bucket_index": int}
-        upper_bound None 表示落在溢出桶（无上界）。
+        {"upper_bound": number or None, "bucket_index": int}
+        upper_bound None means it falls in the overflow bucket (no upper bound).
     """
     total = sum(buckets) if buckets else 0
     if total <= 0:
@@ -56,11 +70,12 @@ def _bucket_quantile(buckets: list, bounds: list, q: float) -> dict:
 
 
 def _as_int_count(x) -> int | None:
-    """把整数计数语义的值归一化成 int；非整数 / NaN / Inf / bool 返回 None。
+    """Normalize an integer-count-semantics value to int; non-integer / NaN / Inf / bool return None.
 
-    histogram 的 count 和 bucket 必须是整数计数。接受 int 或整数值 float
-    （如 ``4.0``，跨序列化器容差），拒 ``4.5`` / NaN / Inf / True/False。
-    归一化后再做 sum==count 校验和写库，避免 ``int()`` 截断造成不一致。
+    A histogram's count and buckets must be integer counts. Accepts int or
+    integer-valued float (e.g. ``4.0``, tolerance across serializers); rejects
+    ``4.5`` / NaN / Inf / True/False. Normalize first, then run the sum==count check
+    and DB write, avoiding inconsistencies from ``int()`` truncation.
     """
     if isinstance(x, bool):
         return None
@@ -73,24 +88,29 @@ def _as_int_count(x) -> int | None:
 
 
 def normalize_steam_id(raw) -> str:
-    """把任意来源的 steam_user_id 归一化为 canonical 十进制 Steam64，非法返回 ''。
+    """Normalize a steam_user_id from any source to the canonical decimal Steam64; invalid input returns ''.
 
-    单一事实源：ingest（server.py）和 canonical 边构建（扫 events.payload）共用
-    这一份，避免两条写路径规则漂移把同一身份拆成两个节点。
+    Single source of truth: ingest (server.py) and canonical edge building (scanning
+    events.payload) share this one implementation, so the two write paths cannot
+    drift apart and split one identity into two nodes.
 
-    raw 不标注 str：边构建扫的是原始 events.payload JSON，伪造 / 异常行的
-    steam_user_id 可能是 number / null / 其它类型，直接 .isdigit() 会抛异常。
-    先做类型守卫再走字符串规则。ingest 侧传进来的是 Pydantic str，守卫对它无害。
+    raw is intentionally untyped (not str): edge building scans raw events.payload
+    JSON, where a forged / anomalous row's steam_user_id may be number / null /
+    another type; calling .isdigit() directly would throw. Type-guard first, then
+    apply the string rules. Ingest passes a Pydantic str, for which the guard is
+    harmless.
 
-    规则（与历史 ingest 一致）：纯数字 + 长度 <= 20（u64 十进制 20 位，cheap
-    pre-check 挡超长串 DoS）+ 0 < int < 2^64（排除 '0'/'00' 哨兵和超界值）+
-    str(int()) 去前导零（否则 '00076561...' 会和 '76561...' 被当成两个账号）。
+    Rules (consistent with historical ingest): pure digits + length <= 20 (u64 has
+    20 decimal digits; cheap pre-check against oversized-string DoS) +
+    0 < int < 2^64 (excludes the '0'/'00' sentinels and out-of-range values) +
+    str(int()) to drop leading zeros (otherwise '00076561...' and '76561...' would
+    count as two different accounts).
     """
     if not isinstance(raw, str):
         return ""
-    # 必须 isascii：str.isdigit() 对 Unicode 数字（如上标 '²'、阿拉伯-印度数字）
-    # 返回 True，但 int('²') 抛 ValueError。不挡的话 ingest 会 500、且 build_edges
-    # 在事务里抛异常回滚、游标不前进 —— 一条伪造事件就能永久卡死 canonical 重建。
+    # Require isascii: isdigit accepts Unicode superscripts/Arabic-Indic digits,
+    # but int('²') raises ValueError. Without guarding, ingest returns 500 and transactional
+    # build_edges rolls back without advancing, letting one forged event permanently block canonical rebuilds.
     if not raw.isascii() or not raw.isdigit() or len(raw) > 20:
         return ""
     value = int(raw)
@@ -99,9 +119,9 @@ def normalize_steam_id(raw) -> str:
     return ""
 
 
-# device_hw 服务端白名单：公开 ingest 边界上客户端串不可信（HMAC 密钥开源可读），
-# 伪造请求能把任意 64 字符 preserve-known 进 devices.device_hw，污染"设备画像"基数
-# 或注入 PII。只放行 os|arch|ram_tier|cpu_tier 四段、每段在已知 enum 内的串。
+# Allowlist device_hw at public ingest: open-source HMAC secrets make client strings untrusted;
+# forged requests could preserve-known arbitrary 64-character hardware profiles, inflating cardinality
+# or injecting PII. Require four os|arch|ram_tier|cpu_tier segments, each from known enums.
 _DEVICE_HW_ALLOWED = (
     {"win", "mac", "linux", "other"},
     {"x86_64", "arm64", "other"},
@@ -111,11 +131,13 @@ _DEVICE_HW_ALLOWED = (
 
 
 def normalize_device_hw(raw) -> str:
-    """校验 device_hw 复合串（与客户端 _get_device_hw 同口径），非法回退 ''。
+    """Validate the device_hw composite string (same semantics as the client's _get_device_hw); invalid input falls back to ''.
 
-    server 边界防伪造污染：只放行恰好 4 段、每段命中对应 enum 的串，其余一律 ''
-    （含 None / 非 str / 段数不符 / 任一段越界）。与 steam_user_id 同样在 ingest
-    边界做白名单，守 device_hw 的低基数 + 零 PII 契约。
+    Server-boundary anti-forgery: only pass strings with exactly 4 segments, each
+    hitting its corresponding enum; everything else becomes '' (including None /
+    non-str / wrong segment count / any out-of-range segment). Like steam_user_id,
+    whitelisting at the ingest boundary protects device_hw's low-cardinality +
+    zero-PII contract.
     """
     if not isinstance(raw, str) or not raw:
         return ""
@@ -128,7 +150,7 @@ def normalize_device_hw(raw) -> str:
 
 
 class TelemetryStorage:
-    """线程安全的 SQLite 遥测存储。"""
+    """Thread-safe SQLite telemetry storage."""
 
     def __init__(self, db_path: str | Path = "telemetry.db"):
         self._db_path = str(db_path)
@@ -144,9 +166,9 @@ class TelemetryStorage:
             conn.execute("PRAGMA synchronous=NORMAL")
             conn.execute("PRAGMA busy_timeout=10000")
             conn.row_factory = sqlite3.Row
-            # 关掉 Python 的隐式事务管理，改由 _transaction 手动 BEGIN IMMEDIATE。
-            # 默认 deferred 事务在 WAL 下读不取写锁，histogram 的 read-merge-write
-            # 中间会被并发写者插入 → 丢更新。
+            # Disable Python implicit transactions; _transaction explicitly uses BEGIN IMMEDIATE.
+            # Default WAL deferred transactions do not take write locks on reads, allowing concurrent
+            # writers between histogram read/merge/write steps and losing updates.
             conn.isolation_level = None
             self._local.conn = conn
         return self._local.conn
@@ -154,12 +176,12 @@ class TelemetryStorage:
     @contextmanager
     def _transaction(self):
         conn = self._get_conn()
-        # BEGIN IMMEDIATE：事务一开始就取 SQLite 写锁，让 store_event 里
-        # histogram 的"读旧 buckets → Python 合并 → 写回"对并发写者（多 worker /
-        # 多进程，各自独立连接，甚至同一 device 的 main/agent/memory 三进程同时
-        # POST）串行化。否则两个请求都读到同一份旧 buckets、各自合并、后写者
-        # 覆盖前写者，bucket 分布与 count/sum 漂移（Codex P1）。busy_timeout=10000
-        # 让并发写者阻塞等待而非立刻 "database is locked"。
+        # BEGIN IMMEDIATE acquires SQLite write locks at transaction start, serializing store_event's
+        # read-buckets/Python-merge/writeback against other workers/processes with independent connections,
+        # including same-device main/agent/memory simultaneous reports.
+        # Otherwise both requests read old buckets, merge independently, and later writes overwrite
+        # earlier data, diverging bucket distributions from count/sum (Codex P1). busy_timeout=10000
+        # waits for writers instead of immediately reporting database-locked errors.
         conn.execute("BEGIN IMMEDIATE")
         try:
             yield conn
@@ -316,19 +338,19 @@ class TelemetryStorage:
                 CREATE INDEX IF NOT EXISTS idx_ih_date ON instrument_histograms(stat_date);
                 CREATE INDEX IF NOT EXISTS idx_ih_key  ON instrument_histograms(metric_key);
             """)
-            # 老库 devices 表上线时还没有 branch/locale/timezone/distribution/steam_user_id
-            # 列。CREATE TABLE IF NOT EXISTS 不会动已存在的 schema，所以这里显式
-            # 补列；ALTER ADD COLUMN 在 SQLite 上是 O(1)，已有行的列值用 DEFAULT 填。
-            # try/except 是必要的：多进程部署（gunicorn workers / 多副本）首次
-            # 启动时会同时跑迁移，PRAGMA + ALTER 不是原子的，一个 worker ALTER
-            # 成功后第二个 worker 仍按陈旧的 PRAGMA 结果尝试 ALTER，会撞
-            # "duplicate column name"。捕获并忽略让迁移在并发下幂等。
+            # Older devices tables predate branch/locale/timezone/distribution/steam_user_id
+            # columns. CREATE TABLE IF NOT EXISTS leaves existing schemas unchanged,
+            # so add columns explicitly; SQLite ALTER ADD COLUMN is O(1), filling existing rows with DEFAULT.
+            # Catch exceptions because concurrent workers/replicas may migrate at initial
+            # startup; PRAGMA plus ALTER is not atomic, so after one worker adds a column,
+            # another acts on stale PRAGMA results and hits
+            # duplicate-column errors. Ignore those to keep concurrent migration idempotent.
             existing_cols = {
                 r[1] for r in conn.execute("PRAGMA table_info(devices)").fetchall()
             }
-            # (列名, 默认 sentinel) —— 分类字段缺失为 'unknown'，
-            # steam_user_id 是 ID 字段缺失为空 string，server 端 UPSERT 用对应
-            # sentinel 做 preserve-known 判断。
+            # (column, default sentinel): missing categorical fields use 'unknown';
+            # missing Steam ID uses empty strings, with corresponding UPSERT
+            # preserve-known sentinel checks.
             _new_cols = (
                 ("branch", "unknown"),
                 ("locale", "unknown"),
@@ -345,16 +367,16 @@ class TelemetryStorage:
                         f"ALTER TABLE devices ADD COLUMN {col_name} TEXT NOT NULL DEFAULT '{default}'"
                     )
                 except sqlite3.OperationalError as e:
-                    # 只吞 "duplicate column name"，其它 schema 错误照常往上抛。
+                    # Swallow duplicate-column-name errors only; propagate other schema failures.
                     if "duplicate column name" not in str(e).lower():
                         raise
             conn.commit()
             self._initialized = True
 
-    # ----- 写入 -----
+    # -- Writes --
 
     def is_duplicate_batch(self, batch_id: str | None) -> bool:
-        """检查 batch_id 是否已处理过。无 batch_id 时不做去重。"""
+        """Check whether batch_id was already processed. No dedup when batch_id is absent."""
         if not batch_id:
             return False
         conn = self._get_conn()
@@ -369,8 +391,8 @@ class TelemetryStorage:
                     instruments: dict | None = None):
         today = date.today().isoformat()
         with self._transaction() as conn:
-            # denylist 收口：删号后该 Steam64 不得经任何上报写回 devices 列。
-            # 在事务内判定（写串行，看得到已提交的 denylist），把它折叠成空串。
+            # Denylist consolidation: deleted Steam64 IDs must never reenter devices through reports.
+            # Check within serialized write transactions so committed denylists are visible, replacing IDs with ''.
             if steam_user_id and conn.execute(
                 "SELECT 1 FROM steam_id_denylist WHERE steam_user_id = ?", (steam_user_id,)
             ).fetchone():
@@ -380,11 +402,11 @@ class TelemetryStorage:
                     "INSERT OR IGNORE INTO seen_batches (batch_id) VALUES (?)",
                     (batch_id,),
                 )
-                # 真幂等闸：rowcount==0 = batch_id 已存在（server.py 预检与本次
-                # 写入之间的 TOCTOU / 并发重试）。配合 _transaction 的 BEGIN
-                # IMMEDIATE 写锁，此检查与下游写入原子——第二个并发请求在这里
-                # 短路，不再继续写 events / daily_aggregates / instrument_*，
-                # 避免双写双计（CodeRabbit）。
+                # True idempotence gate: rowcount=0 means batch_id already exists from races
+                # between server prechecks/writes or concurrent retries. BEGIN IMMEDIATE
+                # makes this check atomic with downstream writes; second requests short-circuit
+                # before events/daily_aggregates/instrument writes,
+                # preventing double persistence/counting (CodeRabbit).
                 if cur.rowcount == 0:
                     return
             conn.execute(
@@ -415,16 +437,16 @@ class TelemetryStorage:
                         bucket.get("total_tokens", 0), bucket.get("cached_tokens", 0),
                         bucket.get("call_count", 0), 0,
                     )
-            # branch 在客户端首次启动后落盘并保持稳定，理论上同一 device 只该
-            # 看到一个非 unknown 值；非 unknown 时直接覆写（清盘重抽时也只会是
-            # 新真值）。locale / timezone / distribution 每次取实时值，同样仅当
-            # 非 unknown 才覆写 —— 老客户端没带这些字段时 Pydantic 默认 'unknown'，
-            # 或新客户端临时检测失败（例如 tzlocal 抛错）时，都不应该把上一次
-            # 已知的好值抹成 'unknown'。
-            # branch/locale/timezone/distribution 缺失 sentinel 是 'unknown'，
-            # steam_user_id 是空 string（ID 字段不该用 'unknown' 占位 —— 它会
-            # 被下游 join 当成合法 ID）。两种 sentinel 都走 preserve-known：
-            # incoming 是 sentinel 时不覆写历史。
+            # Clients persist stable branch on first launch; one device normally has only one known
+            # value. Known values overwrite, including fresh truth after reset/reassignment.
+            # locale/timezone/distribution are current readings, likewise overwriting only when
+            # known. Older clients omit fields and default to unknown, while transient
+            # detection failures such as tzlocal errors must not erase
+            # previous good values with unknown.
+            # branch/locale/timezone/distribution use 'unknown' sentinels;
+            # steam_user_id uses empty strings, never unknown as an apparently valid
+            # downstream JOIN ID. Both sentinel types preserve known values,
+            # leaving history unchanged for sentinel inputs.
             conn.execute("""
                 INSERT INTO devices (device_id, app_version, branch, locale, timezone, distribution, steam_user_id, device_hw,
                                      first_seen, last_seen, event_count)
@@ -453,17 +475,18 @@ class TelemetryStorage:
                     event_count = event_count + 1
             """, (device_id, app_version, branch, locale, timezone, distribution, steam_user_id, device_hw))
 
-            # Instrument 累加（同事务内）：失败回滚整批，daily_stats 不会
-            # 在 instruments 失败时半截入库。
+            # Accumulate instruments in the same transaction; failure rolls back the whole batch,
+            # preventing partially persisted daily_stats after instrument failures.
             if instruments:
                 self._apply_instruments(conn, device_id, instruments, fallback_stat_date=today)
 
     def store_instruments(self, device_id: str, instruments: dict | None,
                           fallback_stat_date: str | None = None) -> None:
-        """累加 instrument snapshot 的独立入口（自己开 transaction）。
+        """Standalone entry point for accumulating instrument snapshots (opens its own transaction).
 
-        通常由 store_event 在自己的事务里调 _apply_instruments；此入口给
-        独立测试 / 离线导入 / 跨表回填等场景用。
+        Normally store_event calls _apply_instruments inside its own transaction;
+        this entry point serves standalone tests / offline imports / cross-table
+        backfills.
         """
         if not instruments:
             return
@@ -472,38 +495,39 @@ class TelemetryStorage:
 
     def _apply_instruments(self, conn, device_id: str, instruments: dict | None,
                            fallback_stat_date: str | None = None) -> None:
-        """累加 instrument snapshot（counter + histogram）。须在已开 transaction 的 conn 上调用。
+        """Accumulate an instrument snapshot (counter + histogram). Must be called on a conn with an open transaction.
 
         Args:
-            conn: 调用方持有的事务连接
-            device_id: 上报设备
-            instruments: 客户端 utils/instrument.Instrument.snapshot() 的产物，
-                结构: {window_start, window_end, bounds, counters, histograms}
-            fallback_stat_date: 若 instruments 不带时间窗口或解析失败，用此值
-                作 stat_date（一般传 'today'）。
+            conn: transaction connection held by the caller
+            device_id: reporting device
+            instruments: output of the client's utils/instrument.Instrument.snapshot(),
+                shape: {window_start, window_end, bounds, counters, histograms}
+            fallback_stat_date: used as stat_date when instruments carries no time
+                window or parsing fails (usually pass 'today').
 
-        失败处理：单条 metric 解析失败不影响其它，整段失败抛 sqlite3 异常
-        由调用方 transaction 回滚。
+        Failure handling: a single metric failing to parse does not affect the
+        others; a whole-section failure raises sqlite3 errors for the caller's
+        transaction to roll back.
         """
         if not instruments or not isinstance(instruments, dict):
             return
 
-        # stat_date 选取优先级（CodeRabbit 反馈正解）：
-        #   1) 客户端 snapshot 里的 ``stat_date``（客户端本地日历天） —
-        #      跟客户端的 ``daily_stats`` key 完全同口径，跨时区设备
-        #      在午夜附近上报不会被服务端本地时区误拆到两天。
-        #   2) window_end 时间戳按服务端时区落天 — 老客户端兼容回退。
-        #   3) fallback_stat_date（一般是 today.isoformat()）— 兜底。
-        # 兜底：fallback_stat_date（一般 today）。下面按优先级求一个 candidate
-        # 日期，但**两条来源都必须过同一个 recency 校验**才采用。
+        # stat_date precedence, correctly identified by CodeRabbit:
+        #   1) Client snapshot stat_date, its local calendar day, matching
+        #      daily_stats keys and preventing server-local timezone from splitting
+        #      near-midnight reports from one device across dates.
+        #   2) Server-timezone day from window_end for older clients.
+        #   3) fallback_stat_date, usually today.isoformat().
+        # Start with fallback_stat_date, normally today; select candidate dates below,
+        # but both sources require the same recency validation.
         today = date.today()
         stat_date = today.isoformat()
-        # recency anchor：在线实时上报锚到今天；但 store_instruments 文档承诺支持
-        # 离线导入 / 跨表回填——调用方显式传了 fallback_stat_date 时，就拿它当
-        # anchor 校验历史样本，否则合法的历史快照会被压回今天打歪导入分区。
-        # live 路径传的 fallback 就是 today，行为不变。
-        # **只有解析成功才把 fallback 回填进 stat_date** —— 否则像 "foo" 这种
-        # 无效 fallback 会被原样落库污染 retention 分区（CodeRabbit）。
+        # Live reports anchor to today, while store_instruments also promises offline
+        # imports/cross-table backfill. Explicit fallback_stat_date becomes the validation
+        # anchor, avoiding mispartitioning valid historical snapshots into today.
+        # Live paths explicitly pass today, preserving behavior.
+        # Assign fallback to stat_date only after successful parsing, never persisting invalid
+        # fallback strings like foo into retention partitions (CodeRabbit).
         recency_anchor = today
         if fallback_stat_date:
             try:
@@ -513,9 +537,9 @@ class TelemetryStorage:
                 recency_anchor = today
         candidate: date | None = None
 
-        # 来源 1：客户端 snapshot 的 stat_date（客户端本地日历天，跟 daily_stats
-        # 同口径）。HMAC 密钥在开源客户端可读，伪造 payload 可塞
-        # "9999-99-99"/"abcd-ef-gh"（解析失败）或 "9999-12-31"（能解析但越界）。
+        # Source 1: client snapshot stat_date, its local day matching daily_stats.
+        # Open-source HMAC secrets permit forged payload dates like
+        # invalid 9999-99-99/abcd-ef-gh or parseable but out-of-range 9999-12-31.
         client_date = instruments.get("stat_date")
         if isinstance(client_date, str) and len(client_date) == 10:
             try:
@@ -523,9 +547,9 @@ class TelemetryStorage:
             except ValueError:
                 candidate = None
 
-        # 来源 2：window_end 时间戳按服务端时区落天（老客户端 / client_date 缺失
-        # 时回退）。同样要过下面的 recency 校验——偏斜时钟或伪造的 window_end
-        # 也能造远期 stat_date 逃过 retention（Codex）。
+        # Source 2: window_end's server-local day for older/missing client_date.
+        # Apply identical recency checks because skewed/forged window_end also
+        # creates retention-exempt future partitions (Codex).
         if candidate is None:
             window_end = instruments.get("window_end")
             if isinstance(window_end, (int, float)) and window_end > 0:
@@ -535,10 +559,10 @@ class TelemetryStorage:
                 except (TypeError, ValueError, OSError, OverflowError):
                     candidate = None
 
-        # 统一 recency 校验：instrument 是实时窗口（snapshot clear-on-read，不从
-        # unsent 队列补发历史），stat_date 必≈服务端今天。客户端时区最多 ±14h +
-        # 时钟偏差，放宽到 ±2 天。越界（伪造未来日期 / 时钟错乱）一律走 fallback，
-        # 否则字典序 retention（stat_date < cutoff）永远 prune 不掉、污染 dashboard。
+        # Shared recency check: instruments are live clear-on-read windows, not historical
+        # unsent replay, so dates approximate server today. Allow +/-2 days for up to
+        # +/-14-hour client timezones and clock skew. Out-of-range future/broken-clock dates
+        # fall back or lexical stat_date<cutoff retention never removes dashboard pollution.
         if candidate is not None and abs((candidate - recency_anchor).days) <= 2:
             stat_date = candidate.isoformat()
 
@@ -551,14 +575,14 @@ class TelemetryStorage:
         for metric_key, value in counters.items():
             if not isinstance(metric_key, str) or not isinstance(value, (int, float)):
                 continue
-            # 拒 NaN / Inf：SQLite REAL NOT NULL 收到 NaN 会被 Python binding
-            # 映射成 NULL → IntegrityError → 整个 store_event 事务回滚，连带
-            # 合法的 daily_stats 一起丢。跳过单个坏样本而非炸整批（Codex P2）。
+            # Reject NaN/Inf: Python SQLite binds NaN as NULL into REAL NOT NULL,
+            # raising IntegrityError and rolling back store_event, including valid
+            # daily_stats. Skip individual bad samples rather than abort whole batches (Codex P2).
             if not math.isfinite(value):
                 continue
             if len(metric_key) > 256:
-                # 防御：客户端误传超长 key。截断不合并 —— 截断后可能跟
-                # 已有 key 冲突 UPSERT，污染数据。直接丢。
+                # Reject overlong client keys; truncation could collide with existing
+                # UPSERT keys and corrupt data.
                 continue
             conn.execute("""
                 INSERT INTO instrument_counters (stat_date, device_id, metric_key, value)
@@ -579,11 +603,11 @@ class TelemetryStorage:
             raw_buckets = h.get("buckets") or []
             if not isinstance(raw_buckets, list):
                 continue
-            # count 和 bucket 是**整数计数**语义：归一化成 int（接受 int 或
-            # 整数值 float 如 4.0），非整数值 / NaN / Inf / bool 一律 reject。
-            # 否则后面写库 int(count) 截断会让 count 与 buckets 落库后不一致
-            # （如 count=0.5, buckets=[0.5] 能过 sum==count 浮点校验，但写库
-            # int(0.5)=0 而 buckets 存 [0.5]，dashboard 分位数算错）（CodeRabbit）。
+            # Counts/buckets are integer quantities; accept ints or integral floats such
+            # as 4.0, rejecting fractional/NaN/Inf/bool values.
+            # Otherwise database int(count) truncation makes stored counts disagree with buckets:
+            # count=0.5/buckets=[0.5] passes floating sum equality but
+            # persists count=0 alongside [0.5], breaking quantiles (CodeRabbit).
             count = _as_int_count(count)
             if count is None:
                 continue
@@ -597,13 +621,13 @@ class TelemetryStorage:
                 buckets.append(bi)
             if not _bucket_ok:
                 continue
-            # hsum 是观测值之和，可以是小数（如延迟求和），只要 finite 非 bool。
+            # hsum sums observations and may be fractional, e.g. latency, if finite and nonbool.
             if isinstance(hsum, bool) or not isinstance(hsum, (int, float)) or not math.isfinite(hsum):
                 continue
-            # 形状自洽校验（防伪造 / 损坏 payload 把 dashboard 静默带歪）：
-            # get_histogram_summary 的 avg 用 count、p50/p95 用 buckets，count 与
-            # buckets 不一致就会让两个数字打架。要求 count 非负、bucket 非负、
-            # bounds 长度匹配（len==buckets-1，溢出桶）、且 sum(buckets)==count。
+            # Validate shape consistency against forged/corrupt payloads silently skewing dashboards:
+            # averages use counts, while p50/p95 use buckets, so mismatches
+            # contradict metrics. Require nonnegative count/buckets,
+            # matching bound length len(bounds)=len(buckets)-1 for overflow, and sum(buckets)=count.
             if count < 0 or any(b < 0 for b in buckets):
                 continue
             if bounds and len(bounds) != len(buckets) - 1:
@@ -611,8 +635,8 @@ class TelemetryStorage:
             if sum(buckets) != count:
                 continue
 
-            # SQL 不擅长 array element-wise 加；读出现有 buckets，
-            # Python 端合并，再写回。同一 transaction 内保证一致性。
+            # SQL lacks convenient elementwise array addition; read old buckets,
+            # merge in Python, and write back within one consistent transaction.
             row = conn.execute(
                 "SELECT buckets FROM instrument_histograms "
                 "WHERE stat_date = ? AND device_id = ? AND metric_key = ?",
@@ -624,8 +648,8 @@ class TelemetryStorage:
                 try:
                     existing = json.loads(row["buckets"])
                     if isinstance(existing, list):
-                        # 长度不一致时取 max 并 zero-pad —— 给客户端
-                        # 改桶定义留缓冲（迁移期混合数据不爆炸）。
+                        # Use maximum length and zero-pad mismatches, accommodating changed
+                        # bucket definitions without breaking mixed migration data.
                         n = max(len(existing), len(buckets))
                         merged_buckets = [
                             (existing[i] if i < len(existing) else 0)
@@ -672,7 +696,7 @@ class TelemetryStorage:
               prompt_tokens, completion_tokens, total_tokens, cached_tokens,
               call_count, error_count))
 
-    # ----- 查询 -----
+    # -- Queries --
 
     def get_global_stats(self, days: int = 30) -> dict:
         conn = self._get_conn()
@@ -682,7 +706,7 @@ class TelemetryStorage:
             "SELECT COUNT(*) as cnt, COALESCE(SUM(event_count), 0) as total FROM devices"
         ).fetchone()
 
-        # 按日汇总
+        # Daily totals.
         rows = conn.execute("""
             SELECT stat_date,
                    SUM(prompt_tokens) as pt, SUM(completion_tokens) as ct,
@@ -701,7 +725,7 @@ class TelemetryStorage:
                 "call_count": r["cc"], "error_count": r["ec"],
             }
 
-        # 按模型汇总
+        # Model totals.
         model_rows = conn.execute("""
             SELECT model,
                    SUM(prompt_tokens) as pt, SUM(completion_tokens) as ct,
@@ -720,7 +744,7 @@ class TelemetryStorage:
                 "call_count": r["cc"],
             }
 
-        # 按调用类型
+        # By call type.
         type_rows = conn.execute("""
             SELECT call_type,
                    SUM(prompt_tokens) as pt, SUM(completion_tokens) as ct,
@@ -766,11 +790,11 @@ class TelemetryStorage:
         return [dict(r) for r in rows]
 
     def get_user_metrics(self, days: int = 30) -> dict:
-        """DAU / WAU / MAU / 新增 / 留存率。"""
+        """DAU / WAU / MAU / new devices / retention rate."""
         conn = self._get_conn()
         today = date.today()
 
-        # --- 每日活跃设备数（DAU 趋势） ---
+        # -- Daily active devices, DAU trends --
         cutoff = (today - timedelta(days=days)).isoformat()
         dau_rows = conn.execute("""
             SELECT stat_date, COUNT(DISTINCT device_id) as dau
@@ -780,11 +804,11 @@ class TelemetryStorage:
         """, (cutoff,)).fetchall()
         dau_trend = {r["stat_date"]: r["dau"] for r in dau_rows}
 
-        # --- 今日 DAU ---
+        # -- Today's DAU --
         today_str = today.isoformat()
         dau_today = dau_trend.get(today_str, 0)
 
-        # --- 7 日活跃（WAU） ---
+        # -- 7-day active devices, WAU --
         wau_cutoff = (today - timedelta(days=7)).isoformat()
         wau = conn.execute("""
             SELECT COUNT(DISTINCT device_id) as cnt
@@ -792,7 +816,7 @@ class TelemetryStorage:
             WHERE model = '_total' AND call_type = '_total' AND stat_date >= ?
         """, (wau_cutoff,)).fetchone()["cnt"]
 
-        # --- 30 日活跃（MAU） ---
+        # -- 30-day active devices, MAU --
         mau_cutoff = (today - timedelta(days=30)).isoformat()
         mau = conn.execute("""
             SELECT COUNT(DISTINCT device_id) as cnt
@@ -800,7 +824,7 @@ class TelemetryStorage:
             WHERE model = '_total' AND call_type = '_total' AND stat_date >= ?
         """, (mau_cutoff,)).fetchone()["cnt"]
 
-        # --- 每日新增设备 ---
+        # -- Daily new devices --
         new_rows = conn.execute("""
             SELECT DATE(first_seen) as join_date, COUNT(*) as cnt
             FROM devices
@@ -809,17 +833,17 @@ class TelemetryStorage:
         """, (cutoff,)).fetchall()
         new_trend = {r["join_date"]: r["cnt"] for r in new_rows}
 
-        # --- 次日留存率（昨天新增中今天还活跃的比例） ---
+        # -- Next-day retention: yesterday's new devices still active today --
         yesterday = (today - timedelta(days=1)).isoformat()
         day_before = (today - timedelta(days=2)).isoformat()
 
-        # 前天新增的设备
+        # Devices added the day before yesterday.
         cohort = conn.execute("""
             SELECT COUNT(*) as cnt FROM devices
             WHERE DATE(first_seen) = ?
         """, (day_before,)).fetchone()["cnt"]
 
-        # 其中昨天还活跃的
+        # Those still active yesterday.
         retained = 0
         if cohort > 0:
             retained = conn.execute("""
@@ -833,7 +857,7 @@ class TelemetryStorage:
 
         d1_retention = round(retained / cohort * 100, 1) if cohort > 0 else 0.0
 
-        # --- 7 日留存率 ---
+        # -- 7-day retention --
         d7_anchor = (today - timedelta(days=8)).isoformat()
         d7_check = (today - timedelta(days=1)).isoformat()
         cohort_7 = conn.execute("""
@@ -862,12 +886,12 @@ class TelemetryStorage:
             "new_device_trend": new_trend,
         }
 
-    # ----- Instrument 查询 -----
+    # -- Instrument queries --
 
     def get_top_counters(self, days: int = 7, limit: int = 50) -> list[dict]:
-        """跨设备汇总最近 N 天的 counter 总量，按总量降序。
+        """Aggregate counter totals across devices for the last N days, descending by total.
 
-        返回 [{"metric_key": ..., "total": ..., "devices": ...}]。
+        Returns [{"metric_key": ..., "total": ..., "devices": ...}].
         """
         conn = self._get_conn()
         cutoff = (date.today() - timedelta(days=days)).isoformat()
@@ -885,15 +909,16 @@ class TelemetryStorage:
                 for r in rows]
 
     def get_histogram_summary(self, days: int = 7, limit: int = 50) -> list[dict]:
-        """跨设备汇总最近 N 天的 histogram。
+        """Aggregate histograms across devices for the last N days.
 
-        返回 [{"metric_key", "count", "sum", "avg", "p50_bucket", "p95_bucket", "bounds"}]。
-        p50/p95 桶用累积桶 + 桶数除以总样本数定位，精度受桶粒度限制 —— 用于
-        监控趋势够用，要精确分位数请查原始 events 表。
+        Returns [{"metric_key", "count", "sum", "avg", "p50_bucket", "p95_bucket", "bounds"}].
+        p50/p95 buckets are located via cumulative buckets / total samples; precision
+        is limited by bucket granularity — fine for monitoring trends; for exact
+        quantiles query the raw events table.
         """
         conn = self._get_conn()
         cutoff = (date.today() - timedelta(days=days)).isoformat()
-        # 同一 metric_key 不同设备的 buckets 合并：拿出原始行后 Python 端 sum。
+        # Merge same-metric buckets across devices by summing raw rows in Python.
         rows = conn.execute("""
             SELECT metric_key, count, sum, buckets, bounds
             FROM instrument_histograms
@@ -912,7 +937,7 @@ class TelemetryStorage:
                 bk = []
             if not isinstance(bk, list):
                 bk = []
-            # 长度对齐合并（同 _apply_instruments 的策略）
+            # Align lengths as _apply_instruments does.
             n = max(len(slot["buckets"]), len(bk))
             slot["buckets"] = [
                 (slot["buckets"][i] if i < len(slot["buckets"]) else 0)
@@ -925,8 +950,8 @@ class TelemetryStorage:
                     if isinstance(bnd, list):
                         slot["bounds"] = bnd
                 except (json.JSONDecodeError, TypeError):
-                    # bounds 列损坏（极少见）：保留 slot["bounds"] = None，
-                    # 下个有效行有机会再设；查询端 p50/p95 计算允许 bounds 为空。
+                    # Rare corrupt bounds: leave slot["bounds"]=None,
+                    # allowing later valid rows to fill it; query-side quantiles permit missing bounds.
                     pass
 
         out = []
@@ -949,10 +974,10 @@ class TelemetryStorage:
         out.sort(key=lambda x: -x["count"])
         return out[:limit]
 
-    # ----- 导出 -----
+    # -- Exports --
 
     def export_daily_csv(self, days: int = 90) -> str:
-        """导出按日汇总的 CSV。"""
+        """Export the per-day aggregated CSV."""
         conn = self._get_conn()
         cutoff = (date.today() - timedelta(days=days)).isoformat()
         rows = conn.execute("""
@@ -979,7 +1004,7 @@ class TelemetryStorage:
         return output.getvalue()
 
     def export_model_csv(self, days: int = 90) -> str:
-        """导出按模型汇总的 CSV。"""
+        """Export the per-model aggregated CSV."""
         conn = self._get_conn()
         cutoff = (date.today() - timedelta(days=days)).isoformat()
         rows = conn.execute("""
@@ -1001,14 +1026,16 @@ class TelemetryStorage:
                              r["tt"], r["cch"], r["cc"]])
         return output.getvalue()
 
-    # ----- canonical identity 身份聚合 -----
+    # -- Canonical identity aggregation --
 
     def add_steam_id_to_denylist(self, steam_user_id: str) -> str:
-        """删号：被删 Steam64 进 denylist（防复活硬约束）+ 脱敏源数据 + 删边。
+        """Account deletion: the deleted Steam64 goes into the denylist (hard anti-resurrection constraint) + redact source data + delete edges.
 
-        events.payload 里的历史值按 events 180 天 retention 自然过期，不在此处
-        改写（保留 HMAC 原文完整性）；denylist 保证它即便被回填扫到也不产边。
-        返回归一化后的 ID（非法输入返回 ''，不做任何操作）。
+        Historical values inside events.payload expire naturally via the events
+        180-day retention and are not rewritten here (preserving HMAC plaintext
+        integrity); the denylist guarantees no edges are produced even if a backfill
+        scan sees them. Returns the normalized ID ('' for invalid input, in which
+        case nothing is done).
         """
         sid = normalize_steam_id(steam_user_id)
         if not sid:
@@ -1022,12 +1049,15 @@ class TelemetryStorage:
         return sid
 
     def build_edges_from_events(self, batch_limit: int = 5000) -> int:
-        """扫 events 增量产边（device⟷steam + device⟷device 别名）。
+        """Incrementally build edges from events (device⟷steam + device⟷device aliases).
 
-        首跑 = 全量回填（游标从 0 起），之后按 events.id 游标增量。边时间戳用
-        事件观测时间 events.received_at，绝不用墙上时间（否则回填把历史边全盖成
-        回填时刻，留存指标失真）。steam_user_id 复用 normalize_steam_id + denylist
-        过滤，所有产边路径一致。返回本次处理的事件数。
+        First run = full backfill (cursor starts at 0); afterwards incremental by the
+        events.id cursor. Edge timestamps use the event observation time
+        events.received_at, never wall-clock time (otherwise a backfill would stamp
+        all historical edges with the backfill moment, distorting retention
+        metrics). steam_user_id reuses normalize_steam_id + denylist filtering, so
+        all edge-producing paths are consistent. Returns the number of events
+        processed this run.
         """
         conn = self._get_conn()
         row = conn.execute("SELECT last_event_id FROM edge_build_cursor WHERE id = 1").fetchone()
@@ -1056,10 +1086,10 @@ class TelemetryStorage:
                     continue
                 sid = normalize_steam_id(payload.get("steam_user_id"))
                 if sid:
-                    # denylist 用 WHERE NOT EXISTS 在 INSERT 内原子判定，而非读快照：
-                    # SQLite 写事务串行，若并发删号已提交，这里的子查询能看到，
-                    # 杜绝"读快照后删号→本批仍把被删 ID 插回复活"的竞态。
-                    # WHERE 子句同时消除 INSERT...SELECT 与 ON CONFLICT 的解析歧义。
+                    # Check denylists atomically inside INSERT using WHERE NOT EXISTS, not snapshots;
+                    # serialized SQLite writers see committed concurrent deletions,
+                    # preventing snapshot-read/account-delete/reinsert races.
+                    # WHERE also disambiguates INSERT...SELECT versus ON CONFLICT parsing.
                     c.execute("""
                         INSERT INTO device_steam_edges (device_id, steam_user_id, first_seen, last_seen, observe_count)
                         SELECT ?, ?, ?, ?, 1
@@ -1070,10 +1100,10 @@ class TelemetryStorage:
                             observe_count = device_steam_edges.observe_count + 1
                     """, (dev, sid, ts, ts, sid))
                 legacy = payload.get("device_id_legacy")
-                # device_id_legacy 来自未经 Pydantic 校验的 payload extras（model 不声明
-                # 此字段），必须套用与 device_id 相同的长度约束（models.py: min 16 / max
-                # 128），否则伪造请求可塞超长串进 device_alias_edges，撑大边表、把超大
-                # 节点喂进 recompute 的 union-find 拖垮内存/CPU。
+                # device_id_legacy comes from payload extras outside Pydantic because models omit
+                # it; require device_id's same 16..128 length constraints,
+                # or forged huge aliases enlarge edge tables and feed oversized
+                # union-find nodes into recompute, exhausting memory/CPU.
                 if isinstance(legacy, str) and 16 <= len(legacy) <= 128 and legacy != dev:
                     lo, hi = sorted((dev, legacy))
                     c.execute("""
@@ -1088,9 +1118,10 @@ class TelemetryStorage:
         return processed
 
     def build_all_pending_edges(self, batch_limit: int = 5000) -> int:
-        """循环 drain 到游标追平再返回，避免单次只吃一页、游标永远落后于 ingest。
+        """Drain in a loop until the cursor catches up, so a single call never eats just one page while the cursor trails ingest forever.
 
-        每页满（processed == batch_limit）说明还有，继续；不满即追平。返回总处理数。
+        A full page (processed == batch_limit) means there is more, keep going; a
+        partial page means caught up. Returns the total processed.
         """
         total = 0
         while True:
@@ -1101,12 +1132,14 @@ class TelemetryStorage:
         return total
 
     def recompute_canonical(self) -> int:
-        """对 device⟷steam + device⟷device 边跑 union-find，落表 canonical_map。
+        """Run union-find over device⟷steam + device⟷device edges and persist canonical_map.
 
-        canonical_id 代表元规则（确定性，重算不抖）：节点加命名空间前缀
-        （steam=``s:``、device=``d:``）；代表元 = 分量内最小 steam 节点，无 steam
-        退化为最小 device 节点。合并 churn 写 canonical_alias 并 path-compress
-        保持一跳。返回 canonical 数。
+        canonical_id representative rule (deterministic, stable across recomputes):
+        nodes get a namespace prefix (steam=``s:``, device=``d:``); the
+        representative = the smallest steam node in the component, degrading to the
+        smallest device node when there is no steam node. Merge churn is written to
+        canonical_alias and path-compressed to stay one hop. Returns the canonical
+        count.
         """
         conn = self._get_conn()
         parent: dict[str, str] = {}
@@ -1126,7 +1159,7 @@ class TelemetryStorage:
             parent.setdefault(b, b)
             ra, rb = find(a), find(b)
             if ra != rb:
-                # 让字典序小的当根，稳定且与代表元规则方向一致
+                # Lexically smaller roots yield stable representatives aligned with selection rules.
                 lo, hi = sorted((ra, rb))
                 parent[hi] = lo
 
@@ -1134,11 +1167,11 @@ class TelemetryStorage:
             union("d:" + r["device_id"], "s:" + r["steam_user_id"])
         for r in conn.execute("SELECT dev_lo, dev_hi FROM device_alias_edges"):
             union("d:" + r["dev_lo"], "d:" + r["dev_hi"])
-        # 把所有 device 都纳入（无边的 device 自成一个 canonical，指标才覆盖全量）
+        # Include every device; edgeless devices become their own canonical identities for complete metric coverage.
         for r in conn.execute("SELECT device_id FROM devices"):
             parent.setdefault("d:" + r["device_id"], "d:" + r["device_id"])
 
-        # 每个连通分量选代表元：min steam 节点 优先，否则 min device 节点
+        # Per component choose minimum Steam node, otherwise minimum device node.
         root_steam: dict[str, str] = {}
         root_device: dict[str, str] = {}
         for node in list(parent.keys()):
@@ -1172,17 +1205,17 @@ class TelemetryStorage:
                     for node, canon in new_map.items()
                 ],
             )
-            # alias reconciliation：对每个"曾被发出去过的 canonical_id"（old_canon）和每条
-            # 已有 alias 的 key，重新解析到它此刻所属的 live canonical。candidates 覆盖了所有
-            # 可能被外部 resolve_canonical 调用的旧 ID（外部只可能持有曾经的 canonical_id）。
-            #   succ 非空且 != 自己 → 被合并到 succ，写/更新 old→succ；succ 必是 live 代表元，
-            #     天然一跳，不会形成 alias 链。
-            #   succ == 自己       → 它又是 live canonical（如删号后分量炸开、旧 device 复活），
-            #     删掉任何把它指走的陈旧 alias，resolve 回落到自身。
-            #   succ 为 None       → 实体随删号离开图（steam 节点边被删光），旧引用无继承者，
-            #     删 alias；resolve 回落自身、查 canonical_map 得空集，即 GDPR "身份已移除"。
-            # 关键：这同时清理了"指向已删 canonical 的入边 alias"——它们的 key 在 candidates
-            # 里会被重新指到当前 live canonical 或删除，不再悬空指向死节点。
+            # Alias reconciliation re-resolves every previously exposed canonical_id and existing
+            # alias key to its live representative. Candidates cover all old IDs callers could
+            # pass to resolve_canonical, since only former canonical IDs escape externally.
+            #   Nonempty succ different from self: merge into succ and write/update old->succ;
+            #     succ is live, naturally keeping aliases one-hop without chains.
+            #   succ == self: live canonical again, e.g. device resurrection after deletion splits components;
+            #     remove stale outgoing aliases and resolve to self.
+            #   succ=None: deletion removed the entity from the graph, leaving no successor;
+            #     remove aliases, resolve to self, and return empty canonical_map membership, matching GDPR identity removal.
+            # This also repairs incoming aliases pointing to deleted canonicals: candidate keys
+            # redirect to current live representatives or disappear, never hanging off dead nodes.
             for old_id in old_canon | existing_alias_olds:
                 succ = new_map.get(old_id)
                 if succ is not None and succ != old_id:
@@ -1198,21 +1231,22 @@ class TelemetryStorage:
         return len(new_canon_ids)
 
     def resolve_canonical(self, canonical_id: str) -> str:
-        """顺 alias 链解析旧 canonical_id 到当前（一跳即到，path compression 保证）。"""
+        """Resolve an old canonical_id to the current one along the alias chain (one hop, guaranteed by path compression)."""
         row = self._get_conn().execute(
             "SELECT new_canonical_id FROM canonical_alias WHERE old_canonical_id = ?", (canonical_id,)
         ).fetchone()
         return row["new_canonical_id"] if row else canonical_id
 
     def get_canonical_metrics(self, days: int = 30) -> dict:
-        """canonical 口径 DAU/WAU/MAU/留存（按真人去重，与 device 口径并存）。
+        """Canonical-basis DAU/WAU/MAU/retention (deduped per real person, coexisting with the device basis).
 
-        device → canonical 经 canonical_map 映射；未落表的 device 回退 'd:'||device_id
-        （等价于自成 canonical），保证 recompute 没跑过时也不崩、只是不去重。
+        device → canonical is mapped via canonical_map; devices not yet in the table
+        fall back to 'd:'||device_id (equivalent to being their own canonical),
+        so this never crashes when recompute hasn't run — it just doesn't dedup.
         """
         conn = self._get_conn()
         today = date.today()
-        # device → canonical 的公共映射片段
+        # Shared device-to-canonical mapping fragment.
         J = ("LEFT JOIN canonical_map cm ON cm.entity_type='device' AND cm.entity_id=a.device_id")
         C = "COALESCE(cm.canonical_id, 'd:'||a.device_id)"
 
@@ -1235,7 +1269,7 @@ class TelemetryStorage:
         wau = active_count((today - timedelta(days=7)).isoformat())
         mau = active_count((today - timedelta(days=30)).isoformat())
 
-        # canonical first_seen = 旗下最早 device 的 first_seen
+        # Canonical first_seen is the earliest member-device first_seen.
         canon_first_cte = (
             "WITH dc AS ("
             "  SELECT COALESCE(cm.canonical_id, 'd:'||d.device_id) AS canon, d.first_seen "
@@ -1283,7 +1317,7 @@ class TelemetryStorage:
             ).fetchone()["cnt"],
         }
 
-    # ----- 维护 -----
+    # -- Maintenance --
 
     def prune_old_events(self, max_days: int = 180) -> int:
         cutoff = (date.today() - timedelta(days=max_days)).isoformat()
@@ -1293,13 +1327,14 @@ class TelemetryStorage:
             return result.rowcount
 
     def prune_old_instruments(self, max_days: int = 180) -> int:
-        """清理超期的 instrument_counters / instrument_histograms 行。
+        """Prune expired instrument_counters / instrument_histograms rows.
 
-        这两张表按 (device_id, stat_date, metric_key) 累加，不清理会随时间
-        无限增长。对齐 events 表的 180 天 retention。stat_date 是
-        ``YYYY-MM-DD`` 字符串（客户端本地日历天），可直接字典序比较。
+        These two tables accumulate by (device_id, stat_date, metric_key) and would
+        grow forever without pruning. Aligned with the events table's 180-day
+        retention. stat_date is a ``YYYY-MM-DD`` string (client local calendar day),
+        directly comparable lexicographically.
 
-        返回两张表删除的总行数。
+        Returns the total number of rows deleted across the two tables.
         """
         cutoff = (date.today() - timedelta(days=max_days)).isoformat()
         with self._transaction() as conn:

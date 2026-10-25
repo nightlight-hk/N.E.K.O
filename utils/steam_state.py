@@ -1,8 +1,22 @@
 # -*- coding: utf-8 -*-
+# Copyright 2025-2026 Project N.E.K.O. Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 Steamworks process-global handle.
 
-The Steamworks SDK is initialized once during app startup (``app/main_server.py``)
+The Steamworks SDK is initialized once during app startup (``app/main_server/__init__.py``)
 and consumed by code at every layer of the dependency stack:
 
 * high-level routers / brain agents (e.g. ``main_routers/workshop_router.py``,
@@ -61,7 +75,7 @@ def set_steamworks(steamworks: Optional[Any]) -> None:
 def set_steamworks_initializer(initializer: Optional[Callable[[], Optional[Any]]]) -> None:
     """Register a process-local Steamworks initializer for lazy reconnects.
 
-    The callback is installed by ``app/main_server.py`` because only that layer
+    The callback is installed by ``app/main_server/__init__.py`` because only that layer
     knows how to create and wire the SDK instance. Keeping the callback here
     lets routers ask for a retry without importing ``main_server``.
     """

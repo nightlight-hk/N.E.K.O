@@ -2,11 +2,10 @@
  * 插件专属的工作台 composable —— 薄包装，复用通用 `useGridWorkbench`。
  *
  * 这里注入插件语义：
- * - groups = plugin / adapter / extension（predicate 定义）
- * - 搜索索引包含 id / name / description / type / version / host / 拼音
- * - qualifierMatchers 支持 is:running / type:adapter / has:entries / host:xxx 等
+ * - groups = plugin / adapter（predicate 定义）
+ * - 搜索索引包含 id / name / description / type / version / 拼音
+ * - qualifierMatchers 支持 is:running / type:adapter / has:entries 等
  *
- * 对外 API 与改造前保持一致，现有调用点（PluginList.vue、usePackageManager）零改动。
  */
 import { computed, toValue, type MaybeRefOrGetter, type WritableComputedRef } from 'vue'
 import { useI18n } from 'vue-i18n'
@@ -14,16 +13,13 @@ import type { PluginMeta } from '@/types/api'
 import {
   useGridWorkbench,
   normalizeSearchPart,
-  safePinyin,
-  type FilterMode,
   type LayoutMode,
   type QualifierMatcher,
 } from '@/composables/useGridWorkbench'
 import { resolvePluginDisplayText } from '@/utils/pluginDisplay'
 
 export type PluginWorkbenchLayoutMode = LayoutMode
-export type PluginWorkbenchFilterMode = FilterMode
-export type PluginWorkbenchGroupType = 'plugin' | 'adapter' | 'extension'
+export type PluginWorkbenchGroupType = 'plugin' | 'adapter'
 
 export type PluginWorkbenchItem = PluginMeta & {
   type: PluginWorkbenchGroupType
@@ -33,13 +29,15 @@ export type PluginWorkbenchItem = PluginMeta & {
   displayName?: string
   displayDescription?: string
   displayShortDescription?: string
+  entry_count?: number
+  dependency_count?: number
+  has_input_schema?: boolean
 }
 
-const PLUGIN_GROUPS: readonly PluginWorkbenchGroupType[] = ['plugin', 'adapter', 'extension']
+const PLUGIN_GROUPS: readonly PluginWorkbenchGroupType[] = ['plugin', 'adapter']
 
 function normalizePluginType(type?: string): PluginWorkbenchGroupType {
   if (type === 'adapter') return 'adapter'
-  if (type === 'extension') return 'extension'
   return 'plugin'
 }
 
@@ -48,30 +46,24 @@ function hasUi(plugin: PluginWorkbenchItem): boolean {
 }
 
 function buildPluginSearchIndex(plugin: PluginWorkbenchItem): string {
-  const name = plugin.displayName || plugin.name
-  const description = plugin.displayDescription || plugin.description
-  const shortDescription = plugin.displayShortDescription || plugin.short_description
-  const textParts = [
+  return [
     plugin.id,
-    name,
-    description,
-    shortDescription,
+    plugin.displayName || plugin.name,
+    plugin.displayDescription || plugin.description,
+    plugin.displayShortDescription || plugin.short_description,
     plugin.type,
     plugin.version,
-    plugin.host_plugin_id,
-  ]
+  ].map(normalizeSearchPart).filter(Boolean).join('\n')
+}
 
-  const pinyinParts = [name, description, shortDescription].flatMap((value) => {
+function buildPluginPinyinIndex(plugin: PluginWorkbenchItem, search: (value: string, pattern: 'pinyin' | 'first') => string): string {
+  const textParts = [plugin.displayName || plugin.name, plugin.displayDescription || plugin.description, plugin.displayShortDescription || plugin.short_description]
+  return textParts.flatMap((value) => {
     const source = value || ''
-    const full = safePinyin(source, 'pinyin').replace(/\s+/g, ' ').trim()
-    const initials = safePinyin(source, 'first').replace(/\s+/g, '').trim()
+    const full = search(source, 'pinyin').replace(/\s+/g, ' ').trim()
+    const initials = search(source, 'first').replace(/\s+/g, '').trim()
     return [full, full.replace(/\s+/g, ''), initials]
-  })
-
-  return [...textParts, ...pinyinParts]
-    .map(normalizeSearchPart)
-    .filter(Boolean)
-    .join('\n')
+  }).map(normalizeSearchPart).filter(Boolean).join('\n')
 }
 
 // ─── qualifier matchers ─────────────────────────────────────────────
@@ -83,8 +75,6 @@ const pluginQualifiers: Record<string, QualifierMatcher<PluginWorkbenchItem>> = 
       case 'stopped':
       case 'crashed':
       case 'pending':
-      case 'injected':
-      case 'disabled':
       case 'load_failed':
         return (plugin.status || '').toLowerCase() === value
       case 'enabled':
@@ -95,20 +85,15 @@ const pluginQualifiers: Record<string, QualifierMatcher<PluginWorkbenchItem>> = 
         return !ctx.selectedIds.includes(plugin.id)
       case 'manual':
       case 'manual_start':
-        return plugin.autoStart === false
+        return plugin.autoStart !== true
       case 'auto':
       case 'auto_start':
-        return plugin.autoStart !== false
+        return plugin.autoStart === true
       case 'plugin':
       case 'adapter':
-      case 'extension':
         return plugin.type === value
       case 'ui':
         return hasUi(plugin)
-      case 'hosted':
-        return !!plugin.host_plugin_id
-      case 'standalone':
-        return !plugin.host_plugin_id
       default:
         return false
     }
@@ -130,9 +115,6 @@ const pluginQualifiers: Record<string, QualifierMatcher<PluginWorkbenchItem>> = 
   },
   description(plugin, value) {
     return normalizeSearchPart(plugin.displayDescription || plugin.description).includes(value)
-  },
-  host(plugin, value) {
-    return normalizeSearchPart(plugin.host_plugin_id).includes(value)
   },
   version(plugin, value) {
     return normalizeSearchPart(plugin.version).includes(value)
@@ -172,14 +154,12 @@ const pluginQualifiers: Record<string, QualifierMatcher<PluginWorkbenchItem>> = 
         return !!(plugin.displayDescription || plugin.description)?.trim()
       case 'entries':
       case 'entry':
-        return (plugin.entries?.length || 0) > 0
-      case 'host':
-        return !!plugin.host_plugin_id
+        return (plugin.entry_count ?? plugin.entries?.length ?? 0) > 0
       case 'dependencies':
       case 'dependency':
         return (plugin.dependencies?.length || 0) > 0
       case 'schema':
-        return !!plugin.input_schema
+        return plugin.has_input_schema === true || !!plugin.input_schema
       case 'actions':
         return (plugin.list_actions?.length || 0) > 0
       case 'ui':
@@ -236,16 +216,15 @@ export function usePluginWorkbench<
       predicate: (item) => item.type === groupId,
     })),
     buildSearchIndex: buildPluginSearchIndex,
+    buildPinyinSearchIndex: buildPluginPinyinIndex,
     qualifierMatchers: pluginQualifiers,
   })
 
   const filteredPurePlugins = computed(() => workbench.filteredByGroup.value.get('plugin') || [])
   const filteredAdapters = computed(() => workbench.filteredByGroup.value.get('adapter') || [])
-  const filteredExtensions = computed(() => workbench.filteredByGroup.value.get('extension') || [])
 
   const pluginCount = computed(() => workbench.groupCounts.value.get('plugin') || 0)
   const adapterCount = computed(() => workbench.groupCounts.value.get('adapter') || 0)
-  const extensionCount = computed(() => workbench.groupCounts.value.get('extension') || 0)
 
   // 暴露 plugin-typed selectedTypes，屏蔽来自共享 scope 的无效 id。
   const selectedTypes: WritableComputedRef<PluginWorkbenchGroupType[]> = computed({
@@ -261,22 +240,17 @@ export function usePluginWorkbench<
   return {
     items: workbench.items,
     filterText: workbench.filterText,
-    useRegex: workbench.useRegex,
-    filterMode: workbench.filterMode,
     selectedTypes,
     layoutMode: workbench.layoutMode,
     selectedPluginIds: workbench.selectedIds,
     selectedCount: workbench.selectedCount,
     multiSelectEnabled: workbench.multiSelectEnabled,
-    regexError: workbench.regexError,
     groupCounts: workbench.groupCounts,
     pluginCount,
     adapterCount,
-    extensionCount,
     filteredItems: workbench.filteredItems,
     filteredPurePlugins,
     filteredAdapters,
-    filteredExtensions,
     isSelected: workbench.isSelected,
     setSelectedPluginIds: workbench.setSelectedIds,
     togglePlugin: workbench.toggleItem,

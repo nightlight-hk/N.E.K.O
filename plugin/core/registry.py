@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from copy import deepcopy
 from datetime import datetime, timezone
 import hashlib
 import inspect
@@ -19,12 +20,12 @@ _pending_async_shutdown_tasks: set = set()
 
 
 def _wrap_logger(logger: Any) -> Any:
-    """向后兼容函数，现在直接返回 logger。"""
+    """Backward-compatible helper now returning logger directly."""
     return logger
 
 
 def _import_plugin_entry_module(module_path: str, toml_path: Path, logger: Any) -> Any:
-    """延迟使用插件宿主导入兜底，避免用户插件命名空间被内置 plugins 包遮挡。"""
+    """Use host import fallbacks lazily so built-in plugins packages cannot shadow user namespaces."""
 
     from plugin.core.host import _import_plugin_module
 
@@ -37,12 +38,20 @@ except ImportError:  # pragma: no cover
     import tomli as tomllib  # type: ignore[no-redef]
 
 from plugin._types.events import EventHandler, EventMeta, EVENT_META_ATTR
+from plugin._types.entry_metadata import entry_contract_fields
 from plugin._types.version import SDK_VERSION
-from plugin.server.infrastructure.config_resolver import resolve_plugin_config_from_path
-from plugin.server.infrastructure.runtime_overrides import get_runtime_override
+from plugin.server.infrastructure.config_resolver import read_plugin_config_from_path, resolve_plugin_config_from_path
+from plugin.server.infrastructure.runtime_overrides import (
+    get_runtime_auto_start_override,
+    get_runtime_override,
+)
 from plugin.core.state import state
 from plugin.core.entry_points import normalize_plugin_entry_point
 from plugin._types.models import PluginMeta, PluginAuthor, PluginDependency
+from plugin._types.plugin_types import (
+    SUPPORTED_PLUGIN_TYPES,
+    format_unsupported_plugin_type,
+)
 from plugin.core.ui_manifest import normalize_plugin_ui_manifest
 from plugin.settings import (
     BUILTIN_PLUGIN_CONFIG_ROOT,
@@ -50,8 +59,9 @@ from plugin.settings import (
     PLUGIN_ENABLE_DEPENDENCY_CHECK,
 )
 from plugin.utils import parse_bool_config
+from plugin.utils.path_resolution import PathResolutionCache, canonical_read_path
 
-# 从 dependency.py 导入依赖相关函数
+# Import dependency helpers from dependency.py.
 from plugin.core.dependency import (
     _parse_specifier,
     _version_matches,
@@ -76,12 +86,12 @@ except ImportError:  # pragma: no cover
     InvalidSpecifier = Exception  # type: ignore
 
 
-# SimpleEntryMeta 已删除，统一使用 sdk/events.py 中的 EventMeta
+# SimpleEntryMeta is removed; use sdk/events.py EventMeta everywhere.
 
 
 @dataclass
 class PluginContext:
-    """插件加载上下文，存储解析后的插件配置信息"""
+    """Plugin-load context containing parsed configuration."""
     pid: str
     toml_path: Path
     conf: Dict[str, Any]
@@ -211,68 +221,68 @@ def get_plugins() -> List[Dict[str, Any]]:
 
 def _calculate_plugin_hash(config_path: Optional[Path] = None, entry_point: Optional[str] = None, plugin_data: Optional[Dict[str, Any]] = None) -> str:
     """
-    计算插件的哈希值，用于比较插件内容是否相同
+    Hash plugin content for equality comparisons.
     
-    注意：为了确保相同插件产生相同哈希值，路径会被规范化（resolve为绝对路径）
+    Normalize paths through absolute resolve so identical plugins produce stable hashes.
     
     Args:
-        config_path: 插件配置文件路径
-        entry_point: 插件入口点
-        plugin_data: 插件配置数据（可选），应包含 id、name、version、entry 字段
+        config_path: Plugin configuration path.
+        entry_point: Plugin entrypoint.
+        plugin_data: Optional configuration containing id/name/version/entry.
     
     Returns:
-        插件的哈希值（十六进制字符串）
+        Hexadecimal plugin hash.
     """
     hash_data = []
     
-    # 添加配置文件路径（如果提供）- 规范化路径以确保一致性
+    # Include optional config paths, normalized for consistency.
     if config_path:
         try:
-            # 使用 resolve() 获取绝对路径并规范化
+            # resolve() obtains absolute normalized paths.
             resolved_path = config_path.resolve()
-            # 使用字符串表示，确保跨平台一致性
+            # Use string forms for cross-platform consistency.
             hash_data.append(f"config_path:{str(resolved_path)}")
         except (OSError, RuntimeError):
-            # 如果路径解析失败，使用原始路径的字符串表示
+            # On resolution failure, use the original path string.
             hash_data.append(f"config_path:{str(config_path)}")
     
-    # 添加入口点（如果提供）- 标准化格式
+    # Include optional entrypoints in standard format.
     if entry_point:
         hash_data.append(f"entry_point:{entry_point.strip()}")
     
-    # 添加插件配置数据的关键字段（如果提供）
+    # Include key fields from optional plugin configuration.
     if plugin_data:
-        # 使用关键字段来标识插件，按固定顺序以确保一致性
+        # Identify plugins through key fields in stable order.
         key_fields = ["id", "name", "version", "entry"]
         for field in key_fields:
             if field in plugin_data:
                 value = plugin_data[field]
-                # 确保值为字符串，None 转为空字符串
+                # Convert values to strings, mapping None to empty.
                 if value is None:
                     value = ""
                 else:
                     value = str(value).strip()
                 hash_data.append(f"{field}:{value}")
     
-    # 计算哈希值
+    # Compute hashes.
     content = "|".join(hash_data)
-    return hashlib.sha256(content.encode('utf-8')).hexdigest()[:16]  # 使用前16位作为简短标识
+    return hashlib.sha256(content.encode('utf-8')).hexdigest()[:16]  # Use the first 16 characters as short IDs.
 
 
 def _get_existing_plugin_info(plugin_id: str) -> Optional[Dict[str, Any]]:
     """
-    获取已存在插件的信息
+    Get existing plugin information.
     
     Args:
-        plugin_id: 插件 ID
+        plugin_id: Plugin ID.
     
     Returns:
-        插件信息字典，包含 config_path、entry_point、plugin_meta 等，如果不存在则返回 None
+        Dict with config_path/entry_point/plugin_meta/etc., or None if absent.
     """
     result = {}
     
-    # 锁顺序规范: plugins_lock -> plugin_hosts_lock -> event_handlers_lock
-    # 先从 plugins 获取插件元数据
+    # Required order: plugins_lock -> plugin_hosts_lock -> event_handlers_lock.
+    # Get plugin metadata from plugins first.
     with state.acquire_plugins_read_lock():
         if plugin_id in state.plugins:
             plugin_meta_raw = state.plugins[plugin_id]
@@ -293,7 +303,7 @@ def _get_existing_plugin_info(plugin_id: str) -> Optional[Dict[str, Any]]:
                 if meta_entry_point:
                     result["entry_point"] = meta_entry_point
     
-    # 再从 plugin_hosts 获取运行时信息（可能更新）
+    # Then runtime data from plugin_hosts, possibly newer.
     with state.acquire_plugin_hosts_read_lock():
         if plugin_id in state.plugin_hosts:
             host = state.plugin_hosts[plugin_id]
@@ -304,7 +314,7 @@ def _get_existing_plugin_info(plugin_id: str) -> Optional[Dict[str, Any]]:
             if entry_point:
                 result["entry_point"] = entry_point
     
-    # 如果获取到了任何信息，返回结果
+    # Return if any information was found.
     if result:
         return result
     
@@ -320,23 +330,24 @@ def _resolve_plugin_id_conflict(
     *,
     purpose: str = "load",
     enable_rename: Optional[bool] = None,
+    read_cache: PathResolutionCache | None = None,
 ) -> Optional[str]:
     """
-    检测并解决插件 ID 冲突
+    Detect and resolve plugin ID conflicts.
     
-    如果插件 ID 已存在（在 plugins 或 plugin_hosts 中），
-    生成一个新的唯一 ID（添加数字后缀）并记录警告。
-    如果两个插件的内容哈希值相同，会记录更详细的日志。
+    If IDs already exist in plugins or plugin_hosts, generate
+    unique IDs with numeric suffixes and log warnings.
+    Identical content hashes produce more detailed diagnostics.
     
     Args:
-        plugin_id: 原始插件 ID
-        logger: 日志记录器
-        config_path: 当前插件的配置文件路径（可选，用于哈希计算）
-        entry_point: 当前插件的入口点（可选，用于哈希计算）
-        plugin_data: 当前插件的配置数据（可选，用于哈希计算）
+        plugin_id: Original ID.
+        logger: Logger.
+        config_path: Optional current config path for hashing.
+        entry_point: Optional current entrypoint for hashing.
+        plugin_data: Optional current configuration for hashing.
     
     Returns:
-        解决冲突后的插件 ID（如果无冲突则返回原始 ID，如果是重复加载则返回 None）
+        Resolved ID, original if no conflict, or None for duplicate loading.
     """
     logger = _wrap_logger(logger)
     _ = entry_point
@@ -352,7 +363,7 @@ def _resolve_plugin_id_conflict(
     cur_path: Optional[Path] = None
     if config_path is not None:
         try:
-            cur_path = Path(config_path).resolve()
+            cur_path = canonical_read_path(Path(config_path), cache=read_cache)
         except (OSError, RuntimeError):
             cur_path = Path(config_path)
 
@@ -365,7 +376,7 @@ def _resolve_plugin_id_conflict(
         if v is None:
             return None
         try:
-            return Path(v).resolve()
+            return canonical_read_path(Path(v), cache=read_cache)
         except (OSError, RuntimeError, TypeError, ValueError):
             try:
                 return Path(v)
@@ -440,23 +451,31 @@ def register_plugin(
     plugin: PluginMeta,
     logger: Optional[Any] = None,  # loguru.Logger or logging.Logger
     config_path: Optional[Path] = None,
-    entry_point: Optional[str] = None
+    entry_point: Optional[str] = None,
+    *,
+    read_cache: PathResolutionCache | None = None,
 ) -> Optional[str]:
     """
-    注册插件到注册表
+    Register a plugin.
     
     Args:
-        plugin: 插件元数据
-        logger: 日志记录器（可选，用于冲突检测）
-        config_path: 插件配置文件路径（可选，用于哈希计算）
-        entry_point: 插件入口点（可选，用于哈希计算）
+        plugin: Plugin metadata.
+        logger: Optional logger for conflict detection.
+        config_path: Optional configuration path for hashing.
+        entry_point: Optional entrypoint for hashing.
     
     Returns:
-        实际注册的插件 ID（如果发生冲突，返回重命名后的 ID）
+        Actual registered ID, renamed on conflicts.
     """
     logger_ = cast(Any, _wrap_logger(logger or _DEFAULT_LOGGER))
-    
-    # 准备插件数据用于哈希计算
+
+    plugin_type = getattr(plugin, "type", None)
+    plugin_id = getattr(plugin, "id", "<unknown>")
+    if not isinstance(plugin_type, str) or plugin_type not in SUPPORTED_PLUGIN_TYPES:
+        logger_.error(format_unsupported_plugin_type(plugin_type, plugin_id=plugin_id))
+        return None
+
+    # Prepare plugin data for hashing.
     plugin_data = {
         "id": plugin.id,
         "name": plugin.name,
@@ -464,7 +483,7 @@ def register_plugin(
         "entry": entry_point or "",
     }
 
-    # 检测并解决 ID 冲突
+    # Detect/resolve ID conflicts.
     resolved_id = _resolve_plugin_id_conflict(
         plugin.id,
         logger_,
@@ -473,18 +492,19 @@ def register_plugin(
         plugin_data=plugin_data,
         purpose="register",
         enable_rename=bool(PLUGIN_ENABLE_ID_CONFLICT_CHECK),
+        read_cache=read_cache,
     )
     
-    # 如果返回 None，说明是重复加载，不应该注册
+    # None denotes duplicate loading; skip registration.
     if resolved_id is None:
         logger_.warning(
             "Plugin {} is already loaded (duplicate detected), skipping registration",
             plugin.id
         )
-        # 返回 None 作为特殊标记，表示这是重复加载
+        # Return None as the duplicate-load marker.
         return None
     
-    # 如果 ID 被重命名，更新插件元数据
+    # Update metadata after ID renaming.
     if resolved_id != plugin.id:
         plugin = plugin.model_copy(update={"id": resolved_id})
 
@@ -500,12 +520,43 @@ def register_plugin(
     return resolved_id
 
 
+def _copied_entry_value(value: Any) -> Any:
+    """A private copy of a decorator value, or the value itself if it cannot be copied.
+
+    Registry records must not alias the decorator's mutable mappings, but a
+    lock or a client handle stashed in decorator metadata makes ``deepcopy``
+    raise, and swallowing that would silently drop the configured override
+    that shares the same loop iteration. Sharing such a value is the lesser
+    harm: it is exactly what the decorator handler itself references.
+    """
+    try:
+        return deepcopy(value)
+    except Exception:
+        return value
+
+
+def _inherited_entry_field(base_meta: Any, field_name: str, fallback: Any) -> Any:
+    """A display field the declaration never mentions inherits the decorator's.
+
+    Same rule the control fields follow: writing an empty value is a
+    declaration, not a fallback. Only a field the declaration never mentions
+    falls back to the decorator.
+    """
+    # Missing fields must inherit decorators: manifest-only timeout overrides previously erased name/
+    # description/input_schema. Empty schemas make panels/agents call without parameters,
+    # while children still validate actual decorator schemas and
+    # reject calls (codex).
+    inherited = getattr(base_meta, field_name, None) if base_meta is not None else None
+    return _copied_entry_value(inherited) if inherited is not None else fallback
+
+
 def scan_static_metadata(pid: str, cls: type, conf: dict, pdata: dict) -> None:
     """
-    在不实例化的情况下扫描类属性，提取 @EventHandler 元数据并填充全局表。
+    Scan class attributes without instantiation, extracting @EventHandler metadata into global tables.
     """
-    # 使用模块级 logger
+    # Use module-level logger.
     handlers_updated = False
+    decorated_entries: dict[str, EventHandler] = {}
     for name, member in inspect.getmembers(cls):
         event_meta = getattr(member, EVENT_META_ATTR, None)
         if event_meta is None and hasattr(member, "__wrapped__"):
@@ -523,18 +574,17 @@ def scan_static_metadata(pid: str, cls: type, conf: dict, pdata: dict) -> None:
                     state.event_handlers[f"{pid}:{etype}:{eid}"] = handler_obj
             handlers_updated = True
             if etype == "plugin_entry":
+                decorated_entries[str(eid)] = handler_obj
                 plugin_entry_method_map[(pid, str(eid))] = name
-    if handlers_updated:
-        state.invalidate_snapshot_cache("handlers")
-
-    entries = conf.get("entries") or pdata.get("entries") or []
+    entries = _effective_entries(conf, pdata)
     for ent in entries:
         try:
             eid = ent.get("id") if isinstance(ent, dict) else str(ent)
             if not eid:
                 continue
+            decorated = decorated_entries.get(str(eid))
             try:
-                handler_fn = getattr(cls, eid)
+                handler_fn = decorated.handler if decorated is not None else getattr(cls, eid)
             except AttributeError:
                 logger.warning(
                     "Entry id {} for plugin {} has no handler on class {}, skipping",
@@ -543,20 +593,45 @@ def scan_static_metadata(pid: str, cls: type, conf: dict, pdata: dict) -> None:
                     cls.__name__,
                 )
                 continue
+            declared = _normalized_entry_declaration(ent if isinstance(ent, dict) else {})
+            base_meta = decorated.meta if decorated is not None else None
             entry_meta = EventMeta(
                 event_type="plugin_entry",
                 id=eid,
-                name=ent.get("name", "") if isinstance(ent, dict) else "",
-                description=ent.get("description", "") if isinstance(ent, dict) else "",
-                input_schema=ent.get("input_schema", {}) if isinstance(ent, dict) else {},
+                name=declared.get("name", _inherited_entry_field(base_meta, "name", "")),
+                description=declared.get(
+                    "description", _inherited_entry_field(base_meta, "description", "")
+                ),
+                input_schema=declared.get(
+                    "input_schema", _inherited_entry_field(base_meta, "input_schema", {})
+                ),
             )
+            # Only explicitly configured fields override the decorator contract.
+            # Copy decorator metadata where possible; deepcopy fails on locks/modules in metadata/extra,
+            # and swallowed TypeError silently drops configured timeouts.
+            # Normalization already copied config values, so mutable configuration and
+            # registry entries cannot affect one another.
+            controls = {
+                name: _copied_entry_value(value)
+                for name, value in entry_contract_fields(base_meta).items()
+            }
+            controls.update(
+                (name, value)
+                for name, value in declared.items()
+                if name not in _ENTRY_DISPLAY_FIELDS
+            )
+            for field_name, value in controls.items():
+                setattr(entry_meta, field_name, value)
             eh = EventHandler(meta=entry_meta, handler=handler_fn)
             with state.acquire_event_handlers_write_lock():
                 state.event_handlers[f"{pid}.{eid}"] = eh
                 state.event_handlers[f"{pid}:plugin_entry:{eid}"] = eh
+            handlers_updated = True
         except (AttributeError, KeyError, TypeError) as e:
             logger.warning("Error parsing entry {} for plugin {}: {}", ent, pid, e, exc_info=True)
-            # 继续处理其他条目，不中断整个插件加载
+            # Continue other entries without aborting whole plugin loads.
+    if handlers_updated:
+        state.invalidate_snapshot_cache("handlers")
 
 
 def _remove_scanned_metadata(pid: str) -> None:
@@ -590,10 +665,9 @@ def _build_plugin_meta(
     sdk_conflicts_list: Optional[List[str]] = None,
     dependencies: Optional[List[PluginDependency]] = None,
     input_schema: Optional[Dict[str, Any]] = None,
-    host_plugin_id: Optional[str] = None,
     plugin_ui: Optional[Dict[str, Any]] = None,
 ) -> PluginMeta:
-    """统一构建 PluginMeta，消除 disabled / extension / normal 三处重复。"""
+    """Build PluginMeta centrally, removing disabled/normal duplication."""
     author_data = pdata.get("author")
     author = None
     if author_data and isinstance(author_data, dict):
@@ -602,7 +676,7 @@ def _build_plugin_meta(
             email=author_data.get("email"),
         )
 
-    # 读取 keywords (正则表达式列表) 和 short_description
+    # Read keywords regex lists and short_description.
     raw_keywords = pdata.get("keywords", [])
     keywords: list[str] = []
     if isinstance(raw_keywords, list):
@@ -613,9 +687,14 @@ def _build_plugin_meta(
     # Defensive cap on plugin manifest short_description. 200 tokens — same
     # as task_executor's downstream short_description LLM-prompt cap, so the
     # value is consistent across "plugin descriptive blurb" callsites.
-    from utils.tokenize import count_tokens, truncate_to_tokens
-    if count_tokens(short_desc) > 200:
-        short_desc = truncate_to_tokens(short_desc, 200)
+    # Byte-level tokenization cannot exceed the UTF-8 byte count. Match the
+    # tokenizer fallback's surrogate handling and avoid initializing its large
+    # encoding table for descriptions that already fit this upper bound.
+    if len(short_desc.encode("utf-8", errors="surrogatepass")) > 200:
+        from utils.tokenize import count_tokens, truncate_to_tokens
+
+        if count_tokens(short_desc) > 200:
+            short_desc = truncate_to_tokens(short_desc, 200)
     passive = parse_bool_config(pdata.get("passive"), default=False)
 
     meta = PluginMeta(
@@ -635,7 +714,6 @@ def _build_plugin_meta(
         input_schema=input_schema or {"type": "object", "properties": {}},
         author=author,
         dependencies=dependencies or [],
-        host_plugin_id=host_plugin_id,
     )
     if plugin_ui is not None:
         setattr(meta, "plugin_ui", plugin_ui)
@@ -649,16 +727,56 @@ def _build_plugin_meta(
     return meta
 
 
-def _router_entry_preview(
-    pid: str,
-    eid: str,
-    event_meta: Any,
-    _to_dict: Callable[[Any], Dict[str, Any]],
-    _to_string_list: Callable[[Any], List[str]],
-) -> Dict[str, Any]:
+def _entry_mapping(value: Any) -> Dict[str, Any]:
+    """A mapping-valued entry field as a dict; anything else is an empty one."""
+    if isinstance(value, dict):
+        return value
+    try:
+        if hasattr(value, "model_dump"):
+            dumped = value.model_dump()
+            return dumped if isinstance(dumped, dict) else {}
+    except Exception:
+        # A model that cannot dump itself is a preview gap, not a listing failure.
+        pass
+    return {}
+
+
+def _entry_string_list(value: Any) -> List[str]:
+    """A list-valued entry field with only its distinct, non-blank strings."""
+    if not isinstance(value, list):
+        return []
+    out: List[str] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        field_name = item.strip()
+        if not field_name or field_name in seen:
+            continue
+        seen.add(field_name)
+        out.append(field_name)
+    return out
+
+
+def _set_declared_result_fields(preview: Dict[str, Any], declared: Any) -> None:
+    """Write llm_result_fields only when the source actually declared a list.
+
+    Absence and an explicit empty list mean different things downstream: the
+    consumer derives the fields from llm_result_schema when the key is missing
+    and takes a list as the final answer.
+    """
+    # Normalizing absent fields to [] looks explicit and disables consumer schema inference,
+    # while handlers still infer, making before/after startup result fields disagree.
+    # SDK inference uses required; all-default models have empty required and None
+    # fields despite schema properties, so this path is real (coderabbit).
+    if isinstance(declared, list):
+        preview["llm_result_fields"] = _entry_string_list(declared)
+
+
+def _router_entry_preview(pid: str, eid: str, event_meta: Any) -> Dict[str, Any]:
     """Build the static preview dict for one router-declared entry.
 
-    与 1) 分支保持一致：从 `event_meta` 读 return_message，避免 router 预览丢字段喵。
+    Match branch 1 by reading event_meta.return_message, preserving router preview fields, meow.
     """
     name_obj = getattr(event_meta, "name", None) or ""
     description_obj = getattr(event_meta, "description", None) or ""
@@ -670,21 +788,115 @@ def _router_entry_preview(
         "name": name_obj if isinstance(name_obj, (str, dict)) else str(name_obj),
         "description": description_obj if isinstance(description_obj, (str, dict)) else str(description_obj),
         "event_key": f"{pid}.{eid}",
-        "input_schema": _to_dict(getattr(event_meta, "input_schema", {}) or {}),
+        "input_schema": _entry_mapping(getattr(event_meta, "input_schema", {}) or {}),
         "return_message": return_message_obj if isinstance(return_message_obj, (str, dict)) else str(return_message_obj),
         "event_type": "plugin_entry",
         "kind": str(getattr(event_meta, "kind", "action") or "action"),
         "auto_start": bool(getattr(event_meta, "auto_start", False)),
         "timeout": getattr(event_meta, "timeout", None),
         "model_validate": bool(getattr(event_meta, "model_validate", True)),
-        "llm_result_fields": _to_string_list(getattr(event_meta, "llm_result_fields", None)),
-        "llm_result_schema": _to_dict(getattr(event_meta, "llm_result_schema", {}) or {}),
-        "metadata": _to_dict(getattr(event_meta, "metadata", {}) or {}),
+        "llm_result_schema": _entry_mapping(getattr(event_meta, "llm_result_schema", {}) or {}),
+        "metadata": _entry_mapping(getattr(event_meta, "metadata", {}) or {}),
     }
+    _set_declared_result_fields(preview, getattr(event_meta, "llm_result_fields", None))
     meta_dict = getattr(event_meta, "metadata", None)
     if isinstance(meta_dict, dict) and "llm_result_fields" in meta_dict:
         preview["llm_result_fields"] = meta_dict["llm_result_fields"]
     return preview
+
+
+def _effective_entries(conf: dict, pdata: dict) -> Any:
+    """The ``entries`` table the effective configuration declares.
+
+    Selected by key presence, not by truthiness. An overlay that sets
+    ``entries = []`` is removing them, and ``deep_merge`` keeps that empty list;
+    reading it as "no entries table here" falls through to the manifest and
+    shows the user the very entries their configuration removed (coderabbit).
+    """
+    for table in (conf, pdata):
+        if isinstance(table, dict) and "entries" in table:
+            value = table["entries"]
+            return value if isinstance(value, (list, dict)) else []
+    return []
+
+
+_ENTRY_DISPLAY_FIELDS = ("name", "description", "input_schema")
+_ENTRY_BOOL_FIELDS = ("auto_start", "enabled", "dynamic", "model_validate", "quick_action")
+_ENTRY_MAPPING_FIELDS = (
+    "input_schema", "llm_result_schema", "metadata", "extra", "quick_action_config",
+)
+_ENTRY_TEXT_FIELDS = ("name", "description", "return_message")
+
+
+def _normalized_entry_declaration(declaration: Dict[str, Any]) -> Dict[str, Any]:
+    """Every field a configured entry mentions, coerced to its wire shape.
+
+    Presence is the declaration: an explicit empty value stays an explicit
+    empty value. The shapes match what decorator previews already carry, so a
+    preview and a handler built from one declaration agree, and a manifest typo
+    (``metadata = "x"``, ``llm_result_fields = ["a", 1]``) cannot put a
+    non-mapping or a non-string item on the wire. Values are copied so registry
+    records never alias the mutable configuration tables.
+    """
+    fields = entry_contract_fields(declaration)
+    for name in _ENTRY_DISPLAY_FIELDS:
+        if name in declaration:
+            fields[name] = declaration[name]
+    for name, value in list(fields.items()):
+        if name == "kind":
+            fields[name] = str(value or "action")
+        elif name in _ENTRY_BOOL_FIELDS:
+            fields[name] = bool(value)
+        elif name in _ENTRY_MAPPING_FIELDS:
+            fields[name] = _entry_mapping(value)
+        elif name == "llm_result_fields":
+            # Only lists declare values; wrong types must not mean explicit clearing,
+            # disabling schema fallback. Treat nonlists as absent keys.
+            if isinstance(value, list):
+                fields[name] = _entry_string_list(value)
+            else:
+                del fields[name]
+        elif name in _ENTRY_TEXT_FIELDS:
+            fields[name] = value if isinstance(value, (str, dict)) else str(value or "")
+    return deepcopy(fields)
+
+
+def _overlay_entry_declaration(
+    previews: list[dict[str, Any]], conf: dict, pdata: dict,
+) -> list[dict[str, Any]]:
+    """Apply every explicitly declared field to scanned or packaged previews.
+
+    Same presence-based precedence the registration path uses, display fields
+    included: preview and handler must describe one entry the same way. Only a
+    preview some declaration matches is rebuilt; the others pass through as
+    they are, so a plugin without an ``entries`` table costs nothing here.
+    """
+    results = list(previews)
+    positions = {str(entry.get("id")): index for index, entry in enumerate(results)}
+    for declaration in _effective_entries(conf, pdata):
+        if not isinstance(declaration, dict):
+            continue
+        position = positions.get(str(declaration.get("id")))
+        if position is None:
+            continue
+        preview = dict(results[position])
+        # Decorators populate seen first, suppressing configured previews, so explicit config
+        # name/description/input_schema overrides never reach lists. Stopped plugins report
+        # decorator schemas, running ones config schemas, making clients construct
+        # calls from conflicting parameter sets (codex).
+        declared = _normalized_entry_declaration(declaration)
+        if "metadata" in declared and "llm_result_fields" not in declared:
+            # Result fields may originate in legacy decorator metadata. Replacing all metadata
+            # makes handler query_service fall back to SDK fields/schema inference;
+            # previews must mirror that instead of retaining obsolete values.
+            old_metadata = preview.get("metadata")
+            if isinstance(old_metadata, dict) and "llm_result_fields" in old_metadata:
+                preview.pop("llm_result_fields", None)
+            if "llm_result_fields" in declared["metadata"]:
+                declared["llm_result_fields"] = declared["metadata"]["llm_result_fields"]
+        preview.update(declared)
+        results[position] = preview
+    return results
 
 
 def _extract_entries_preview(pid: str, cls: type, conf: dict, pdata: dict) -> List[Dict[str, Any]]:
@@ -695,32 +907,6 @@ def _extract_entries_preview(pid: str, cls: type, conf: dict, pdata: dict) -> Li
     """
     results: List[Dict[str, Any]] = []
     seen: set[str] = set()
-
-    def _to_dict(v: Any) -> Dict[str, Any]:
-        if isinstance(v, dict):
-            return v
-        try:
-            if hasattr(v, "model_dump"):
-                d = v.model_dump()
-                return d if isinstance(d, dict) else {}
-        except Exception:
-            pass
-        return {}
-
-    def _to_string_list(v: Any) -> List[str]:
-        if not isinstance(v, list):
-            return []
-        out: List[str] = []
-        seen: set[str] = set()
-        for item in v:
-            if not isinstance(item, str):
-                continue
-            field_name = item.strip()
-            if not field_name or field_name in seen:
-                continue
-            seen.add(field_name)
-            out.append(field_name)
-        return out
 
     # 1) Decorator-based metadata (@plugin_entry / EVENT_META_ATTR)
     try:
@@ -740,7 +926,7 @@ def _extract_entries_preview(pid: str, cls: type, conf: dict, pdata: dict) -> Li
                 continue
             seen.add(eid)
 
-            input_schema = _to_dict(getattr(event_meta, "input_schema", {}) or {})
+            input_schema = _entry_mapping(getattr(event_meta, "input_schema", {}) or {})
             name_obj = getattr(event_meta, "name", None)
             description_obj = getattr(event_meta, "description", None)
             return_message_obj = getattr(event_meta, "return_message", None)
@@ -762,10 +948,12 @@ def _extract_entries_preview(pid: str, cls: type, conf: dict, pdata: dict) -> Li
                     "auto_start": bool(getattr(event_meta, "auto_start", False)),
                     "timeout": getattr(event_meta, "timeout", None),
                     "model_validate": bool(getattr(event_meta, "model_validate", True)),
-                    "llm_result_fields": _to_string_list(getattr(event_meta, "llm_result_fields", None)),
-                    "llm_result_schema": _to_dict(getattr(event_meta, "llm_result_schema", {}) or {}),
-                    "metadata": _to_dict(getattr(event_meta, "metadata", {}) or {}),
+                    "llm_result_schema": _entry_mapping(getattr(event_meta, "llm_result_schema", {}) or {}),
+                    "metadata": _entry_mapping(getattr(event_meta, "metadata", {}) or {}),
                 }
+            _set_declared_result_fields(
+                entry_preview, getattr(event_meta, "llm_result_fields", None)
+            )
             meta_dict = getattr(event_meta, "metadata", None)
             if isinstance(meta_dict, dict) and "llm_result_fields" in meta_dict:
                 entry_preview["llm_result_fields"] = meta_dict["llm_result_fields"]
@@ -775,20 +963,20 @@ def _extract_entries_preview(pid: str, cls: type, conf: dict, pdata: dict) -> Li
         pass
 
     # 1b) Router-decorated entries declared via `__routers__`.
-    #     这些 entry 是通过 @plugin_entry 装饰在 PluginRouter 子类方法上的，
-    #     静态 preview 之前只看 plugin class 本身的成员，所以 router 入口对
-    #     UI/agent 列表完全不可见喵。这里额外扫描 `__routers__` 里声明的
-    #     router 类（或已实例化的 router），和 1) 一样只抽元数据，不触发运行时。
+    #     @plugin_entry decorates PluginRouter subclass methods, but static previews
+    #     previously inspected plugin-class members only, hiding router entries
+    #     from UI/agent lists, meow. Also scan __routers__ classes/instances,
+    #     extracting metadata only without runtime activation, like step 1.
     #
-    #     如果声明的是已实例化的 router，优先用实例 `collect_entries()` 拿
-    #     prefix 解析后的入口，避免 preview 的 id 与运行时不一致而被 seen 误去重喵。
+    #     For instances, prefer collect_entries() with resolved prefixes,
+    #     preventing preview/runtime ID differences and false seen deduplication, meow.
     try:
         declared_routers = getattr(cls, "__routers__", None) or []
         for router_item in declared_routers:
             router_obj = router_item if not isinstance(router_item, type) else None
             router_cls = router_item if isinstance(router_item, type) else type(router_item)
 
-            # 优先使用实例的已解析入口
+            # Prefer instance-resolved entries.
             instance_handled = False
             if router_obj is not None and hasattr(router_obj, "collect_entries"):
                 try:
@@ -808,7 +996,7 @@ def _extract_entries_preview(pid: str, cls: type, conf: dict, pdata: dict) -> Li
                         if not eid or eid in seen:
                             continue
                         seen.add(eid)
-                        results.append(_router_entry_preview(pid, eid, event_meta, _to_dict, _to_string_list))
+                        results.append(_router_entry_preview(pid, eid, event_meta))
 
             if instance_handled:
                 continue
@@ -826,68 +1014,41 @@ def _extract_entries_preview(pid: str, cls: type, conf: dict, pdata: dict) -> Li
                 if not eid or eid in seen:
                     continue
                 seen.add(eid)
-                results.append(_router_entry_preview(pid, eid, event_meta, _to_dict, _to_string_list))
+                results.append(_router_entry_preview(pid, eid, event_meta))
     except Exception:
         pass
 
-    # 2) Config-specified entries (conf/pdata)
-    entries = conf.get("entries") or pdata.get("entries") or []
-    for ent in entries:
-        try:
-            if isinstance(ent, dict):
-                eid = str(ent.get("id") or "")
-                if not eid or eid in seen:
-                    continue
-                seen.add(eid)
-                results.append(
-                    {
-                        "id": eid,
-                        "name": ent.get("name") if isinstance(ent.get("name"), (str, dict)) else str(ent.get("name") or ""),
-                        "description": ent.get("description") if isinstance(ent.get("description"), (str, dict)) else str(ent.get("description") or ""),
-                        "event_key": f"{pid}.{eid}",
-                        "input_schema": _to_dict(ent.get("input_schema") or {}),
-                        "return_message": "",
-                        "event_type": "plugin_entry",
-                        "kind": str(ent.get("kind") or "action"),
-                        "auto_start": bool(ent.get("auto_start", False)),
-                        "timeout": ent.get("timeout"),
-                        "model_validate": bool(ent.get("model_validate", True)),
-                        "llm_result_fields": _to_string_list(ent.get("llm_result_fields")),
-                        "llm_result_schema": _to_dict(ent.get("llm_result_schema") or {}),
-                        "metadata": _to_dict(ent.get("metadata") or {}),
-                    }
-                )
-            else:
-                eid = str(ent)
-                if not eid or eid in seen:
-                    continue
-                seen.add(eid)
-                results.append(
-                    {
-                        "id": eid,
-                        "name": "",
-                        "description": "",
-                        "event_key": f"{pid}.{eid}",
-                        "input_schema": {},
-                        "return_message": "",
-                        "event_type": "plugin_entry",
-                        "kind": "action",
-                        "auto_start": False,
-                        "timeout": None,
-                        "model_validate": True,
-                        "llm_result_fields": [],
-                        "llm_result_schema": {},
-                        "metadata": {},
-                    }
-                )
-        except Exception:
+    # 2) Config-specified entries (conf/pdata). Only the skeleton is built here:
+    #    the declared fields are written by the overlay below, the same way it
+    #    writes them onto decorator previews, so there is one normalization.
+    for ent in _effective_entries(conf, pdata):
+        eid = str(ent.get("id") or "") if isinstance(ent, dict) else str(ent)
+        if not eid or eid in seen:
             continue
+        seen.add(eid)
+        results.append(
+            {
+                "id": eid,
+                "name": "",
+                "description": "",
+                "event_key": f"{pid}.{eid}",
+                "input_schema": {},
+                "return_message": "",
+                "event_type": "plugin_entry",
+                "kind": "action",
+                "auto_start": False,
+                "timeout": None,
+                "model_validate": True,
+                "llm_result_schema": {},
+                "metadata": {},
+            }
+        )
 
-    return results
+    return _overlay_entry_declaration(results, conf, pdata)
 
 
 # ============================================================================
-# load_plugins_from_toml 辅助函数
+# load_plugins_from_toml helpers.
 # ============================================================================
 
 def _check_sdk_compatibility(
@@ -896,23 +1057,23 @@ def _check_sdk_compatibility(
     logger: Any,
 ) -> tuple[bool, Optional[str], Optional[str], Optional[str], List[str]]:
     """
-    检查插件的 SDK 版本兼容性。
+    Check plugin SDK version compatibility.
     
     Args:
-        pid: 插件 ID
-        sdk_config: SDK 配置字典 (plugin.sdk)
-        logger: 日志记录器
+        pid: Plugin ID.
+        sdk_config: plugin.sdk configuration.
+        logger: Logger.
     
     Returns:
         (is_compatible, sdk_supported_str, sdk_recommended_str, sdk_untested_str, sdk_conflicts_list)
-        如果不兼容，is_compatible 为 False
+        is_compatible is False for incompatible versions.
     """
     sdk_supported_str = None
     sdk_recommended_str = None
     sdk_untested_str = None
     sdk_conflicts_list: List[str] = []
     
-    # 解析 SDK 配置
+    # Parse SDK configuration.
     if isinstance(sdk_config, dict):
         sdk_recommended_str = sdk_config.get("recommended")
         sdk_supported_str = sdk_config.get("supported") or sdk_config.get("compatible")
@@ -929,7 +1090,7 @@ def _check_sdk_compatibility(
         )
         return False, None, None, None, []
     
-    # 版本检查
+    # Version checks.
     host_version_obj: Optional[Any] = None
     if Version and SpecifierSet:
         try:
@@ -944,7 +1105,7 @@ def _check_sdk_compatibility(
         untested_spec = _parse_specifier(sdk_untested_str, logger)
         conflict_specs = [_parse_specifier(c, logger) for c in sdk_conflicts_list]
         
-        # 验证 specifier 格式
+        # Validate specifier syntax.
         if sdk_supported_str and supported_spec is None:
             logger.error("Plugin {}: invalid supported SDK spec '{}'; skipping load", pid, sdk_supported_str)
             return False, None, None, None, []
@@ -956,7 +1117,7 @@ def _check_sdk_compatibility(
             logger.error("Plugin {}: invalid conflict SDK spec(s) {}; skipping load", pid, invalid_conflicts)
             return False, None, None, None, []
         
-        # 冲突检查
+        # Conflict checks.
         if any(spec and _version_matches(spec, host_version_obj) for spec in conflict_specs):
             logger.error(
                 "Plugin {} conflicts with host SDK {} (conflict ranges: {}); skipping load",
@@ -964,7 +1125,7 @@ def _check_sdk_compatibility(
             )
             return False, None, None, None, []
         
-        # 兼容性检查
+        # Compatibility checks.
         in_supported = _version_matches(supported_spec, host_version_obj)
         in_untested = _version_matches(untested_spec, host_version_obj)
         
@@ -975,13 +1136,13 @@ def _check_sdk_compatibility(
             )
             return False, None, None, None, []
         
-        # 警告
+        # Warnings.
         if recommended_spec and not _version_matches(recommended_spec, host_version_obj):
             logger.warning("Plugin {}: host SDK {} is outside recommended range {}", pid, SDK_VERSION, sdk_recommended_str)
         if in_untested and not in_supported:
             logger.warning("Plugin {}: host SDK {} is within untested range {}; proceed with caution", pid, SDK_VERSION, sdk_untested_str)
     else:
-        # 回退到字符串比较
+        # Fall back to string comparisons.
         if sdk_supported_str and sdk_supported_str != SDK_VERSION:
             logger.error("Plugin {} requires sdk_version {} but host SDK is {}; skipping load", pid, sdk_supported_str, SDK_VERSION)
             return False, None, None, None, []
@@ -993,19 +1154,23 @@ def _parse_single_plugin_config(
     toml_path: Path,
     processed_paths: set,
     logger: Any,
+    *,
+    apply_user_overlays: bool = True,
+    materialize_runtime_config: bool = True,
+    read_cache: PathResolutionCache | None = None,
 ) -> Optional[PluginContext]:
     """
-    解析单个插件的 TOML 配置文件。
+    Parse one plugin TOML configuration.
     
     Args:
-        toml_path: TOML 文件路径
-        processed_paths: 已处理的路径集合（用于去重）
-        logger: 日志记录器
+        toml_path: TOML path.
+        processed_paths: Previously processed paths for deduplication.
+        logger: Logger.
     
     Returns:
-        PluginContext 或 None（如果解析失败或应跳过）
+        PluginContext, or None on failure/skip.
     """
-    logger.info("Processing plugin config: {}", toml_path)
+    logger.debug("Processing plugin config: {}", toml_path)
     
     try:
         with toml_path.open("rb") as f:
@@ -1020,15 +1185,22 @@ def _parse_single_plugin_config(
         logger.warning("Plugin config {} has no 'id' field, skipping", toml_path)
         return None
     
-    # 应用用户配置覆盖
+    # Apply user overlays.
+    #
+    # Packaging uses apply_user_overlays=False to read staged plugin.toml itself,
+    # excluding author-local runtime settings/active profiles. Shipping private
+    # overlays gives recipients entries/schemas inferred from someone else's config,
+    # despite matching source fingerprints (codex).
     try:
-        if isinstance(conf, dict):
-            resolved_conf = resolve_plugin_config_from_path(
+        if apply_user_overlays and isinstance(conf, dict):
+            resolver = resolve_plugin_config_from_path if materialize_runtime_config else read_plugin_config_from_path
+            resolved_conf = resolver(
                 str(pid),
                 config_path=toml_path,
                 base_config=conf,
                 include_effective_config=True,
                 validate_schema=True,
+                **({} if materialize_runtime_config else {"read_cache": read_cache}),
             )
             effective = resolved_conf.get("effective_config")
             if isinstance(effective, dict):
@@ -1050,12 +1222,17 @@ def _parse_single_plugin_config(
             "Plugin {}: failed to apply user config profile overlay: {}. Using base config only.",
             pid, e,
         )
+
+    plugin_type = pdata.get("type", "plugin")
+    if not isinstance(plugin_type, str) or plugin_type not in SUPPORTED_PLUGIN_TYPES:
+        logger.error(format_unsupported_plugin_type(plugin_type, plugin_id=pid))
+        return None
     
     logger.debug("Plugin ID: {}", pid)
     
-    # 检查重复路径
+    # Check duplicate paths.
     try:
-        resolved_path = toml_path.resolve()
+        resolved_path = canonical_read_path(toml_path, cache=read_cache)
         if str(resolved_path) in processed_paths:
             logger.warning(
                 "Plugin config file {} has already been processed in this scan, skipping duplicate",
@@ -1066,7 +1243,7 @@ def _parse_single_plugin_config(
     except (OSError, RuntimeError) as e:
         logger.debug("Failed to resolve path for duplicate check: {}", e)
     
-    # 验证入口点
+    # Validate entrypoints.
     entry = pdata.get("entry")
     if not entry or ":" not in entry:
         logger.warning("Plugin {} has invalid entry point '{}', skipping", pid, entry)
@@ -1079,20 +1256,21 @@ def _parse_single_plugin_config(
     
     logger.debug("Plugin {} entry point: {}", pid, entry)
     
-    # 解析运行时配置
+    # Parse runtime settings.
     runtime_cfg = conf.get("plugin_runtime")
     enabled_val = True
-    auto_start_val = True
+    # 没写 plugin_runtime.auto_start 时默认关闭，和 PluginRuntimeSchema 一致。
+    auto_start_val = False
     if isinstance(runtime_cfg, dict):
         enabled_val = parse_bool_config(runtime_cfg.get("enabled"), default=True)
-        auto_start_val = parse_bool_config(runtime_cfg.get("auto_start"), default=True)
+        auto_start_val = parse_bool_config(runtime_cfg.get("auto_start"), default=False)
 
-    # 应用用户级运行时开关覆盖（来自 plugin_runtime_overrides.json，
-    # 由 plugin manager UI 的 disable/enable 按钮写入；与 manifest 默认值的
-    # 关系是 manifest -> profile overlay -> user override，user override 最后生效）
-    override = get_runtime_override(str(pid))
+    # Apply plugin_runtime_overrides.json user enablement written by plugin-manager
+    # disable/enable buttons, with precedence manifest -> profile overlay ->
+    # user override, the final authority.
+    override = get_runtime_override(str(pid)) if apply_user_overlays else None
     if override is not None and override != enabled_val:
-        logger.info(
+        logger.debug(
             "Plugin {} runtime_enabled overridden by user preference: {} -> {}",
             pid,
             enabled_val,
@@ -1100,18 +1278,30 @@ def _parse_single_plugin_config(
         )
         enabled_val = override
 
+    auto_start_override = (
+        get_runtime_auto_start_override(str(pid)) if apply_user_overlays else None
+    )
+    if auto_start_override is not None and auto_start_override != auto_start_val:
+        logger.debug(
+            "Plugin {} runtime_auto_start overridden by user preference: {} -> {}",
+            pid,
+            auto_start_val,
+            auto_start_override,
+        )
+        auto_start_val = auto_start_override
+
     if not enabled_val:
-        logger.info(
+        logger.debug(
             "Plugin {} is disabled by plugin_runtime.enabled=false; will register for visibility only (no runtime load)",
             pid,
         )
     if not auto_start_val:
-        logger.info(
+        logger.debug(
             "Plugin {} has plugin_runtime.auto_start=false; treating as manual-start-only (will register metadata but skip auto process start)",
             pid,
         )
     
-    # SDK 兼容性检查
+    # SDK compatibility checks.
     sdk_config = pdata.get("sdk")
     is_compatible, sdk_supported_str, sdk_recommended_str, sdk_untested_str, sdk_conflicts_list = \
         _check_sdk_compatibility(pid, sdk_config, logger)
@@ -1119,9 +1309,9 @@ def _parse_single_plugin_config(
     if not is_compatible:
         return None
     
-    # 解析插件间依赖
+    # Parse inter-plugin dependencies.
     dependencies = _parse_plugin_dependencies(conf, logger, pid)
-    # 解析 Python 运行时依赖（第三方包）
+    # Parse third-party Python runtime dependencies.
     python_requirements = _collect_plugin_python_requirements(conf, toml_path, logger, pid)
     python_requirement_paths = _collect_plugin_python_requirement_paths(toml_path)
     
@@ -1148,17 +1338,18 @@ def _collect_plugin_contexts(
     logger: Any,
 ) -> tuple[List[PluginContext], Dict[str, PluginContext]]:
     """
-    Phase 1: 收集和解析所有插件配置。
+    Phase 1: collect and parse all plugin configurations.
     
     Args:
-        plugin_config_root: 插件配置根目录
-        logger: 日志记录器
+        plugin_config_root: Plugin configuration root.
+        logger: Logger.
     
     Returns:
         (plugin_contexts, pid_to_context)
     """
     found_toml_files = list(plugin_config_root.glob("*/plugin.toml"))
-    logger.info("Found {} plugin.toml files: {}", len(found_toml_files), [str(p) for p in found_toml_files])
+    logger.info("Found {} plugin.toml files in {}", len(found_toml_files), plugin_config_root)
+    logger.debug("plugin.toml files in {}: {}", plugin_config_root, [str(p) for p in found_toml_files])
     
     plugin_contexts: List[PluginContext] = []
     processed_paths: set = set()
@@ -1189,7 +1380,7 @@ def _collect_plugin_contexts_from_roots(
     plugin_config_roots: Iterable[Path],
     logger: Any,
 ) -> tuple[List[PluginContext], Dict[str, PluginContext]]:
-    """从多个插件根目录收集插件配置，并在统一命名空间中去重。"""
+    """Collect configurations from multiple roots, deduplicating in one namespace."""
     plugin_contexts: List[PluginContext] = []
     pid_to_context: Dict[str, PluginContext] = {}
     processed_paths: set[Path] = set()
@@ -1205,7 +1396,8 @@ def _collect_plugin_contexts_from_roots(
             continue
 
         found_toml_files = list(root.glob("*/plugin.toml"))
-        logger.info("Found {} plugin.toml files in {}: {}", len(found_toml_files), root, [str(p) for p in found_toml_files])
+        logger.info("Found {} plugin.toml files in {}", len(found_toml_files), root)
+        logger.debug("plugin.toml files in {}: {}", root, [str(p) for p in found_toml_files])
 
         for toml_path in found_toml_files:
             try:
@@ -1230,89 +1422,24 @@ def _collect_plugin_contexts_from_roots(
 
 
 def _prepare_plugin_import_roots(plugin_config_roots: Iterable[Path], logger: Any) -> None:
-    """为用户插件根注入 import 根目录，内置插件保持包内导入。"""
-    try:
-        builtin_root = BUILTIN_PLUGIN_CONFIG_ROOT.resolve()
-    except Exception:
-        builtin_root = BUILTIN_PLUGIN_CONFIG_ROOT
+    """Compatibility hook that intentionally avoids shared plugin roots.
 
-    def _is_same_or_within(path: Path, base: Path) -> bool:
-        try:
-            if path == base:
-                return True
-            if hasattr(path, "is_relative_to"):
-                return path.is_relative_to(base)  # type: ignore[attr-defined]
-            return str(path).startswith(str(base))
-        except Exception:
-            return False
-
-    for plugin_config_root in plugin_config_roots:
-        try:
-            root = plugin_config_root.resolve()
-        except Exception:
-            root = plugin_config_root
-
-        project_root = root.parent
-        if _is_same_or_within(root, builtin_root) or _is_same_or_within(project_root, builtin_root):
-            logger.debug("Skipping built-in plugin import root: {}", root)
-            continue
-        if str(project_root) in sys.path:
-            continue
-        sys.path.insert(0, str(project_root))
-        logger.info("Added plugin import root to sys.path: {}", project_root)
-
-
-def _build_extension_map(
-    plugin_contexts: List[PluginContext],
-) -> Dict[str, List[Dict[str, str]]]:
+    User plugins are loaded from their selected ``plugin.toml`` directory by
+    :func:`plugin.core.host._import_plugin_module`.  Adding a shared root here
+    would also expose every unselected sibling as a top-level Python module.
     """
-    构建 Extension 映射：host_plugin_id -> [extension_configs]
-    
-    Args:
-        plugin_contexts: 插件上下文列表
-    
-    Returns:
-        Extension 映射字典
-    """
-    extension_map: Dict[str, List[Dict[str, str]]] = {}
-    
-    for ctx in plugin_contexts:
-        if ctx.pdata.get("type") != "extension":
-            continue
-        
-        host_conf = ctx.pdata.get("host")
-        if not isinstance(host_conf, dict):
-            continue
-        
-        host_pid = host_conf.get("plugin_id")
-        if not host_pid:
-            continue
-        
-        # 用 ctx.enabled 而不是直接重读 conf —— 前者已包含 manifest 默认值
-        # 之上叠加的 user override（plugin_runtime_overrides.json），重读 conf
-        # 会绕过 override，导致初始 host 注入清单和 state.plugins.runtime_enabled
-        # 不一致。
-        if not ctx.enabled:
-            continue
 
-        extension_map.setdefault(host_pid, []).append({
-            "ext_id": ctx.pid,
-            "ext_entry": ctx.entry,
-            "prefix": host_conf.get("prefix", ""),
-            "config_path": str(ctx.toml_path),
-        })
-    
-    return extension_map
+    del plugin_config_roots, logger
 
 
 def _shutdown_host_safely(host: Any, logger: Any, plugin_id: str) -> None:
     """
-    安全关闭插件 host。
+    Safely close plugin hosts.
     
     Args:
-        host: 插件 host 对象
-        logger: 日志记录器
-        plugin_id: 插件 ID（用于日志）
+        host: Plugin host.
+        logger: Logger.
+        plugin_id: ID for logging.
     """
     import asyncio
     
@@ -1355,20 +1482,20 @@ def _migrate_plugin_id(
     logger: Any,
 ) -> None:
     """
-    迁移插件 ID：更新所有相关映射。
+    Migrate plugin IDs across all associated maps.
     
     Args:
-        old_pid: 原插件 ID
-        new_pid: 新插件 ID
-        host: 插件 host 对象
-        logger: 日志记录器
+        old_pid: Original ID.
+        new_pid: New ID.
+        host: Plugin host.
+        logger: Logger.
     """
     logger.warning(
         "Plugin ID changed during registration from '{}' to '{}', updating plugin_hosts",
         old_pid, new_pid
     )
     
-    # 更新 plugin_hosts
+    # Update plugin_hosts.
     with state.acquire_plugin_hosts_write_lock():
         if old_pid in state.plugin_hosts:
             existing_host = state.plugin_hosts.pop(old_pid)
@@ -1392,7 +1519,7 @@ def _migrate_plugin_id(
         if sender is not None:
             state._plugin_downlink_senders[new_pid] = sender
 
-    # 迁移 event handlers
+    # Migrate event handlers.
     with state.acquire_event_handlers_write_lock():
         handlers_to_migrate = [
             k for k in list(state.event_handlers.keys())
@@ -1405,7 +1532,7 @@ def _migrate_plugin_id(
                 new_key = old_key.replace(f"{old_pid}:", f"{new_pid}:", 1)
             state.event_handlers[new_key] = state.event_handlers.pop(old_key)
     
-    # 迁移 plugin_entry_method_map
+    # Migrate plugin_entry_method_map.
     for (p, eid), method in list(plugin_entry_method_map.items()):
         if p == old_pid:
             plugin_entry_method_map[(new_pid, eid)] = method
@@ -1417,11 +1544,11 @@ def _load_disabled_plugin(
     logger: Any,
 ) -> None:
     """
-    加载禁用的插件（仅注册元数据，不启动进程）。
+    Load disabled plugins as metadata only, without starting processes.
     
     Args:
-        ctx: 插件上下文
-        logger: 日志记录器
+        ctx: Plugin context.
+        logger: Logger.
     """
     entries_preview = _extract_entries_preview(
         ctx.pid,
@@ -1468,16 +1595,16 @@ def _register_failed_plugin(
     error_phase: str,
 ) -> None:
     """
-    注册加载失败的插件元数据（仅可见，不可运行）。
+    Register failed-plugin metadata as visible but nonrunnable.
 
     Args:
-        ctx: 插件上下文
-        logger: 日志记录器
-        plugin_id: 注册用插件 ID（允许与 ctx.pid 不同，如冲突重命名后）
-        entries_preview: 已提取的入口预览；若未提供则回退到 FailedPluginStub 提取
-        error_type: 错误类型
-        error_message: 错误信息
-        error_phase: 失败阶段（dependency_check/import/start_process 等）
+        ctx: Plugin context.
+        logger: Logger.
+        plugin_id: Registration ID, possibly different from ctx.pid after conflict renaming.
+        entries_preview: Extracted entry previews, falling back to FailedPluginStub if absent.
+        error_type: Error type.
+        error_message: Error message.
+        error_phase: Failure phase, e.g. dependency_check/import/start_process.
     """
     pid = plugin_id or ctx.pid
     existing_meta: Optional[Dict[str, Any]] = None
@@ -1556,52 +1683,6 @@ def _register_failed_plugin(
     )
 
 
-def _load_extension_plugin(
-    ctx: PluginContext,
-    logger: Any,
-) -> None:
-    """
-    加载 Extension 类型插件（仅注册元数据，不启动独立进程）。
-    
-    Args:
-        ctx: 插件上下文
-        logger: 日志记录器
-    """
-    host_conf = ctx.pdata.get("host")
-    host_pid = host_conf.get("plugin_id") if isinstance(host_conf, dict) else None
-    
-    plugin_meta = _build_plugin_meta(
-        ctx.pid, ctx.pdata,
-        sdk_supported_str=ctx.sdk_supported_str,
-        sdk_recommended_str=ctx.sdk_recommended_str,
-        sdk_untested_str=ctx.sdk_untested_str,
-        sdk_conflicts_list=ctx.sdk_conflicts_list,
-        dependencies=ctx.dependencies,
-        host_plugin_id=host_pid,
-        plugin_ui=_extract_plugin_ui_config(ctx.conf, plugin_id=ctx.pid, logger=logger),
-    )
-    
-    resolved_id = register_plugin(
-        plugin_meta,
-        logger,
-        config_path=ctx.toml_path,
-        entry_point=ctx.entry,
-    )
-    
-    if resolved_id is not None:
-        with state.acquire_plugins_write_lock():
-            meta = state.plugins.get(resolved_id)
-            if isinstance(meta, dict):
-                meta["runtime_enabled"] = ctx.enabled
-                meta["runtime_auto_start"] = False
-                state.plugins[resolved_id] = meta
-    
-    logger.info(
-        "Extension '{}' registered (host='{}'); will be injected into host process at runtime",
-        ctx.pid, host_pid,
-    )
-
-
 def _load_adapter_plugin(
     ctx: PluginContext,
     logger: Any,
@@ -1609,22 +1690,22 @@ def _load_adapter_plugin(
     plugin_id: Optional[str] = None,
 ) -> Optional[Any]:
     """
-    加载 Adapter 类型插件。
+    Load adapter plugins.
     
-    Adapter 是一种特殊的插件类型，用于：
-    1. 作为网关转发外部协议请求到 NEKO 插件
-    2. 作为路由器直接处理外部请求
-    3. 作为桥接器在不同协议间转换
+    Adapters are specialized plugins that:
+    1. Gateway external protocols into NEKO plugins.
+    2. Route and directly handle external requests.
+    3. Bridge different protocols.
     
-    Adapter 作为独立进程运行，但具有更高的启动优先级。
+    Run independently with higher startup priority.
     
     Args:
-        ctx: 插件上下文
-        logger: 日志记录器
-        process_host_factory: 进程宿主工厂函数
+        ctx: Plugin context.
+        logger: Logger.
+        process_host_factory: Process-host factory.
     
     Returns:
-        创建的 host 对象，或 None 如果加载失败
+        Created host, or None on failure.
     """
     pid = plugin_id or ctx.pid
     conf = ctx.conf
@@ -1632,7 +1713,7 @@ def _load_adapter_plugin(
     toml_path = ctx.toml_path
     entry = ctx.entry
     
-    # 解析 adapter 配置
+    # Parse adapter configuration.
     adapter_conf = ctx.conf.get("adapter", {})
     adapter_mode = adapter_conf.get("mode", "hybrid")
     entries_preview: List[Dict[str, Any]] = []
@@ -1671,7 +1752,7 @@ def _load_adapter_plugin(
     except Exception:
         logger.debug("Adapter {}: failed to extract entries preview", pid, exc_info=True)
     
-    # 构建插件元数据
+    # Build plugin metadata.
     plugin_meta = _build_plugin_meta(
         pid, pdata,
         sdk_supported_str=ctx.sdk_supported_str,
@@ -1682,11 +1763,11 @@ def _load_adapter_plugin(
         plugin_ui=_extract_plugin_ui_config(ctx.conf, plugin_id=pid, logger=logger),
     )
     
-    # 创建进程宿主
+    # Create process hosts.
     host = None
     try:
         logger.debug("Adapter {}: creating process host...", pid)
-        host = process_host_factory(pid, entry, toml_path, extension_configs=None)
+        host = process_host_factory(pid, entry, toml_path)
         logger.info(
             "Adapter {}: process host created successfully (pid: {}, alive: {})",
             pid,
@@ -1694,7 +1775,7 @@ def _load_adapter_plugin(
             host.process.is_alive() if hasattr(host, 'process') and host.process else False
         )
         
-        # 注册到 plugin_hosts
+        # Register in plugin_hosts.
         with state.acquire_plugin_hosts_write_lock():
             state.plugin_hosts[pid] = host
         state.invalidate_snapshot_cache("hosts")
@@ -1726,7 +1807,7 @@ def _load_adapter_plugin(
         )
         return None
     
-    # 注册插件元数据
+    # Register plugin metadata.
     resolved_id = register_plugin(
         plugin_meta,
         logger,
@@ -1735,7 +1816,7 @@ def _load_adapter_plugin(
     )
     
     if resolved_id is None:
-        # 重复加载，关闭 host
+        # Duplicate load: close host.
         if host is not None:
             _shutdown_host_safely(host, logger, pid)
             with state.acquire_plugin_hosts_write_lock():
@@ -1744,13 +1825,13 @@ def _load_adapter_plugin(
         _remove_scanned_metadata(pid)
         return None
     
-    # 更新运行时状态
+    # Update runtime state.
     with state.acquire_plugins_write_lock():
         meta = state.plugins.get(resolved_id)
         if isinstance(meta, dict):
             meta["runtime_enabled"] = ctx.enabled
             meta["runtime_auto_start"] = ctx.auto_start
-            # type 是唯一权威字段；plugin_type 仅做兼容镜像。
+            # type is authoritative; plugin_type is a compatibility mirror only.
             meta["type"] = "adapter"
             meta["plugin_type"] = meta["type"]
             meta["entries_preview"] = entries_preview
@@ -1771,15 +1852,15 @@ def _check_plugin_already_loaded(
     logger: Any,
 ) -> bool:
     """
-    检查插件是否已经加载。
+    Check whether a plugin is already loaded.
     
     Args:
-        pid: 插件 ID
-        toml_path: 配置文件路径
-        logger: 日志记录器
+        pid: Plugin ID.
+        toml_path: Configuration path.
+        logger: Logger.
     
     Returns:
-        True 如果已加载，应跳过
+        True if loaded and should be skipped.
     """
     with state.acquire_plugin_hosts_read_lock():
         if pid in state.plugin_hosts:
@@ -1811,15 +1892,15 @@ def _check_plugin_already_registered(
     logger: Any,
 ) -> bool:
     """
-    检查插件是否已注册但未运行。
+    Check whether a plugin is registered but stopped.
     
     Args:
-        pid: 插件 ID
-        toml_path: 配置文件路径
-        logger: 日志记录器
+        pid: Plugin ID.
+        toml_path: Configuration path.
+        logger: Logger.
     
     Returns:
-        True 如果已注册，应跳过
+        True if registered and should be skipped.
     """
     with state.acquire_plugins_read_lock():
         plugin_already_registered = pid in state.plugins
@@ -1857,13 +1938,13 @@ def load_plugins_from_roots(
     process_host_factory: Callable[..., Any],
 ) -> None:
     """
-    扫描插件配置，启动子进程，并静态扫描元数据用于注册列表。
-    process_host_factory 接收 (plugin_id, entry_point, config_path, extension_configs=None) 并返回宿主对象。
+    Scan configurations, start child processes, and statically scan registration metadata.
+    process_host_factory receives plugin_id/entry_point/config_path and returns hosts.
     
-    加载过程分为三个阶段：
-    1. 收集（Collect）：扫描所有 TOML 文件，解析配置和依赖。
-    2. 排序（Sort）：根据插件依赖关系进行拓扑排序，确保依赖先加载。
-    3. 加载（Load）：按顺序执行实际加载。
+    Three loading stages:
+    1. Collect: scan TOML and parse configuration/dependencies.
+    2. Sort: topological ordering loads dependencies first.
+    3. Load: perform actual loading sequentially.
     """
     logger = _wrap_logger(logger)
     roots: list[Path] = []
@@ -1881,7 +1962,8 @@ def load_plugins_from_roots(
 
     logger.info("Loading plugins from roots: {}", [str(root) for root in roots])
 
-    # 用户插件继续使用顶层 ``plugins.xxx`` 导入；内置插件则改为 ``plugin.plugins.xxx``。
+    # plugin.toml uses canonical plugin.plugins.xxx entrypoints; installed user plugins
+    # normalize them to top-level plugins.xxx import namespaces.
     _prepare_plugin_import_roots(roots, logger)
     logger.info("Current working directory: {}", os.getcwd())
     logger.info("Python path (first 3): {}", sys.path[:3])
@@ -1897,10 +1979,7 @@ def load_plugins_from_roots(
     final_order = _topological_sort_plugins(plugin_contexts, pid_to_context, logger)
     
     # === Phase 3: Load ===
-    # 预构建 extension 映射
-    extension_map = _build_extension_map(plugin_contexts)
-    
-    # 加载每个插件
+    # Load each plugin.
     for pid in final_order:
         ctx = pid_to_context.get(pid)
         if not ctx:
@@ -1924,21 +2003,16 @@ def load_plugins_from_roots(
         if not enabled_val:
             _load_disabled_plugin(ctx, logger)
             continue
-        # 根据插件类型分发加载逻辑
+        # Dispatch loading by plugin type.
         plugin_type = pdata.get("type", "plugin")
         
-        # extension 类型：不启动独立进程，只注册元数据
-        if plugin_type == "extension":
-            _load_extension_plugin(ctx, logger)
-            continue
-        
-        # 依赖检查（可通过配置禁用）
+        # Dependency checks, configurable off.
         dependency_check_failed = False
         dependency_check_error: Optional[str] = None
         if PLUGIN_ENABLE_DEPENDENCY_CHECK and dependencies:
             logger.debug("Plugin {}: checking {} dependency(ies)...", pid, len(dependencies))
             for dep in dependencies:
-                # 检查依赖（包括简化格式和完整格式）
+                # Check simplified/full dependency declarations.
                 satisfied, error_msg = _check_plugin_dependency(dep, logger, pid)
                 if not satisfied:
                     logger.error(
@@ -1994,11 +2068,11 @@ def load_plugins_from_roots(
             )
             continue
 
-        # 检查插件是否已经加载
+        # Check whether already loaded.
         if _check_plugin_already_loaded(pid, toml_path, logger):
             continue
         
-        # 检测并解决插件 ID 冲突
+        # Detect/resolve plugin ID conflicts.
         plugin_data_for_hash = {
             "id": pid,
             "name": pdata.get("name", pid),
@@ -2022,18 +2096,14 @@ def load_plugins_from_roots(
         pid = resolved_pid
         if pid != original_pid:
             logger.warning("Plugin {} from {}: ID changed from '{}' to '{}' due to conflict", original_pid, toml_path, original_pid, pid)
-            # 同步 extension_map：将 original_pid 下收集的扩展迁移到新 pid
-            if original_pid in extension_map:
-                moved_exts = extension_map.pop(original_pid)
-                extension_map.setdefault(pid, []).extend(moved_exts)
 
-        # 检查插件是否已注册
+        # Check prior registration.
         if _check_plugin_already_registered(pid, toml_path, logger):
             continue
 
         _ensure_python_requirement_paths(ctx.python_requirement_paths, logger, pid)
 
-        # adapter 类型：在通过统一依赖和重复检查后，再走 adapter-specific 启动逻辑
+        # Adapter-specific startup follows shared dependency/duplicate checks.
         if plugin_type == "adapter":
             _load_adapter_plugin(ctx, logger, process_host_factory, plugin_id=pid)
             continue
@@ -2081,8 +2151,7 @@ def load_plugins_from_roots(
         if enabled_val and auto_start_val:
             try:
                 logger.debug("Plugin {}: creating process host...", pid)
-                ext_cfgs = extension_map.get(pid)
-                host = process_host_factory(pid, entry, toml_path, extension_configs=ext_cfgs)
+                host = process_host_factory(pid, entry, toml_path)
                 logger.info(
                     "Plugin {}: process host created successfully (pid: {}, alive: {})",
                     pid,
@@ -2090,14 +2159,14 @@ def load_plugins_from_roots(
                     host.process.is_alive() if hasattr(host, 'process') and host.process else False
                 )
                 
-                # 如果 ID 被重命名，更新 host 的 plugin_id（如果支持）
+                # If IDs rename, update host.plugin_id where supported.
                 if pid != original_pid and hasattr(host, 'plugin_id'):
                     host.plugin_id = pid
                     logger.debug("Updated host plugin_id to '{}'", pid)
                 
                 skip_register = False
                 with state.acquire_plugin_hosts_write_lock():
-                    # 检查是否已经存在（防止重复注册）
+                    # Check existing entries to prevent duplicate registration.
                     if pid in state.plugin_hosts:
                         existing_host = state.plugin_hosts[pid]
                         existing_config = getattr(existing_host, 'config_path', None)
@@ -2113,15 +2182,15 @@ def load_plugins_from_roots(
                                 pass
 
                     if not skip_register:
-                        # 注册 host
+                        # Register hosts.
                         state.plugin_hosts[pid] = host
-                        # 立即验证注册是否成功
+                        # Immediately verify registration succeeded.
                         registered_keys = list(state.plugin_hosts.keys())
                         logger.info(
                             "Plugin {}: registered in plugin_hosts. Current plugin_hosts keys: {}",
                             pid, registered_keys
                         )
-                        # 在同一个锁内验证 host 是否还在（防止在注册后立即被其他代码移除）
+                        # Check host presence under the same lock, preventing intervening removal.
                         if pid not in state.plugin_hosts:
                             logger.error(
                                 "Plugin {} host was removed from plugin_hosts immediately after registration! "
@@ -2129,7 +2198,7 @@ def load_plugins_from_roots(
                                 "Re-registering host to continue...",
                                 pid, list(state.plugin_hosts.keys())
                             )
-                            # 重新注册 host（可能是被意外清空了）
+                            # Reregister hosts possibly cleared accidentally.
                             state.plugin_hosts[pid] = host
                             logger.debug("Plugin {}: re-registered in plugin_hosts", pid)
 
@@ -2172,8 +2241,8 @@ def load_plugins_from_roots(
             plugin_ui=_extract_plugin_ui_config(conf, plugin_id=pid, logger=logger),
         )
         
-        # 在调用 register_plugin 之前，验证 host 是否还在 plugin_hosts 中。
-        # 对于 manual-start-only 插件（auto_start=false），host 允许为 None，此时不应要求在 plugin_hosts 中存在。
+        # Verify plugin_hosts still contains the host before register_plugin.
+        # Manual-start-only auto_start=false plugins may have host=None; require no plugin_hosts entry then.
         host_still_exists = False
         if host is not None:
             with state.acquire_plugin_hosts_read_lock():
@@ -2206,7 +2275,7 @@ def load_plugins_from_roots(
             pid, resolved_id, pid
         )
         
-        # 验证 register_plugin 调用后 host 是否还在
+        # Verify hosts remain after register_plugin.
         if host is not None:
             with state.acquire_plugin_hosts_read_lock():
                 host_after_register = pid in state.plugin_hosts
@@ -2224,7 +2293,7 @@ def load_plugins_from_roots(
                         pid, resolved_id
                     )
         
-        # 如果 register_plugin 返回 None，说明这是重复加载
+        # register_plugin returning None denotes duplicate loads.
         if resolved_id is None:
             logger.warning("Plugin {} from {} detected as duplicate in register_plugin, removing from plugin_hosts", pid, toml_path)
             existing_host = None
@@ -2237,7 +2306,7 @@ def load_plugins_from_roots(
             logger.debug("Plugin {} removed from plugin_hosts due to duplicate detection", pid)
             continue
         
-        # 如果 ID 被进一步重命名，迁移所有相关映射
+        # Further ID renaming migrates all associated maps.
         if resolved_id != pid:
             _migrate_plugin_id(pid, resolved_id, host, logger)
             pid = resolved_id
@@ -2257,5 +2326,5 @@ def load_plugins_from_toml(
     logger: Any,
     process_host_factory: Callable[..., Any],
 ) -> None:
-    """兼容旧调用：从单个插件根目录加载。"""
+    """Legacy entry: load from one plugin root."""
     load_plugins_from_roots((plugin_config_root,), logger, process_host_factory)

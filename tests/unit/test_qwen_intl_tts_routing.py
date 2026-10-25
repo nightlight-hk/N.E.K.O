@@ -1,6 +1,12 @@
-"""阿里国际版默认 TTS 路由回归测试。"""
+"""Alibaba international default TTS routing regression tests."""
+
+import pytest
 
 from main_logic import tts_client
+from main_logic.tts_client.workers.qwen import (
+    _QWEN_REALTIME_TTS_MODEL,
+    _resolve_qwen_realtime_tts_url,
+)
 
 
 class _FakeConfigManager:
@@ -26,14 +32,14 @@ class _FakeConfigManager:
 
 
 def test_qwen_intl_default_routes_to_realtime_tts(monkeypatch):
-    """qwen_intl 默认 TTS 一律走 qwen_realtime_tts_worker。
+    """qwen_intl default TTS always uses qwen_realtime_tts_worker.
 
-    历史曾经基于 "OPENROUTER_URL 解析到 dashscope-us" 推断 key 仅 US 可用并
-    fallback 到 dummy worker，但 _test_connectivity_candidates 是 latency race
-    挑首响，dual-region intl key 经常被误判到 US 然后被错误静音
-    (Codex P1 #3258641929)。同时若 key 真的只在 US 区域可用，coreApi=qwen_intl
-    的对话 realtime WS 也会走 dashscope-intl 端点同样失败 —— TTS 静音只是
-    掩盖更大的配置问题。
+    Historically, resolving OPENROUTER_URL to dashscope-us was interpreted as a US-only key,
+    falling back to a dummy worker. But _test_connectivity_candidates races latency
+    and chooses the first response, often misclassifying dual-region international keys as US-only and muting them
+    (Codex P1 #3258641929). For genuinely US-only keys, coreApi=qwen_intl
+    conversation realtime WebSockets also use dashscope-intl and fail likewise: muting TTS merely
+    hides the larger configuration problem.
     """
     monkeypatch.setattr(tts_client, "get_config_manager", lambda: _FakeConfigManager())
 
@@ -46,3 +52,48 @@ def test_qwen_intl_default_routes_to_realtime_tts(monkeypatch):
     assert worker is tts_client.qwen_realtime_tts_worker
     assert api_key_override is None
     assert provider_key == 'qwen'
+
+
+def _patch_qwen_core_config(monkeypatch, core_config):
+    class _CM:
+        def get_core_config(self):
+            return core_config
+
+    monkeypatch.setattr(
+        "main_logic.tts_client.workers.qwen.get_config_manager",
+        lambda: _CM(),
+    )
+
+
+def test_qwen_realtime_tts_url_uses_configured_model_without_legacy_prefix(monkeypatch):
+    """A Qwen TTS model outside the qwen3-tts prefix is passed through unchanged."""
+    _patch_qwen_core_config(monkeypatch, {
+        "CORE_URL": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "TTS_MODEL": "qwen3.5-tts-flash-realtime",
+        "REALTIME_MODEL": "qwen3.8-omni-flash-realtime",
+    })
+
+    url = _resolve_qwen_realtime_tts_url()
+
+    assert url.endswith("?model=qwen3.5-tts-flash-realtime")
+
+
+@pytest.mark.parametrize("tts_model", [
+    # Default: TTS_MODEL copies the omni realtime model name.
+    "qwen3.8-omni-flash-realtime",
+    # Fallback after another provider failed: its model id is still configured.
+    "tts-1",
+    "cosyvoice-v3-plus",
+    "  ",
+])
+def test_qwen_realtime_tts_url_falls_back_for_non_qwen_tts_models(monkeypatch, tts_model):
+    """Only Qwen TTS model ids may reach the DashScope realtime TTS endpoint."""
+    _patch_qwen_core_config(monkeypatch, {
+        "CORE_URL": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "TTS_MODEL": tts_model,
+        "REALTIME_MODEL": "qwen3.8-omni-flash-realtime",
+    })
+
+    url = _resolve_qwen_realtime_tts_url()
+
+    assert url.endswith(f"?model={_QWEN_REALTIME_TTS_MODEL}")

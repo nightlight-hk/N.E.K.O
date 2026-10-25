@@ -1,24 +1,25 @@
 """
-插件上下文模块
+Plugin context module
 
-提供插件运行时上下文，包括状态更新和消息推送功能。
+Provides plugin runtime context, including status updates and message-push features.
 """
 import contextlib
 import contextvars
 import asyncio
 import base64
 import copy
+import queue
+import threading
 import time
 try:
     import tomllib
 except ImportError:
     import tomli as tomllib
 import uuid
-import threading
 import functools
-import itertools
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Optional, cast
@@ -33,8 +34,6 @@ try:
 except ImportError:  # pragma: no cover
     zmq = None
 
-from fastapi import FastAPI
-
 from plugin.core.state import state
 from plugin.settings import (
     EXPORT_INLINE_BINARY_MAX_BYTES,
@@ -44,23 +43,107 @@ from plugin.settings import (
     SYNC_CALL_IN_HANDLER_POLICY,
 )
 
-# 模块级初始化锁，用于 _push_lock 的双检初始化
-_PUSH_LOCK_INIT = threading.Lock()
-
 if TYPE_CHECKING:
+    # Used only for type annotations on PluginContext.app; importing at runtime would pull all of fastapi/starlette into every plugin subprocess.
+    from fastapi import FastAPI
     from plugin.core.bus.types import BusHubProtocol
     from plugin.core.bus.events import EventClient
     from plugin.core.bus.lifecycle import LifecycleClient
-    from plugin.core.bus.memory_client import MemoryClient
+    from plugin.core.bus.memory import MemoryClient
     from plugin.core.bus.messages import MessageClient
     from plugin.core.bus.conversations import ConversationClient
-    # ⚠ 严禁 import loguru。logger 字段实际类型是 plugin.logging_config.PluginLoggerAdapter。
+    from plugin.core.bus.frames import FrameClient
+    from plugin.sdk.shared.core.types import PushMessageRejected, PushMessageResult
+    # ⚠ Never import loguru. The actual type of the logger field is plugin.logging_config.PluginLoggerAdapter.
     from plugin.logging_config import PluginLoggerAdapter as LoguruLogger
 
 
 _IN_HANDLER: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("plugin_in_handler", default=None)
 
 _CURRENT_RUN_ID: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("plugin_current_run_id", default=None)
+_CURRENT_LANLAN: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("plugin_current_lanlan", default=None)
+
+
+def _is_submission_backpressure(error: BaseException) -> bool:
+    """Return whether a non-blocking local submission path was full."""
+    if isinstance(error, (asyncio.QueueFull, queue.Full)):
+        return True
+    again_type = getattr(zmq, "Again", None) if zmq is not None else None
+    return isinstance(again_type, type) and isinstance(error, again_type)
+
+
+# base64 spends 4 wire bytes for every 3 raw bytes, and the rest of the
+# envelope is scalars plus whatever text parts ride along -- a few hundred
+# bytes at most.  So this ratio is what turns MESSAGE_PLANE_PAYLOAD_MAX_BYTES
+# into the raw-bytes budget an author can actually aim at, and it is the number
+# the rejection log prints.  It only holds while an inline payload rides the
+# wire ONCE: the envelope used to carry a raw duplicate in the legacy
+# ``binary_data`` field as well, which put the real ratio at ~2.34x.
+_INLINE_BASE64_WIRE_RATIO = 4.0 / 3.0
+
+# Label for the deprecated top-level ``binary_data`` field in the rejection
+# log.  It is not a part type and is deliberately not mapped onto one: it only
+# survives translation when the caller passed it next to an explicit ``parts=``
+# list, and in that shape nothing in the payload says what those bytes are.
+_LEGACY_BINARY_CARRIER = "binary_data"
+
+
+def _inline_binary_carriers(
+    parts: Any, legacy_binary_data: Any
+) -> tuple[tuple[str, int], ...]:
+    """Return ``(carrier label, wire bytes)`` per inline payload, in wire order.
+
+    This used to double as a gate: an empty tuple skipped the size probe
+    entirely, on the theory that only inline bytes can realistically blow
+    MESSAGE_PLANE_PAYLOAD_MAX_BYTES.  That gate is gone.  The host measures the
+    WHOLE envelope, so an oversized text or metadata push was dropped there
+    while push_message() had already answered submitted=True -- and the cost it
+    was avoiding turned out to be 0.19us per typical cue, measured.  Every
+    payload is probed now, and an empty tuple here means only "nothing travels
+    inline", never "skip the check".
+
+    The labels and sizes exist so the rejection can name the payload that
+    actually blew the cap.  ``ctx.images.upload()`` is the remedy for an image
+    and for nothing else -- there is no audio or video upload helper today --
+    so a rejection that always pointed there sent the author of an inline
+    audio part hunting for an API that does not exist (Codex).
+
+    Both carriers are reported because they can appear independently:
+    ``parts[].binary_base64`` is the canonical one, while ``binary_data`` is
+    the legacy field that :func:`translate_push_message` leaves untranslated
+    when a caller passes v2 ``parts`` and the deprecated ``binary_data=``
+    kwarg together.  Either one alone is enough to reach the cap.
+    """
+    carriers: list[tuple[str, int]] = []
+    if isinstance(parts, list):
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            blob = part.get("binary_base64")
+            if not isinstance(blob, str) or not blob:
+                continue
+            part_type = part.get("type")
+            label = part_type if isinstance(part_type, str) and part_type else "unknown"
+            carriers.append((label, len(blob)))
+    if isinstance(legacy_binary_data, (bytes, bytearray)) and legacy_binary_data:
+        carriers.append((_LEGACY_BINARY_CARRIER, len(legacy_binary_data)))
+    return tuple(carriers)
+
+
+def _inline_carrier_totals(
+    carriers: tuple[tuple[str, int], ...]
+) -> list[tuple[str, int]]:
+    """Aggregate carriers per label, biggest total first.
+
+    Aggregating before ranking is what makes "which one blew the cap" answer
+    the question the author is actually asking: ten thumbnails that together
+    outweigh one voice clip are the thing to fix, even though the clip is the
+    single largest part.  The label breaks ties so the log line is stable.
+    """
+    totals: Dict[str, int] = {}
+    for label, size in carriers:
+        totals[label] = totals.get(label, 0) + size
+    return sorted(totals.items(), key=lambda item: (-item[1], item[0]))
 
 
 def _synthesize_legacy_message_type(canonical: Dict[str, Any]) -> str:
@@ -104,7 +187,7 @@ class _BusHub:
 
     @functools.cached_property
     def memory(self) -> "MemoryClient":
-        from plugin.core.bus.memory_client import MemoryClient
+        from plugin.core.bus.memory import MemoryClient
 
         return MemoryClient(self._ctx)
 
@@ -132,31 +215,71 @@ class _BusHub:
 
         return ConversationClient(self._ctx)
 
+    @functools.cached_property
+    def frames(self) -> "FrameClient":
+        from plugin.core.bus.frames import FrameClient
+
+        return FrameClient(self._ctx)
+
+
+# The host normalizes the record before writing to the message plane, so the packed payload is larger than what the SDK measures
+# inside push_message(). _reject_if_payload_too_large subtracts this overhead so a push that is
+# "right at the lower edge of the limit" is rejected synchronously instead of receiving submitted=True and then being
+# silently discarded during ingest.
+#
+# **Derived, not guessed** — an earlier choice of 128 was disproven in practice: the host-added plugin_id
+# can be 128 characters, and that alone can cause 222 bytes of drift. Three contributors:
+#
+#   plugin_id   added by the host from authenticated identity, key + value (≤ _HOST_PLUGIN_ID_MAX_CHARS)
+#   message_id  filled with a uuid4 string when missing (36 characters)
+#   time        converted to an ISO string (28 characters) when missing or a float (fast_mode)
+#
+# Each also includes the msgpack key and length header. It is module-level rather than buried in a function because the guard
+# reads it — the guard measures the **worst-case shape** (both missing + longest plugin_id), so an undersized value
+# fails instead of silently reopening the gap.
+_HOST_PLUGIN_ID_MAX_CHARS = 128
+_HOST_ENVELOPE_HEADROOM_BYTES = (
+    (4 + len("plugin_id") + _HOST_PLUGIN_ID_MAX_CHARS)
+    + (4 + len("message_id") + 36)
+    + (4 + len("time") + 28)
+)
+
 
 @dataclass
 class PluginContext:
-    """插件运行时上下文"""
+    """Plugin runtime context"""
     plugin_id: str
     config_path: Path
     logger: "LoguruLogger"
     status_queue: Any
-    message_queue: Any = None  # 消息推送队列
-    app: Optional[FastAPI] = None
-    _plugin_comm_queue: Optional[Any] = None  # 插件间通信队列（主进程提供）
+    message_queue: Any = None  # Message-push queue
+    app: Optional["FastAPI"] = None
+    _plugin_comm_queue: Optional[Any] = None  # Inter-plugin communication queue (provided by the main process)
     _zmq_ipc_client: Optional[Any] = None
-    _cmd_queue: Optional[Any] = None  # 命令队列（用于在等待期间处理命令）
-    _res_queue: Optional[Any] = None  # 结果队列（用于在等待期间处理响应）
+    _cmd_queue: Optional[Any] = None  # Command queue (for handling commands while waiting)
+    _res_queue: Optional[Any] = None  # Result queue (for handling responses while waiting)
     _response_queue: Optional[Any] = None
     _response_pending: Optional[Dict[str, Any]] = None
-    _entry_map: Optional[Dict[str, Any]] = None  # 入口映射（用于处理命令）
+    _direct_response_waiters: Optional[Dict[str, Any]] = None
+    _direct_response_lock: Any = field(
+        default_factory=threading.Lock,
+        init=False,
+        repr=False,
+    )
+    _image_transport: Optional[Any] = None
+    _images: Optional[Any] = None
+    _model_gateway_base_url: str = field(default="", repr=False)
+    _model_gateway_token: str = field(default="", repr=False)
+    _model_gateway_closed: bool = field(default=False, init=False, repr=False)
+    _models: Optional[Any] = field(default=None, init=False, repr=False)
+    _image_uploads_blocked: bool = False
+    _entry_map: Optional[Dict[str, Any]] = None  # Entry-point mapping (for handling commands)
     _entry_meta_map: Optional[Dict[str, Any]] = None  # entry_id -> EventMeta
-    _instance: Optional[Any] = None  # 插件实例（用于处理命令）
+    _instance: Optional[Any] = None  # Plugin instance (for handling commands)
     _bus_hub: Optional[Any] = None
-    _push_seq: int = 0
-    _push_lock: Optional[Any] = None
-    _push_batcher: Optional[Any] = None
-    _restored_from_freeze: bool = False  # 标记是否从冻结状态恢复
+    _restored_from_freeze: bool = False  # Whether restored from frozen state
     _effective_config: Optional[Dict[str, Any]] = None
+    _effective_config_uncertain: bool = False
     _current_lanlan: Optional[str] = None
 
     @property
@@ -167,55 +290,187 @@ class PluginContext:
             self._bus_hub = hub
         return cast("BusHubProtocol", hub)
 
+    @property
+    def reply_tail(self) -> Any:
+        from plugin.sdk.shared.core.reply_tail import ReplyTailClient
+
+        return ReplyTailClient(self)
+
+    @property
+    def images(self) -> Any:
+        images = self._images
+        if images is None:
+            from plugin.sdk.shared.core.images import PluginImages
+
+            images = PluginImages(self)
+            self._images = images
+        return images
+
+    @property
+    def models(self) -> Any:
+        with self._direct_response_lock:
+            models = self._models
+            if models is None:
+                from plugin.sdk.shared.core.models import PluginModels
+
+                models = PluginModels(self)
+                self._models = models
+            return models
+
+    async def _upload_image(
+        self,
+        data: bytes,
+        *,
+        mime: str,
+        deadline: float | None = None,
+        timeout: float,
+    ) -> dict[str, object]:
+        """Upload one image within ``timeout`` TOTAL.
+
+        ``deadline`` is a monotonic instant established by the caller before it
+        began any work on this upload. Without it the legs each got a fresh
+        ``timeout`` — send, then wait — so an upload could take past twice its
+        advertised budget and overrun a timer or entry handler's own deadline.
+        The decode gate widened that further, since queueing for a slot happens
+        before the transport is even touched (Codex).
+        """
+        self._ensure_image_upload_available()
+        transport = self._image_transport
+        if transport is None:
+            raise RuntimeError("temporary image transport is not available")
+        if timeout <= 0:
+            raise ValueError("image upload timeout must be positive")
+
+        request_id = str(uuid.uuid4())
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        with self._direct_response_lock:
+            waiters = self._direct_response_waiters
+            if waiters is None:
+                waiters = {}
+                self._direct_response_waiters = waiters
+            waiters[request_id] = (loop, future)
+        try:
+            def _remaining() -> float:
+                if deadline is None:
+                    return timeout
+                return deadline - asyncio.get_running_loop().time()
+
+            # The host starts timer and custom-event handler threads BEFORE the
+            # downlink loop begins reading, and _on_command_loop_start can await
+            # for as long as it likes in between. An upload launched in that
+            # window is sent to nobody: the reply has no reader, so it can only
+            # time out (Codex).
+            #
+            # Waiting is the honest answer rather than refusing, because those
+            # handlers are legitimate uploaders the moment the loop is up -- a
+            # refusal keyed on handler NAME would also reject them afterwards.
+            # The wait is charged to the SAME deadline, so it is never a second
+            # budget stacked on the caller's: a plugin that asked for three
+            # seconds still gets an answer within three seconds.
+            ready = getattr(self, "_downlink_ready", None)
+            while ready is not None and not ready.is_set():
+                remaining = _remaining()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"image upload timed out after {timeout}s "
+                        "(plugin downlink not ready)"
+                    )
+                await asyncio.sleep(min(0.02, remaining))
+
+            send_budget = _remaining()
+            if send_budget <= 0:
+                raise TimeoutError(f"image upload timed out after {timeout}s")
+            await transport.send_image(
+                request_id,
+                mime=mime,
+                data=data,
+                timeout=send_budget,
+            )
+            wait_budget = _remaining()
+            if wait_budget <= 0:
+                raise TimeoutError(f"image upload timed out after {timeout}s")
+            try:
+                response = await asyncio.wait_for(future, timeout=wait_budget)
+            except asyncio.TimeoutError:
+                raise TimeoutError(f"image upload timed out after {timeout}s") from None
+            return self._unwrap_image_upload_response(response)
+        finally:
+            with self._direct_response_lock:
+                waiters.pop(request_id, None)
+
+    def _ensure_image_upload_available(self) -> None:
+        if self._image_uploads_blocked:
+            raise RuntimeError("ctx.images.upload() is not available while the plugin is freezing")
+
+    def _dispatch_direct_response(self, response: Any) -> bool:
+        """Resolve SDK-owned response futures before the legacy shared inbox."""
+        if not isinstance(response, dict) or response.get("type") != "IMAGE_UPLOAD_RESULT":
+            return False
+        request_id = response.get("request_id")
+        with self._direct_response_lock:
+            waiters = self._direct_response_waiters
+            waiter = waiters.get(request_id) if waiters and request_id else None
+        if waiter is not None:
+            loop, future = waiter
+            try:
+                loop.call_soon_threadsafe(
+                    self._resolve_direct_response,
+                    future,
+                    response,
+                )
+            except RuntimeError:
+                pass
+        # A late image result is owned by this path too; don't leak it into the
+        # plugin-to-plugin response inbox where it can confuse correlation.
+        return True
+
+    @staticmethod
+    def _resolve_direct_response(
+        future: asyncio.Future[Any],
+        response: dict[str, Any],
+    ) -> None:
+        if not future.done():
+            future.set_result(response)
+
+    @staticmethod
+    def _cancel_direct_response(future: asyncio.Future[Any]) -> None:
+        if not future.done():
+            future.cancel()
+
+    @staticmethod
+    def _unwrap_image_upload_response(response: dict[str, Any]) -> dict[str, object]:
+        error = response.get("error")
+        if error:
+            if isinstance(error, dict):
+                message = error.get("message") or error.get("code") or "image upload failed"
+            else:
+                message = str(error)
+            raise RuntimeError(str(message))
+        result = response.get("result")
+        if not isinstance(result, dict):
+            raise RuntimeError("image upload returned no image part")
+        return dict(result)
+
     def close(self) -> None:
-        """Release per-context resources such as the ZeroMQ push batcher.
+        """Release resources owned directly by this context.
 
         This is safe to call multiple times.
         """
-        batcher = getattr(self, "_push_batcher", None)
-        if batcher is not None:
+        self._model_gateway_closed = True
+        models = getattr(self, "_models", None)
+        if models is not None:
+            models.close()
+        with self._direct_response_lock:
+            waiters = getattr(self, "_direct_response_waiters", None)
+            pending = tuple(waiters.values()) if waiters else ()
+            if waiters:
+                waiters.clear()
+        for loop, future in pending:
             try:
-                # Give the batcher a bounded window to flush and stop.
-                batcher.stop(timeout=2.0)
-            except Exception as e:
-                # Cleanup should be best-effort and never raise.
-                try:
-                    self.logger.debug(f"Batcher stop failed (best-effort): {e}")
-                except Exception:
-                    pass
-            try:
-                self._push_batcher = None
-            except Exception:
+                loop.call_soon_threadsafe(self._cancel_direct_response, future)
+            except RuntimeError:
                 pass
-
-        mp_batcher = getattr(self, "_message_plane_push_batcher", None)
-        if mp_batcher is not None:
-            push_lock = getattr(self, "_push_lock", None)
-            acquired_push_lock = False
-            if push_lock is not None:
-                try:
-                    acquired_push_lock = bool(push_lock.acquire(timeout=3.0))
-                except TypeError:
-                    acquired_push_lock = bool(push_lock.acquire())
-                except Exception:
-                    acquired_push_lock = False
-            try:
-                mp_batcher.stop(timeout=2.0)
-            except Exception as e:
-                try:
-                    self.logger.debug(f"Message plane batcher stop failed (best-effort): {e}")
-                except Exception:
-                    pass
-            try:
-                self._message_plane_push_batcher = None
-            except Exception:
-                pass
-            finally:
-                if acquired_push_lock and push_lock is not None:
-                    try:
-                        push_lock.release()
-                    except Exception:
-                        pass
 
         zmq_client = getattr(self, "_zmq_ipc_client", None)
         if zmq_client is not None:
@@ -230,35 +485,85 @@ class PluginContext:
             except Exception:
                 pass
 
-        tls = getattr(self, "_message_plane_ingest_tls", None)
-        if tls is not None:
-            try:
-                sock = getattr(tls, "sock", None)
-                if sock is not None:
-                    try:
-                        sock.close(0)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-            try:
-                object.__setattr__(self, "_message_plane_ingest_tls", None)
-            except Exception:
-                try:
-                    self._message_plane_ingest_tls = None
-                except Exception:
-                    pass
-
     def __del__(self) -> None:  # pragma: no cover - best-effort safety net
         try:
             self.close()
         except Exception:
             pass
 
-    def _get_sync_call_in_handler_policy(self) -> str:
-        """获取同步调用策略，优先使用插件自身配置，其次使用全局配置。
+    def _refresh_instance_runtime_config(self, effective_config: Dict[str, Any]) -> None:
+        instance = getattr(self, "_instance", None)
+        refresh = getattr(instance, "refresh_runtime_config", None)
+        if not callable(refresh):
+            return
+        try:
+            refresh(effective_config)
+        except Exception as exc:
+            try:
+                self.logger.warning(
+                    "[PluginContext] Failed to refresh runtime config: plugin_id={}, err_type={}, err={}",
+                    self.plugin_id,
+                    type(exc).__name__,
+                    str(exc),
+                )
+            except Exception:
+                pass
 
-        有效值："warn" / "reject"。任何非法值都会回退到全局策略。
+    def _set_effective_config_cache(self, config_obj: object) -> Dict[str, Any] | None:
+        if not isinstance(config_obj, dict):
+            self._effective_config = None
+            self._effective_config_uncertain = False
+            return None
+        config_copy = copy.deepcopy(config_obj)
+        self._effective_config = config_copy
+        self._effective_config_uncertain = False
+        self._refresh_instance_runtime_config(config_copy)
+        return config_copy
+
+    @staticmethod
+    def _merge_config_copy(base: object, updates: Dict[str, Any]) -> Dict[str, Any]:
+        merged = copy.deepcopy(base) if isinstance(base, dict) else {}
+        for key, value in updates.items():
+            if not isinstance(key, str):
+                continue
+            if value == "__DELETE__":
+                merged.pop(key, None)
+                continue
+            if isinstance(value, Mapping):
+                value_mapping = {
+                    nested_key: nested_value
+                    for nested_key, nested_value in value.items()
+                    if isinstance(nested_key, str)
+                }
+                if value_mapping.get("__replace__") is True:
+                    merged[key] = {
+                        nested_key: copy.deepcopy(nested_value)
+                        for nested_key, nested_value in value_mapping.items()
+                        if nested_key != "__replace__"
+                    }
+                    continue
+                current = merged.get(key)
+                if isinstance(current, Mapping):
+                    current_mapping = {
+                        nested_key: nested_value
+                        for nested_key, nested_value in current.items()
+                        if isinstance(nested_key, str)
+                    }
+                    merged[key] = (
+                        PluginContext._merge_config_copy(current_mapping, value_mapping)
+                        if value_mapping
+                        else {}
+                    )
+                else:
+                    merged[key] = copy.deepcopy(value_mapping)
+            else:
+                merged[key] = copy.deepcopy(value)
+        return merged
+
+    def _get_sync_call_in_handler_policy(self) -> str:
+        """Get the synchronous-call policy, preferring the plugin's own setting and then the global setting.
+
+        Valid values: \"warn\" / \"reject\". Any invalid value falls back to the global policy.
         """
         try:
             st = self.config_path.stat()
@@ -320,6 +625,19 @@ class PluginContext:
         finally:
             _CURRENT_RUN_ID.reset(token)
 
+    @contextlib.contextmanager
+    def _lanlan_scope(self, lanlan_name: Optional[str]):
+        token = _CURRENT_LANLAN.set(lanlan_name if isinstance(lanlan_name, str) and lanlan_name else None)
+        try:
+            yield
+        finally:
+            _CURRENT_LANLAN.reset(token)
+
+    @property
+    def current_lanlan(self) -> Optional[str]:
+        """Recipient of this invocation, never the last caller on another task."""
+        return _CURRENT_LANLAN.get()
+
     @property
     def handler_ctx(self) -> Optional[str]:
         return _IN_HANDLER.get()
@@ -369,10 +687,10 @@ class PluginContext:
         return rid
 
     def _is_in_event_loop(self) -> bool:
-        """检测当前是否在事件循环中运行。
+        """Detect whether currently running inside an event loop.
         
         Returns:
-            True 如果当前在事件循环中，False 如果在无事件循环环境
+            True if currently in an event loop; False if there is no running event loop
         """
         try:
             asyncio.get_running_loop()
@@ -414,7 +732,7 @@ class PluginContext:
 
     def update_status(self, status: Dict[str, Any]) -> None:
         """
-        子进程 / 插件内部调用：把原始 status 丢到主进程的队列里，由主进程统一整理。
+        Calls from subprocesses / plugins enqueue the raw status for the main process to normalize centrally.
         """
         try:
             payload = {
@@ -427,10 +745,10 @@ class PluginContext:
             if PLUGIN_LOG_CTX_STATUS_UPDATE:
                 self.logger.info(f"Plugin {self.plugin_id} status updated: {payload}")
         except (AttributeError, RuntimeError) as e:
-            # 队列操作错误
+            # Queue operation error
             self.logger.warning(f"Queue error updating status for plugin {self.plugin_id}: {e}")
         except Exception:
-            # 其他未知异常
+            # Other unexpected exception
             self.logger.exception(f"Unexpected error updating status for plugin {self.plugin_id}")
 
     # ==================== Unified Export Push ====================
@@ -647,7 +965,7 @@ class PluginContext:
         metrics: Optional[Dict[str, Any]] = None,
         timeout: float = 5.0,
     ):
-        """智能代理：自动检测执行环境，选择同步或异步执行方式。"""
+        """Smart agent: detect the execution environment and choose synchronous or asynchronous execution automatically."""
         coro = self._run_update_async(
             run_id=run_id,
             progress=progress,
@@ -742,7 +1060,7 @@ class PluginContext:
         message: Optional[str] = None,
         timeout: float = 5.0,
     ):
-        """智能代理：自动检测执行环境，选择同步或异步执行方式。"""
+        """Smart agent: detect the execution environment and choose synchronous or asynchronous execution automatically."""
         coro = self._run_progress_async(
             run_id=run_id, progress=progress, stage=stage, message=message, timeout=timeout
         )
@@ -801,7 +1119,7 @@ class PluginContext:
         mime: Optional[str] = None,
         delivery: Any = None,
         reply: Optional[bool] = None,
-    ) -> None:
+    ) -> "PushMessageResult":
         """Push a message from a plugin to the host.
 
         The v2 (canonical) parameters are ``visibility`` (list of
@@ -813,9 +1131,14 @@ class PluginContext:
 
         All other parameters (``message_type``, ``content``, ``binary_data``,
         ``binary_url``, ``mime``, ``delivery``, ``reply``, ``description``,
-        ``unsafe``) are deprecated.  They still work for the deprecation
-        window but emit ``DeprecationWarning`` and are scheduled for
-        removal in v0.9 (see ``docs/changelog``).
+        ``unsafe``, ``fast_mode``) are deprecated.  They still work for the
+        deprecation window but emit ``DeprecationWarning`` and are scheduled
+        for removal in v0.9 (see ``docs/changelog``).
+
+        The returned ``submitted`` flag only reports whether the SDK's
+        authoritative local submission path accepted responsibility for the
+        payload.  It does not acknowledge host consumption, model generation,
+        or playback.
         """
         from plugin.sdk.shared.core.push_message_schema import (
             translate_push_message,
@@ -834,6 +1157,7 @@ class PluginContext:
             delivery=delivery,
             reply=reply,
             unsafe=unsafe if unsafe else None,
+            fast_mode=fast_mode if fast_mode else None,
             source=source,
             metadata=metadata,
             target_lanlan=target_lanlan,
@@ -857,9 +1181,26 @@ class PluginContext:
         )
         legacy_content = content if isinstance(content, str) else _synthesize_legacy_content(canonical.get("parts") or [])
         legacy_binary_url: Optional[str] = binary_url if isinstance(binary_url, str) else None
-        legacy_binary_data: Optional[bytes] = bytes(binary_data) if isinstance(binary_data, (bytes, bytearray)) else None
+        # The deprecated top-level ``binary_data`` reaches the wire ONLY when the
+        # caller passed it next to an explicit ``parts=`` list.  That is the one
+        # shape translate_push_message leaves untranslated, so those bytes ride
+        # in no part and dropping them here would be silent data loss.  Every
+        # other shape is a duplicate of what ``parts[].binary_base64`` already
+        # carries: either translate_push_message built the part FROM
+        # ``binary_data`` (``parts=None``), or the loop below used to decode the
+        # part's base64 back into raw bytes purely to re-attach them.  Carrying
+        # both put one image on the wire at ~2.34x its raw size, which is what
+        # made a 100 KiB screenshot blow a 256 KiB cap; the base64 copy alone is
+        # ~1.34x, so the cap now means roughly what it says.  query_service is
+        # the only reader of the field and decodes the canonical part on demand
+        # instead.
+        legacy_binary_data: Optional[bytes] = (
+            bytes(binary_data)
+            if isinstance(binary_data, (bytes, bytearray)) and parts is not None
+            else None
+        )
         legacy_mime: Optional[str] = mime if isinstance(mime, str) else None
-        if legacy_binary_url is None or legacy_binary_data is None or legacy_mime is None:
+        if legacy_binary_url is None or legacy_mime is None:
             for part in canonical.get("parts") or []:
                 if not isinstance(part, dict):
                     continue
@@ -869,18 +1210,11 @@ class PluginContext:
                     url_obj = part.get("url")
                     if isinstance(url_obj, str) and url_obj:
                         legacy_binary_url = url_obj
-                if legacy_binary_data is None:
-                    b64_obj = part.get("binary_base64")
-                    if isinstance(b64_obj, str) and b64_obj:
-                        try:
-                            legacy_binary_data = base64.b64decode(b64_obj, validate=False)
-                        except Exception:
-                            legacy_binary_data = None
                 if legacy_mime is None:
                     mime_obj = part.get("mime")
                     if isinstance(mime_obj, str) and mime_obj:
                         legacy_mime = mime_obj
-                if legacy_binary_url is not None and legacy_binary_data is not None and legacy_mime is not None:
+                if legacy_binary_url is not None and legacy_mime is not None:
                     break
         # ``description`` has no role in v2 (no semantic consumer; only
         # surfaces as a human label in legacy log lines and the
@@ -911,10 +1245,10 @@ class PluginContext:
         legacy_reply = legacy_delivery != "silent"
 
         def _build_wire_payload(*, message_id: str, ts: Any) -> Dict[str, Any]:
-            """Construct the message_plane envelope (v2 + legacy compat fields).
+            """Construct the authenticated message envelope.
 
-            Used by all three send paths (fast batcher / slow per-call / fallback
-            queue).  Keeps the wire shape identical regardless of transport.
+            Legacy compatibility fields keep downstream readers stable while
+            the canonical v2 schema crosses the dedicated message uplink.
             """
             return {
                 "type": "MESSAGE_PUSH",
@@ -946,268 +1280,285 @@ class PluginContext:
                 "reply": legacy_reply,
             }
 
-        # Prefer writing messages directly to message_plane ingest to isolate high-frequency writes
-        # from the control plane and rely on ZMQ backpressure.
-        if zmq is not None:
+        def _reject_if_payload_too_large(payload: Dict[str, Any]) -> Optional["PushMessageRejected"]:
+            """Refuse a push the host's ingest server would discard whole.
+
+            The host measures ``len(ormsgpack.packb(payload))`` of each delta
+            item -- the payload dict, NOT the batch envelope around it -- against
+            MESSAGE_PLANE_PAYLOAD_MAX_BYTES, and on overflow it records
+            ``payload_too_big`` and drops the entire item, text parts included.
+            That verdict lands in the host process, long after push_message() has
+            already returned ``{"submitted": True}``, so the author's only trace
+            is a throttled line in someone else's log.  Measuring the same
+            expression here turns that into a synchronous verdict the caller can
+            branch on.  Both processes import the constant from plugin.settings,
+            so the CONSTANT cannot drift apart -- but the OBJECT being measured
+            can, and does: the host normalizes the record before it writes the
+            plane (``_forward_message`` fills ``message_id`` / rewrites a
+            non-string ``time``, and ``fast_mode`` sends a float timestamp the
+            host swaps for a 28-character ISO string). Measured, that is up to
+            ~19 bytes on the fast path. ``_HOST_ENVELOPE_HEADROOM_BYTES`` is
+            held back here so a push sized into that window is refused
+            synchronously rather than accepted and then dropped at ingest.
+            A test packs both shapes and asserts the real drift stays inside
+            the headroom, so a future host-side field cannot reopen the window
+            unnoticed.
+
+            The check is deliberately skipped when the host is not validating
+            (MESSAGE_PLANE_VALIDATE_PAYLOAD_BYTES off): rejecting locally what
+            the host would happily accept would be the SDK inventing a limit of
+            its own, and this function exists precisely to agree with the host.
+            A pack failure is likewise not our verdict to make -- the host's
+            own ``payload_pack_error`` path owns it, and swallowing the
+            exception here keeps a msgpack quirk from turning into a push that
+            never even reaches the transport.
+
+            Returns the rejection dict to hand back to the caller, or ``None``
+            when the push may proceed.
+            """
+            carriers = _inline_binary_carriers(
+                canonical.get("parts"), legacy_binary_data
+            )
+            # Every payload is measured, not just the ones carrying inline
+            # bytes. This used to skip out when ``carriers`` was empty, to keep
+            # a second msgpack pack off the high-frequency text cue path -- but
+            # the host measures the WHOLE envelope, so an oversized text or
+            # metadata push was still dropped there as payload_too_big while
+            # push_message() had already answered submitted=True. That is the
+            # exact invisible non-delivery this guard exists to end, left open
+            # for the cheapest possible payload to walk through (CodeRabbit).
+            #
+            # The cost that justified the skip does not survive measurement:
+            # ormsgpack.packb on a typical text cue (248 B) is 0.19 us, and
+            # 50 us on a 200 KB one. Paying a fifth of a microsecond per cue to
+            # close a silent-loss hole is not a trade that needs thinking about.
+            if ormsgpack is None:
+                return None
+            from plugin.settings import (
+                MESSAGE_PLANE_PAYLOAD_MAX_BYTES,
+                MESSAGE_PLANE_VALIDATE_PAYLOAD_BYTES,
+            )
+
+            if not bool(MESSAGE_PLANE_VALIDATE_PAYLOAD_BYTES):
+                return None
             try:
-                from plugin.settings import MESSAGE_PLANE_ZMQ_INGEST_ENDPOINT
-                from plugin.settings import (
-                    PLUGIN_ZMQ_MESSAGE_PUSH_BATCH_SIZE,
-                    PLUGIN_ZMQ_MESSAGE_PUSH_FLUSH_INTERVAL_MS,
+                size = len(ormsgpack.packb(payload))
+            except Exception:
+                return None
+            # Subtract the bytes added by host normalization, as described above. Clamp to >=1 so
+            # setting the limit below this overhead does not make everything get rejected.
+            limit = max(
+                1,
+                int(MESSAGE_PLANE_PAYLOAD_MAX_BYTES) - _HOST_ENVELOPE_HEADROOM_BYTES,
+            )
+            if size <= limit:
+                return None
+            totals = _inline_carrier_totals(carriers)
+            labels = [label for label, _size in totals]
+            dominant = totals[0][0] if totals else ""
+            # How much of this overage can be explained by inline carriers? How much remains after removing all of them?
+            #
+            # Sorting only by totals would always blame the inline carrier, even when it is not the cause:
+            # 600 KiB of metadata plus a 1-byte image still makes "image" dominant,
+            # so the author would be told to use ctx.images.upload() — and the request would remain over the limit,
+            # because the image never used meaningful space. Bad advice is worse than none; it makes the author think
+            # the problem is already fixed.
+            carrier_bytes = sum(size_b for _label, size_b in totals)
+            non_inline = max(0, size - carrier_bytes)
+            if totals and non_inline > limit:
+                # Even after removing all inline data the request is still too large: text or metadata is the actual cause.
+                remedy = (
+                    "The inline payloads are not what blew this cap: even with "
+                    f"all of them removed the push is about {non_inline}B, still "
+                    f"over the {limit}B limit. The text parts or the metadata "
+                    "are what to shrink here; offloading the attachments alone "
+                    "will not get this push through."
                 )
-
-                endpoint = str(MESSAGE_PLANE_ZMQ_INGEST_ENDPOINT)
-                if endpoint:
-                    if bool(fast_mode):
-                        lock = getattr(self, "_push_lock", None)
-                        if lock is None:
-                            with _PUSH_LOCK_INIT:
-                                lock = getattr(self, "_push_lock", None)
-                                if lock is None:
-                                    new_lock = threading.Lock()
-                                    try:
-                                        object.__setattr__(self, "_push_lock", new_lock)
-                                    except Exception:
-                                        self._push_lock = new_lock
-                                    lock = new_lock
-
-                        # 双重检查锁定模式：先检查是否需要创建 batcher
-                        batcher = getattr(self, "_message_plane_push_batcher", None)
-                        need_create_batcher = batcher is None
-                        
-                        if need_create_batcher:
-                            # 在锁外创建 batcher（避免在锁内做 I/O）
-                            from plugin.utils.zeromq_ipc import MessagePlaneIngestBatcher
-                            from plugin.settings import (
-                                MESSAGE_PLANE_PUSH_BATCHER_ENQUEUE_TIMEOUT_SECONDS,
-                                MESSAGE_PLANE_PUSH_BATCHER_MAX_QUEUE,
-                                MESSAGE_PLANE_PUSH_BATCHER_REJECT_RATIO,
-                            )
-                            
-                            new_batcher = MessagePlaneIngestBatcher(
-                                from_plugin=self.plugin_id,
-                                endpoint=endpoint,
-                                batch_size=int(PLUGIN_ZMQ_MESSAGE_PUSH_BATCH_SIZE),
-                                flush_interval_ms=int(PLUGIN_ZMQ_MESSAGE_PUSH_FLUSH_INTERVAL_MS),
-                                max_queue=int(MESSAGE_PLANE_PUSH_BATCHER_MAX_QUEUE),
-                                reject_ratio=float(MESSAGE_PLANE_PUSH_BATCHER_REJECT_RATIO),
-                                enqueue_timeout_s=float(MESSAGE_PLANE_PUSH_BATCHER_ENQUEUE_TIMEOUT_SECONDS),
-                            )
-                            # 在锁外启动（可能涉及 ZMQ 连接）
-                            new_batcher.start()
-                            
-                            # 获取锁后再次检查并设置
-                            with lock:
-                                batcher = getattr(self, "_message_plane_push_batcher", None)
-                                if batcher is None:
-                                    batcher = new_batcher
-                                    try:
-                                        object.__setattr__(self, "_message_plane_push_batcher", batcher)
-                                    except Exception:
-                                        self._message_plane_push_batcher = batcher
-                                else:
-                                    # 另一个线程已经创建了，关闭我们创建的
-                                    try:
-                                        new_batcher.stop(timeout=2.0)
-                                    except Exception:
-                                        pass
-                        
-                        # 在锁内只做快速的内存操作
-                        with lock:
-                            # Fast path: use counter instead of UUID, use float timestamp instead of ISO
-                            msg_counter = getattr(self, "_msg_counter", None)
-                            if msg_counter is None:
-                                msg_counter = itertools.count(1)
-                                try:
-                                    object.__setattr__(self, "_msg_counter", msg_counter)
-                                except Exception:
-                                    self._msg_counter = msg_counter
-                            
-                            payload = _build_wire_payload(
-                                message_id=f"{self.plugin_id}:{next(msg_counter)}",
-                                ts=time.time(),
-                            )
-                            item = {"store": "messages", "topic": "all", "payload": payload}
-                            try:
-                                batcher.enqueue(item)
-                            except Exception:
-                                # [ISSUE4-DIAG] An important proactive cue
-                                # (ai_behavior!="read": respond completion /
-                                # keep-going self-prompt / alert) must never
-                                # vanish silently — log every such drop loudly.
-                                # High-freq "read" (screenshots/logs) stay on the
-                                # rate-limited aggregate below.
-                                try:
-                                    if canonical.get("ai_behavior") != "read":
-                                        self.logger.error(
-                                            "[PluginContext] message_plane DROP (fast batcher): plugin_id={} source={} ai_behavior={} priority={} — important cue lost to backpressure",
-                                            self.plugin_id, canonical.get("source"),
-                                            canonical.get("ai_behavior"), canonical.get("priority"),
-                                        )
-                                except Exception:
-                                    # This is a best-effort diagnostic on the hot
-                                    # backpressure path; a logging failure (rotation
-                                    # race, bad arg) must never propagate and turn a
-                                    # dropped-cue observation into a real crash.
-                                    pass
-                                # Backpressure: do not fall back to control-plane (it will amplify overload).
-                                try:
-                                    last_ts = float(getattr(self, "_mp_backpressure_last_ts", 0.0) or 0.0)
-                                except Exception:
-                                    last_ts = 0.0
-                                try:
-                                    cnt = int(getattr(self, "_mp_backpressure_count", 0) or 0) + 1
-                                except Exception:
-                                    cnt = 1
-                                try:
-                                    object.__setattr__(self, "_mp_backpressure_count", cnt)
-                                except Exception:
-                                    try:
-                                        self._mp_backpressure_count = cnt
-                                    except Exception:
-                                        pass
-                                now_ts = time.time()
-                                if now_ts - last_ts >= 1.0:
-                                    try:
-                                        object.__setattr__(self, "_mp_backpressure_last_ts", float(now_ts))
-                                        object.__setattr__(self, "_mp_backpressure_count", 0)
-                                    except Exception:
-                                        try:
-                                            self._mp_backpressure_last_ts = float(now_ts)
-                                            self._mp_backpressure_count = 0
-                                        except Exception:
-                                            pass
-                                    try:
-                                        self.logger.warning(
-                                            "[PluginContext] message_plane backpressure: rejected push_message.fast (x{})",
-                                            int(cnt),
-                                        )
-                                    except Exception:
-                                        pass
-                                return
-                            if PLUGIN_LOG_CTX_MESSAGE_PUSH:
-                                try:
-                                    self.logger.debug(
-                                        f"Plugin {self.plugin_id} pushed message (message_plane.fast): {source} - {description}"
-                                    )
-                                except Exception:
-                                    pass
-                            return
-
-                    tls = getattr(self, "_message_plane_ingest_tls", None)
-                    if tls is None:
-                        tls = threading.local()
-                        try:
-                            object.__setattr__(self, "_message_plane_ingest_tls", tls)
-                        except Exception:
-                            self._message_plane_ingest_tls = tls
-
-                    sock = getattr(tls, "sock", None)
-                    if sock is None:
-                        ctx = zmq.Context.instance()
-                        sock = ctx.socket(zmq.PUSH)
-                        try:
-                            sock.setsockopt(zmq.LINGER, 0)
-                            try:
-                                from plugin.settings import MESSAGE_PLANE_INGEST_SNDTIMEO_MS
-
-                                sock.setsockopt(zmq.SNDTIMEO, int(MESSAGE_PLANE_INGEST_SNDTIMEO_MS))
-                            except Exception:
-                                pass
-                        except Exception:
-                            pass
-                        sock.connect(endpoint)
-                        try:
-                            tls.sock = sock
-                        except Exception:
-                            pass
-
-                    payload = _build_wire_payload(
-                        message_id=str(uuid.uuid4()),
-                        ts=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            elif not totals:
+                # No inline carrier at all: the text parts or the metadata are
+                # what spent the budget. The base64 explanation below would be
+                # actively misleading here -- there is nothing base64-encoded to
+                # blame, the payload is simply that big -- so this branch gets
+                # its own wording and the log line drops the ratio arithmetic.
+                remedy = (
+                    "Nothing in this push travels inline, so the text parts or "
+                    "the metadata are what spent the budget: shorten them, or "
+                    "move the bulk into a file or a URL the host can fetch and "
+                    "reference it from a shorter message."
+                )
+            elif dominant == "image":
+                remedy = (
+                    "Send large images as a URL part instead: "
+                    "`part = await ctx.images.upload(data, mime=...)` returns a "
+                    "push-ready image part that does not travel inline."
+                )
+            else:
+                # There is no upload helper for audio/video today, so naming one
+                # would send the author after an API that is not there. Say what
+                # IS true: make the payload smaller, or host it and reference it.
+                remedy = (
+                    f"There is no upload helper for an inline {dominant} payload "
+                    "today, so the options are to shrink the payload itself "
+                    "(shorter clip, lower bitrate or resolution) or to host it "
+                    "and push the same part with `url=` instead of `data=`."
+                )
+                if "image" in labels:
+                    remedy += (
+                        " The image part in this push can also be offloaded with "
+                        "`part = await ctx.images.upload(data, mime=...)`."
                     )
-                    msg = {
-                        "v": 1,
-                        "kind": "delta_batch",
-                        "from": str(self.plugin_id),
-                        "ts": time.time(),
-                        "batch_id": str(uuid.uuid4()),
-                        "items": [
-                            {
-                                "store": "messages",
-                                "topic": "all",
-                                "payload": payload,
-                            }
-                        ],
-                    }
-
-                    # Blocking send: rely on ZMQ HWM for backpressure.
-                    if ormsgpack is None:
-                        raise RuntimeError("ormsgpack is required for message_plane push")
-                    sock.send(ormsgpack.packb(msg), flags=0)
-                    if PLUGIN_LOG_CTX_MESSAGE_PUSH:
-                        try:
-                            self.logger.debug(f"Plugin {self.plugin_id} pushed message (message_plane): {source} - {description}")
-                        except Exception:
-                            pass
-                    return
-            except Exception as e:
-                # Catch all ZMQ/Batcher errors to prevent plugin crash
-                # [ISSUE4-DIAG] Enrich so we can tell WHAT got dropped on
-                # backpressure. ai_behavior!="read" → an important proactive cue
-                # (respond completion / keep-going self-prompt / alert) was
-                # silently dropped — that's the "猫娘 goes silent" mechanism.
-                try:
-                    _beh = canonical.get("ai_behavior")
-                    _lvl = self.logger.error if _beh != "read" else self.logger.warning
-                    _lvl(
-                        "[PluginContext] message_plane DROP (slow PUSH): plugin_id={} source={} ai_behavior={} priority={} err={}: {}",
-                        self.plugin_id, canonical.get("source"), _beh,
-                        canonical.get("priority"), type(e).__name__, e,
+            try:
+                # The author needs four things to act: how far over they are,
+                # what the ceiling is, WHICH payload spent the budget, and why
+                # their "300 KiB screenshot" blew a 512 KiB cap. The last one is
+                # the non-obvious part -- inline bytes travel base64, 4/3 of the
+                # raw size -- and without it the arithmetic looks broken and the
+                # fix looks arbitrary. The per-carrier breakdown is what keeps
+                # the remedy honest when a push carries more than one inline
+                # part: the advice follows the payload that spent the budget.
+                if totals:
+                    self.logger.error(
+                        "[PluginContext] push_message rejected: reason=payload_too_large "
+                        "plugin_id={} size={}B limit={}B inline={}. Inline bytes travel "
+                        "base64-encoded in parts[].binary_base64, about {}x their raw "
+                        "size, so the effective raw-bytes ceiling for one inline payload "
+                        "is about {}B. {}",
+                        self.plugin_id,
+                        int(size),
+                        limit,
+                        " ".join(f"{label}={size_b}B" for label, size_b in totals),
+                        f"{_INLINE_BASE64_WIRE_RATIO:.2f}",
+                        int(limit / _INLINE_BASE64_WIRE_RATIO),
+                        remedy,
                     )
-                except Exception:
-                    pass
-                # Do not fall back to control-plane: it can amplify overload
-                return
+                else:
+                    # No base64 arithmetic here: quoting a ratio and an
+                    # "effective raw-bytes ceiling" for a push that carries no
+                    # inline bytes would send the author hunting for an
+                    # attachment that does not exist. The size and the limit are
+                    # the whole story.
+                    self.logger.error(
+                        "[PluginContext] push_message rejected: reason=payload_too_large "
+                        "plugin_id={} size={}B limit={}B inline=none. {}",
+                        self.plugin_id,
+                        int(size),
+                        limit,
+                        remedy,
+                    )
+            except Exception:
+                # Diagnostic only. A logging failure (rotation race, bad
+                # formatting arg) must not convert a clean local rejection into
+                # an exception the plugin author never asked for.
+                pass
+            return {
+                "ok": False,
+                "submitted": False,
+                "reason": "payload_too_large",
+            }
 
-        # message_plane 不可用时，尝试回退到 message_queue（如果可用）
+        # Plugin-originated messages cross the authenticated per-host uplink.
+        # The host binds plugin_id to that transport before any shared-state
+        # write, so plugin code cannot self-assert another plugin's identity by
+        # opening the public message-plane ingest socket directly.
         if self.message_queue is not None:
             try:
-                payload = _build_wire_payload(
+                use_fast_uplink = bool(fast_mode)
+                authenticated_payload = _build_wire_payload(
                     message_id=str(uuid.uuid4()),
-                    ts=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    ts=(
+                        time.time()
+                        if use_fast_uplink
+                        else datetime.now(timezone.utc).isoformat().replace(
+                            "+00:00",
+                            "Z",
+                        )
+                    ),
                 )
-                self.message_queue.put_nowait(payload)
-                if PLUGIN_LOG_CTX_MESSAGE_PUSH:
-                    try:
-                        self.logger.debug(f"Plugin {self.plugin_id} pushed message (fallback queue): {source} - {description}")
-                    except Exception:
-                        pass
-                return
+                # Before the send, so the rejection is authoritative rather
+                # than a report about a payload already on its way to be
+                # discarded. #2999 put this probe on all three exits that
+                # existed then; the authenticated uplink is now the only one,
+                # and the cap is a property of the payload rather than of the
+                # transport carrying it, so the one exit still gets it.
+                oversized = _reject_if_payload_too_large(authenticated_payload)
+                if oversized is not None:
+                    return oversized
+                fast_put = getattr(
+                    self.message_queue,
+                    "put_fast_nowait",
+                    None,
+                )
+                if use_fast_uplink and callable(fast_put):
+                    fast_put(authenticated_payload)
+                else:
+                    self.message_queue.put_nowait(authenticated_payload)
+                return {"submitted": True}
             except Exception as e:
                 try:
-                    self.logger.warning(f"[PluginContext] fallback message_queue push failed: {e}")
+                    self.logger.warning(
+                        "[PluginContext] authenticated message uplink failed ({})",
+                        type(e).__name__,
+                    )
                 except Exception:
                     pass
-        
-        # 所有方式都不可用时，记录警告而非抛错（避免插件崩溃）
+                return {
+                    "ok": False,
+                    "submitted": False,
+                    "reason": (
+                        "backpressure"
+                        if _is_submission_backpressure(e)
+                        else "transport_error"
+                    ),
+                }
+
         try:
             self.logger.error(
-                "[PluginContext] push_message failed: message_plane unavailable "
-                "(zmq={}, endpoint={}). Check MESSAGE_PLANE_ZMQ_INGEST_ENDPOINT config.",
-                zmq is not None,
-                bool(getattr(self, "_mp_endpoint_cached", None)),
+                "[PluginContext] push_message failed: authenticated message "
+                "uplink unavailable"
             )
         except Exception:
             pass
+        return {
+            "ok": False,
+            "submitted": False,
+            "reason": "transport_unavailable",
+        }
 
-    async def push_message_async(self, *args: Any, **kwargs: Any) -> None:
-        """异步版本的 push_message，使用 asyncio.to_thread 包装同步调用。
+    async def create_card(self, *, html: str, summary: str, css: str = "",
+                          actions: Optional[Dict[str, Any]] = None,
+                          target_lanlan: Optional[str] = None):
+        """Create a display-only HTML card; awaiting confirms local submission."""
+        from plugin.sdk.shared.core.cards import create_card
+        return await create_card(self, html=html, summary=summary, css=css,
+                                 actions=actions, target_lanlan=target_lanlan or self.current_lanlan)
 
-        Note: 底层 ZMQ socket 是同步的，此方法通过线程池实现非阻塞。新签名见
-        :meth:`push_message`。本方法仅做参数透传，不在此处做兼容翻译。
+    def get_card(self, card_id: str, *, target_lanlan: Optional[str] = None):
+        """Recover an online card handle from a UI action's _ctx."""
+        from plugin.sdk.shared.core.cards import ChatCard
+        return ChatCard(self, card_id, target_lanlan or self.current_lanlan)
+
+    async def create_view(self, *, title: str, html: str, css: str = "",
+                          actions: Optional[Dict[str, Any]] = None,
+                          summary: Optional[str] = None,
+                          target_lanlan: Optional[str] = None):
+        """Create online AgentHUD content; awaiting confirms local submission."""
+        from plugin.sdk.shared.core.cards import create_view
+        return await create_view(self, title=title, html=html, css=css,
+                                 actions=actions, summary=summary,
+                                 target_lanlan=target_lanlan or self.current_lanlan)
+
+    def get_view(self, view_id: str, *, target_lanlan: Optional[str] = None):
+        """Recover an AgentHUD view handle from a UI action's _ctx."""
+        from plugin.sdk.shared.core.cards import PluginView
+        return PluginView(self, view_id, target_lanlan or self.current_lanlan)
+
+    async def push_message_async(self, *args: Any, **kwargs: Any) -> "PushMessageResult":
+        """Async push_message wrapper, using asyncio.to_thread around the synchronous call.
+
+        Note: the underlying ZMQ socket is synchronous; this method uses a thread pool to avoid blocking. See the new signature in
+        :meth:`push_message`. This method only forwards parameters; it does not perform compatibility translation.
         """
-        await asyncio.to_thread(self.push_message, *args, **kwargs)
+        return await asyncio.to_thread(self.push_message, *args, **kwargs)
 
     def _send_request_and_wait(
         self,
@@ -1426,17 +1777,17 @@ class PluginContext:
         params: Dict[str, Any],
         timeout: float = 10.0
     ) -> Dict[str, Any]:
-        """同步版本:触发其他插件的自定义事件（插件间通信）
+        """Synchronous version: trigger a custom event in another plugin (inter-plugin communication)
         
         Args:
-            target_plugin_id: 目标插件ID
-            event_type: 自定义事件类型
-            event_id: 事件ID
-            params: 参数字典
-            timeout: 超时时间（秒）
+            target_plugin_id: Target plugin ID
+            event_type: Custom event type
+            event_id: Event ID
+            params: Parameter dictionary
+            timeout: Timeout in seconds
             
         Returns:
-            事件处理器的返回结果
+            Return value from the event handler
         """
         try:
             return self._send_request_and_wait(
@@ -1446,7 +1797,7 @@ class PluginContext:
                     "to_plugin": target_plugin_id,
                     "event_type": event_type,
                     "event_id": event_id,
-                    "args": params,  # 内部协议仍使用 args
+                    "args": params,  # The internal protocol still uses args
                 },
                 timeout=timeout,
                 wrap_result=False,
@@ -1474,7 +1825,7 @@ class PluginContext:
         params: Dict[str, Any],
         timeout: float = 10.0
     ) -> Dict[str, Any]:
-        """异步版本:触发其他插件的自定义事件（插件间通信）"""
+        """Asynchronous version: trigger a custom event in another plugin (inter-plugin communication)"""
         try:
             return await self._send_request_and_wait_async(
                 method_name="trigger_plugin_event",
@@ -1483,7 +1834,7 @@ class PluginContext:
                     "to_plugin": target_plugin_id,
                     "event_type": event_type,
                     "event_id": event_id,
-                    "args": params,  # 内部协议仍使用 args
+                    "args": params,  # The internal protocol still uses args
                 },
                 timeout=timeout,
                 wrap_result=False,
@@ -1511,10 +1862,10 @@ class PluginContext:
         params: Dict[str, Any],
         timeout: float = 10.0
     ):
-        """智能版本:自动检测执行环境,选择同步或异步执行方式
+        """Adaptive version: detect the execution environment and choose synchronous or asynchronous execution.
         
         Returns:
-            在事件循环中返回协程,否则返回结果字典
+            Return a coroutine in the event loop; otherwise return a result dictionary
         """
         if self._is_in_event_loop():
             return self.trigger_plugin_event_async(
@@ -1533,7 +1884,7 @@ class PluginContext:
         )
 
     def query_plugins_sync(self, filters: Optional[Dict[str, Any]] = None, timeout: float = 5.0) -> Dict[str, Any]:
-        """同步版本:查询插件列表"""
+        """Synchronous version: query plugin list"""
         try:
             return self._send_request_and_wait(
                 method_name="query_plugins",
@@ -1548,7 +1899,7 @@ class PluginContext:
             raise TimeoutError(f"Plugin query timed out after {timeout}s") from e
     
     async def query_plugins_async(self, filters: Optional[Dict[str, Any]] = None, timeout: float = 5.0) -> Dict[str, Any]:
-        """异步版本:查询插件列表"""
+        """Asynchronous version: query plugin list"""
         try:
             return await self._send_request_and_wait_async(
                 method_name="query_plugins",
@@ -1563,10 +1914,10 @@ class PluginContext:
             raise TimeoutError(f"Plugin query timed out after {timeout}s") from e
     
     def query_plugins(self, filters: Optional[Dict[str, Any]] = None, timeout: float = 5.0):
-        """智能版本:自动检测执行环境,选择同步或异步执行方式
+        """Adaptive version: detect the execution environment and choose synchronous or asynchronous execution.
         
         Returns:
-            在事件循环中返回协程,否则返回结果字典
+            Return a coroutine in the event loop; otherwise return a result dictionary
         """
         if self._is_in_event_loop():
             return self.query_plugins_async(filters=filters, timeout=timeout)
@@ -1585,7 +1936,8 @@ class PluginContext:
             service = ConfigQueryService()
             if payload_type == "config":
                 cached = getattr(self, "_effective_config", None)
-                if isinstance(cached, dict):
+                uncertain = getattr(self, "_effective_config_uncertain", False)
+                if isinstance(cached, dict) and not uncertain:
                     return {
                         "plugin_id": self.plugin_id,
                         "config": copy.deepcopy(cached),
@@ -1597,7 +1949,7 @@ class PluginContext:
                 )
                 config_obj = payload.get("config")
                 if isinstance(config_obj, dict):
-                    self._effective_config = copy.deepcopy(config_obj)
+                    self._set_effective_config_cache(config_obj)
                 return payload
             if payload_type == "base":
                 return await asyncio.wait_for(
@@ -1738,7 +2090,7 @@ class PluginContext:
         if isinstance(local_payload, dict):
             effective_obj = local_payload.get("config")
             if isinstance(effective_obj, dict) and profile_name is None:
-                self._effective_config = copy.deepcopy(effective_obj)
+                self._set_effective_config_cache(effective_obj)
             return local_payload
 
         try:
@@ -1767,7 +2119,7 @@ class PluginContext:
             raise TimeoutError(f"System config get timed out after {timeout}s") from e
 
     def query_memory_sync(self, lanlan_name: str, query: str, timeout: float = 5.0) -> Dict[str, Any]:
-        """同步版本:查询内存数据"""
+        """Synchronous version: query memory data"""
         try:
             return self._send_request_and_wait(
                 method_name="query_memory",
@@ -1784,7 +2136,7 @@ class PluginContext:
             raise TimeoutError(f"Memory query timed out after {timeout}s") from e
     
     async def query_memory_async(self, lanlan_name: str, query: str, timeout: float = 5.0) -> Dict[str, Any]:
-        """异步版本:查询内存数据"""
+        """Asynchronous version: query memory data"""
         try:
             return await self._send_request_and_wait_async(
                 method_name="query_memory",
@@ -1801,10 +2153,10 @@ class PluginContext:
             raise TimeoutError(f"Memory query timed out after {timeout}s") from e
     
     def query_memory(self, lanlan_name: str, query: str, timeout: float = 5.0):
-        """智能版本:自动检测执行环境,选择同步或异步执行方式
+        """Adaptive version: detect the execution environment and choose synchronous or asynchronous execution.
         
         Returns:
-            在事件循环中返回协程,否则返回结果字典
+            Return a coroutine in the event loop; otherwise return a result dictionary
         """
         if self._is_in_event_loop():
             return self.query_memory_async(lanlan_name=lanlan_name, query=query, timeout=timeout)
@@ -1813,6 +2165,17 @@ class PluginContext:
     async def update_own_config(self, updates: Dict[str, Any], timeout: float = 10.0) -> Dict[str, Any]:
         if not isinstance(updates, dict):
             raise TypeError("updates must be a dict")
+        old_effective_config = copy.deepcopy(getattr(self, "_effective_config", None))
+        old_effective_config_uncertain = getattr(
+            self,
+            "_effective_config_uncertain",
+            False,
+        )
+        optimistic_config = self._merge_config_copy(old_effective_config, updates)
+        self._set_effective_config_cache(optimistic_config)
+        # Keep config writes from blocking plugin actions; timeouts fall back to the optimistic in-memory config.
+        request_timeout = min(float(timeout), 4.5)
+        request_deadline = time.monotonic() + request_timeout
         try:
             payload = await self._send_request_and_wait_async(
                 method_name="update_own_config",
@@ -1820,13 +2183,89 @@ class PluginContext:
                 request_data={
                     "plugin_id": self.plugin_id,
                     "updates": updates,
+                    "_request_deadline_monotonic": request_deadline,
                 },
-                timeout=timeout,
+                timeout=request_timeout,
                 wrap_result=True,
                 error_log_template=None,
             )
             config_obj = payload.get("config") if isinstance(payload, dict) else None
-            self._effective_config = copy.deepcopy(config_obj) if isinstance(config_obj, dict) else None
+            if isinstance(config_obj, dict):
+                if payload.get("persisted") is False:
+                    self._set_effective_config_cache(optimistic_config)
+                    payload = dict(payload)
+                    payload["config"] = copy.deepcopy(optimistic_config)
+                else:
+                    self._set_effective_config_cache(config_obj)
             return payload
-        except TimeoutError as e:
-            raise TimeoutError(f"Plugin config update timed out after {timeout}s") from e
+        except TimeoutError:
+            self._effective_config_uncertain = True
+            return {
+                "success": False,
+                "plugin_id": self.plugin_id,
+                "config": copy.deepcopy(optimistic_config),
+                "requires_reload": False,
+                "persisted": None,
+                "message": "Config persistence response timed out; final persistence status is unknown",
+            }
+        except asyncio.CancelledError:
+            # The request may already have crossed the atomic commit point.
+            # Keep the optimistic view instead of restoring a known-stale one.
+            self._effective_config_uncertain = True
+            raise
+        except Exception:
+            if isinstance(old_effective_config, dict):
+                self._set_effective_config_cache(old_effective_config)
+            else:
+                self._effective_config = None
+                self._refresh_instance_runtime_config({})
+            self._effective_config_uncertain = old_effective_config_uncertain
+            raise
+
+    async def replace_own_config(self, config: Dict[str, Any], timeout: float = 10.0) -> Dict[str, Any]:
+        if not isinstance(config, dict):
+            raise TypeError("config must be a dict")
+        old_effective_config = copy.deepcopy(getattr(self, "_effective_config", None))
+        old_effective_config_uncertain = getattr(
+            self,
+            "_effective_config_uncertain",
+            False,
+        )
+        optimistic_config = copy.deepcopy(config)
+        self._set_effective_config_cache(optimistic_config)
+        request_timeout = float(timeout)
+        request_deadline = time.monotonic() + request_timeout
+        try:
+            payload = await self._send_request_and_wait_async(
+                method_name="replace_own_config",
+                request_type="PLUGIN_CONFIG_REPLACE",
+                request_data={
+                    "plugin_id": self.plugin_id,
+                    "config": config,
+                    "_request_deadline_monotonic": request_deadline,
+                },
+                timeout=request_timeout,
+                wrap_result=True,
+                error_log_template=None,
+            )
+            config_obj = payload.get("config") if isinstance(payload, dict) else None
+            if isinstance(config_obj, dict):
+                self._set_effective_config_cache(config_obj)
+            return payload
+        except TimeoutError:
+            # No response does not prove that the atomic replace lost its
+            # deadline race.  Keep the requested view; the next successful
+            # config read will replace it with the persisted effective config.
+            self._effective_config_uncertain = True
+            raise
+        except asyncio.CancelledError:
+            self._effective_config_uncertain = True
+            raise
+        except Exception:
+            if isinstance(old_effective_config, dict):
+                self._set_effective_config_cache(old_effective_config)
+            else:
+                self._effective_config = None
+                self._refresh_instance_runtime_config({})
+            self._effective_config_uncertain = old_effective_config_uncertain
+            raise

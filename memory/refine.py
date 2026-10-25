@@ -1,21 +1,41 @@
 # -*- coding: utf-8 -*-
-"""MemoryRefineEngine — cosine cluster + LLM 决议四件套 refine engine。
+# Copyright 2025-2026 Project N.E.K.O. Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
-Phase A-3 of memory enhancements. Drives PERSONA_REFINE and
-REFLECTION_REFINE crons. cluster 内成员同 entity（engine 层强制切片），
-reflection refine 的 cluster 可混入 absorbed fact 作为只读信息源
-（fact 不可被 split/discard/modify，代码层兜底）。
+"""MemoryRefineEngine — cosine clustering + LLM four-action refine engine.
 
-Pipeline 每 pass:
-  1. 采集候选 entries（按 type/entity 切片）
-  2. 同 entity 池内 cosine 邻接 → connected component（双 cap：阈值 +
-     topk-per-entry；溢出 cluster 按 cosine 强度截到 CLUSTER_SIZE_MAX）
-  3. cluster_hash skip（hash 全员命中 + 未超 REVISIT_AFTER_DAYS → 跳过）
-  4. 饥饿度排序（cluster 内 min(last_refine_at)，None 视为 ''）
-  5. 取前 CLUSTERS_PER_PASS 个 cluster 调 LLM
-  6. action 应用委托给 manager（manager 内 lock + apply + stamp + save）
+Phase A-3 of memory enhancements. Drives the PERSONA_REFINE and
+REFLECTION_REFINE crons. Cluster members share the same entity (sliced at the
+engine layer); reflection-refine clusters may mix in absorbed facts as
+read-only information sources (facts cannot be split/discarded/modified —
+enforced in code).
 
-Embedding 不可用 / 候选不足 → 整 pass no-op，不报错。
+Pipeline per pass:
+  1. Gather candidate entries (sliced by type/entity)
+  2. Cosine adjacency within the same-entity pool → connected components
+     (double cap: threshold + topk-per-entry; overflowing clusters truncated
+     to CLUSTER_SIZE_MAX by cosine strength)
+  3. cluster_hash skip (every member hits the hash + not past
+     REVISIT_AFTER_DAYS → skip)
+  4. Starvation ordering (min(last_refine_at) within the cluster, None
+     treated as '')
+  5. Take the first CLUSTERS_PER_PASS clusters and call the LLM
+  6. Action application is delegated to the manager (lock + apply + stamp +
+     save inside the manager)
+
+Embedding unavailable / not enough candidates → the whole pass is a no-op,
+no error.
 """
 from __future__ import annotations
 
@@ -64,8 +84,20 @@ logger = get_module_logger(__name__, "Memory")
 REFINE_TYPE_KEY = '_refine_type'      # 'persona' | 'reflection' | 'fact'
 REFINE_ENTITY_KEY = '_refine_entity'  # 'master' | 'neko' | 'relationship'
 
-# 四件套合法 action set；apply 层用这个集合 reject 越界 action。
+# Valid four-action set; apply rejects actions outside this set.
 VALID_REFINE_ACTIONS = frozenset({'split', 'merge', 'modify', 'discard'})
+
+
+def _detect_refine_prompt_language(text: str) -> str:
+    from utils.language_utils import (
+        detect_prompt_language_with_ascii_fallback,
+        get_global_language_full,
+    )
+
+    return detect_prompt_language_with_ascii_fallback(
+        text,
+        ui_language=get_global_language_full(),
+    )
 
 
 # ── Annotation helpers (manager-side use) ─────────────────────────────
@@ -103,13 +135,13 @@ ApplyFn = Callable[[list[dict], list[dict], str], Awaitable[set[str]]]
 
 # Manager-supplied failure callback signature.
 # Args: cluster (annotated entries), cluster_hash.
-# Triggered when ``_resolve_cluster`` returns False（LLM 输出空 / parse 失败 /
-# 非 list）**或**抛异常（LLM 超时 / apply_fn 持久化异常等）。先前只在 False
-# 时调、异常按 transient 不计（Codex P1 round-3 on PR #1412），但持续性故障
-# （模型快照下线一直超时）那样会变成每 30min 无限重打；现在异常也计入预算。
+# Trigger when _resolve_cluster returns False (empty LLM output / parse failure /
+# non-list) or raises (LLM timeout / apply_fn persistence error, etc.). Previously only False
+# counted, with exceptions treated as transient (Codex P1, round 3 on PR #1412). Persistent failures
+# such as retired model snapshots timing out would retry every 30 minutes forever; exceptions now consume budget too.
 # Manager bumps ``refine_attempts`` on each non-fact cluster member (and
 # saves persona/reflection file), so the next refine pass can filter
-# out entries that have repeatedly failed (Site 4 liveness 兜底)。
+# out entries that repeatedly fail (Site 4 liveness fallback).
 FailureFn = Callable[[list[dict], str], Awaitable[None]]
 
 
@@ -117,6 +149,15 @@ class MemoryRefineEngine:
     """Stateless apart from the embedding service handle and config
     manager. Construct once per refine cron and call refine_persona_pass
     / refine_reflection_pass per character per pass."""
+
+    @staticmethod
+    def _cluster_locale_text(cluster: list[dict]) -> str:
+        """Return mutable member text without IDs or read-only fact context."""
+        return "\n".join(
+            str(entry.get('text') or '')
+            for entry in cluster
+            if entry.get(REFINE_TYPE_KEY) != 'fact'
+        )
 
     def __init__(self, config_manager):
         self._cm = config_manager
@@ -131,28 +172,37 @@ class MemoryRefineEngine:
         apply_fn: ApplyFn,
         scope_label: str,  # for logging: "persona/character" etc.
         failure_fn: FailureFn | None = None,
+        max_clusters: int | None = None,
     ) -> dict:
-        """通用 pass：候选已按 entity 切片（每条带 annotate_entry 的标签），
-        engine 跑 cluster + hash skip + ranking + LLM + apply。
+        """Generic pass: candidates are already sliced by entity (each tagged via
+        annotate_entry); the engine runs cluster + hash skip + ranking + LLM +
+        apply.
 
         Returns: {'clusters_seen', 'clusters_skipped', 'clusters_resolved',
                   'clusters_failed'}.
 
-        Embedding 不可用 → 返回零计数，no-op。
+        Embedding unavailable → returns zero counts, no-op.
 
-        ``failure_fn``: 可选回调，在 ``_resolve_cluster`` 返 False（LLM 输出
-        空 / parse 失败 / 非 list）**或** 抛异常（LLM 超时 / apply_fn 持久化
-        失败等）时都调用，传入 ``(cluster, cluster_hash)``。Manager 在回调里
-        bump ``refine_attempts``，达 N 次后下次候选 gather 把成员过滤掉。
+        ``failure_fn``: optional callback, invoked both when ``_resolve_cluster``
+        returns False (empty LLM output / parse failure / non-list) **and** when
+        it raises (LLM timeout / apply_fn persistence failure, etc.), receiving
+        ``(cluster, cluster_hash)``. The manager bumps ``refine_attempts`` in
+        the callback; after N attempts the members get filtered out of the next
+        candidate gather.
 
-        为什么异常路径也计数（修正先前 Codex P1 round-3 on PR #1412 的设计）：
-        原本把异常按"瞬态、不计数"处理，怕单次网络/IO 抖动冤枉具体 entry。
-        但当"瞬态"其实是**持续性**的——correction 模型快照下线一直超时、
-        cloudsave 卡维护态、FS 只读——这条不计数路径就变成无限重试风暴，
-        每 30min 把同一个毒 cluster 原样重打 LLM 永不放弃。N=
-        ``MEMORY_LIVENESS_MAX_ATTEMPTS`` 的预算足够跨过偶发抖动（要连续
-        失败才 dead-letter），且 cluster 内容一变 hash 就变、attempts 随
-        新成员天然复位，所以持续故障收敛、偶发抖动无损。
+        Why exceptions also count (correcting the earlier design from Codex P1
+        round-3 on PR #1412): exceptions used to be treated as "transient,
+        don't count", to avoid blaming specific entries for one-off network/IO
+        hiccups. But when the "transient" issue is actually **persistent** —
+        the correction model snapshot is offline and keeps timing out,
+        cloudsave stuck in maintenance, a read-only FS — that uncounted path
+        becomes an infinite retry storm, slamming the same poison cluster into
+        the LLM every 30min forever. A budget of
+        N=``MEMORY_LIVENESS_MAX_ATTEMPTS`` is enough to ride out occasional
+        hiccups (dead-letter requires consecutive failures), and once the
+        cluster content changes the hash changes and attempts naturally reset
+        with new members — so persistent faults converge and occasional jitter
+        is harmless.
         """
         zero = {
             'clusters_seen': 0,
@@ -195,14 +245,19 @@ class MemoryRefineEngine:
         # Starvation-first ordering (smallest last_refine_at first).
         active.sort(key=lambda t: self._cluster_starvation_key(t[1]))
 
-        to_process = active[:MEMORY_REFINE_CLUSTERS_PER_PASS]
+        cluster_budget = (
+            MEMORY_REFINE_CLUSTERS_PER_PASS
+            if max_clusters is None
+            else max(0, min(max_clusters, MEMORY_REFINE_CLUSTERS_PER_PASS))
+        )
+        to_process = active[:cluster_budget]
         resolved = 0
         failed = 0
         for entity, cluster, cluster_hash in to_process:
-            # _resolve_cluster 返 False（LLM 输出空 / parse 失败 / 非 list）
-            # 或抛异常（LLM 超时 / apply_fn 持久化失败）都 bump refine_attempts。
-            # 持续性故障必须计入预算才能 dead-letter（见函数 docstring）；偶发
-            # 抖动靠 N 次预算 + cluster 内容变即复位兜住，不会冤枉。
+            # Both _resolve_cluster returning False (empty LLM output / parse failure / non-list)
+            # and raising (LLM timeout / apply_fn persistence failure) increment refine_attempts.
+            # Persistent failures must consume budget for dead-lettering (see docstring); occasional
+            # failures are protected by N attempts plus reset on cluster-content changes.
             cluster_failed = False
             try:
                 ok = await self._resolve_cluster(
@@ -223,7 +278,7 @@ class MemoryRefineEngine:
             if cluster_failed and failure_fn is not None:
                 try:
                     await failure_fn(cluster, cluster_hash)
-                except Exception as fe:  # noqa: BLE001 — failure_fn 是兜底，自己再失败也不该挂主路径
+                except Exception as fe:  # noqa: BLE001 - failure_fn is a fallback; its own failure must not break the main path.
                     logger.warning(
                         f"[Refine] {scope_label} cluster {cluster_hash} "
                         f"failure_fn 异常: {fe}"
@@ -397,34 +452,29 @@ class MemoryRefineEngine:
             return False
 
         from config.prompts.prompts_memory import get_memory_refine_prompt
-        from utils.language_utils import get_global_language
-        from utils.llm_client import create_chat_llm
+        from memory.thinking_llm import ainvoke_thinking
 
-        template = get_memory_refine_prompt(get_global_language())
+        template = get_memory_refine_prompt(
+            _detect_refine_prompt_language(self._cluster_locale_text(cluster))
+        )
         prompt = (
             template
             .replace('{ENTITY}', entity)
             .replace('{CLUSTER}', cluster_text)
         )
 
-        # refine 跟 persona correction 同性质：后果不可逆（split/merge/
-        # modify/discard 直接改 persona/reflection 写盘），值得用 correction
-        # tier + thinking + 长 timeout。对齐 PersonaManager.resolve_corrections
-        # 的调用配置。
+        # Refinement resembles persona correction: irreversible split/merge/modify/discard operations
+        # directly persist persona/reflection changes, warranting the correction tier,
+        # thinking, and a long timeout. Match PersonaManager.resolve_corrections
+        # call configuration.
         set_call_type("memory_refine")
-        api_config = self._cm.get_model_api_config('correction')
-        llm = create_chat_llm(
-            api_config['model'],
-            api_config['base_url'],
-            api_config['api_key'],
+        api_config = await self._cm.aget_model_api_config('correction')
+        # Enable thinking explicitly, as for correction; see memory.thinking_llm for budgets and fallback.
+        resp, _ = await ainvoke_thinking(  # noqa: LLM_INPUT_BUDGET  # prompt assembled from token-capped memory components (refine clusters bounded upstream).
+            api_config, prompt,
             timeout=MEMORY_LLM_HARD_TIMEOUT_SECONDS,
-            max_retries=0,
-            extra_body=None,  # 显式开 thinking（同 correction）
+            call_label=f"memory_refine cluster_hash={cluster_hash}",
         )
-        try:
-            resp = await llm.ainvoke(prompt)
-        finally:
-            await llm.aclose()
 
         raw = (resp.content or "").strip()
         if raw.startswith("```"):

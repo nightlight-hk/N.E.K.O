@@ -1,21 +1,20 @@
 """Unit tests for _build_callback_instruction's (origin × passive) routing.
 
-The host derives ``origin`` from upstream ``event_type``:
+The host derives ``origin`` from upstream ``event_type`` plus the validated
+user-plugin result-kind contract:
 - ``event_type == "task_result"`` (agent_server._emit_task_result):
-  real task completion → ``origin="task_result"`` → TASK_* templates
-  ("任务已完成，请汇报" semantics).
+  real task completion → ``origin="task_result"`` → TASK_* reporting templates.
 - ``event_type == "proactive_message"`` (proactive_bridge from
-  plugin push_message): event stream → ``origin="event"`` → EVENT_*
-  templates ("新消息，请回应" semantics; **no** "任务"/"汇报" wording).
+  plugin push_message): event stream → ``origin="event"`` → neutral EVENT_*
+  response templates without task-completion wording.
 
-Plugin authors cannot influence ``origin``; it is a structural fact of
-which SDK method they called (``finish()`` vs ``push_message()``) and
-which host path the event flowed through.
+Plugin authors cannot set ``origin`` directly. A successful user-plugin entry
+may only downgrade its task result to neutral event wording.
 
 These tests pin both the active/passive split and the cross-axis
 guarantees:
-- TASK ACTIVE renders status_phrase + action_phrase ("已完成 / 汇报").
-- EVENT ACTIVE renders neutral wording with no "任务"/"汇报".
+- TASK ACTIVE renders status and reporting phrases.
+- EVENT ACTIVE renders neutral wording without task-reporting phrases.
 - Missing origin silently falls back to "event" (pre-migration compat).
 - Explicitly unknown origin values fall back to "event" + warn (signals
   a typo or a producer using an unsupported value, worth surfacing).
@@ -28,6 +27,37 @@ wrappers, so the origin routing must be re-asserted there.
 from __future__ import annotations
 
 import logging
+
+from tests.fake_clock import patch_module_clock
+
+
+def test_host_only_downgrades_successful_user_plugin_task_results():
+    from app.main_server.character_runtime import _resolve_callback_origin
+
+    event = {"success": True, "result_kind": "event"}
+    assert _resolve_callback_origin("task_result", event, "user_plugin") == "event"
+    assert _resolve_callback_origin("task_result", event, "computer_use") == "task_result"
+    assert _resolve_callback_origin(
+        "task_result", {"success": False, "result_kind": "event"}, "user_plugin"
+    ) == "task_result"
+    assert _resolve_callback_origin(
+        "proactive_message", {"result_kind": "task_result"}, "plugin:demo"
+    ) == "event"
+
+
+def test_host_stamps_expiry_only_for_neutral_events(monkeypatch):
+    from app.main_server import character_runtime
+
+    patch_module_clock(monkeypatch, character_runtime, monotonic=lambda: 100.0)
+    assert character_runtime._resolve_callback_expiry(
+        {"expires_in_s": 12}, "event"
+    ) == 112.0
+    assert character_runtime._resolve_callback_expiry(
+        {"expires_in_s": 12}, "task_result"
+    ) is None
+    assert character_runtime._resolve_callback_expiry(
+        {"expires_in_s": float("inf")}, "event"
+    ) is None
 
 
 def _build(callbacks, *, passive: bool = False):
@@ -61,13 +91,33 @@ def test_task_active_renders_task_report_wrapper():
             }
         ],
     )
-    # Task wrapper requires "任务" + "汇报" (and status_phrase "已完成").
+    # Task wrapper requires "任务" ('task') + "汇报" ('report'), and status_phrase "已完成" ('completed').
     assert "任务" in out
     assert "已完成" in out
     assert "汇报" in out
     assert "番茄钟到点了" in out
     # Event wrapper marker MUST NOT appear.
     assert "新消息" not in out
+
+
+def test_topic_hook_source_uses_neutral_descriptor():
+    out = _build(
+        [
+            {
+                "origin": "event",
+                "status": "completed",
+                "source_kind": "topic",
+                "source_name": "deep_topic_hook",
+                "summary": "聊聊最近想听的城市流行",
+                "detail": "请只生成一句自然开场",
+                "delivery_mode": "proactive",
+            }
+        ],
+    )
+
+    assert "话题提示" in out
+    assert "deep_topic_hook" not in out
+    assert "聊聊最近想听的城市流行" in out
 
 
 def test_task_passive_renders_neutral_task_result_wrapper():
@@ -84,7 +134,7 @@ def test_task_passive_renders_neutral_task_result_wrapper():
             }
         ],
     )
-    # Passive task wrapper says "任务结果" — neutral, no "汇报" verb.
+    # Passive task wrapper says "任务结果" ('task result') — neutral, no "汇报" ('report') verb.
     assert "任务结果" in out
     assert "汇报" not in out
     assert "找到 5 条结果" in out
@@ -92,10 +142,10 @@ def test_task_passive_renders_neutral_task_result_wrapper():
 
 def test_event_active_omits_task_and_report_wording():
     """The bilidanmu fix anchor: a plugin push_message → origin=event →
-    EVENT_ACTIVE wrapper. Must NOT include "任务" or "汇报" — those
-    framings caused 兰兰 to narrate "我刚才处理了一下弹幕" instead of
+    EVENT_ACTIVE wrapper. Must NOT include \"任务\" or \"汇报\" ('task'/'report') — those
+    framings caused Lanlan to narrate \"我刚才处理了一下弹幕\" ('I just handled danmaku') instead of
     actually reacting to the danmaku content.
-    """
+    """  # noqa: DOCSTRING_CJK
     out = _build(
         [
             {
@@ -149,7 +199,7 @@ def test_missing_origin_falls_back_to_event_silently():
     """If a callback arrives without origin (older callsite / test stub /
     pre-migration code), we default to the EVENT template — never the TASK
     one. Rationale: we'd rather have the AI react naturally than fabricate
-    "我做完了一个任务" for an event that wasn't actually a task.
+    \"我做完了一个任务\" ('I completed a task') for an event that wasn't actually a task.
 
     Missing-key path stays **silent** (no warning) because it's the
     legitimate pre-migration fallback. An explicit but unknown value, by
@@ -159,7 +209,7 @@ def test_missing_origin_falls_back_to_event_silently():
     no-warning invariant. Without the second assertion a future drift that
     started warning on missing-key (turning every legacy callsite noisy)
     would silently slip in.
-    """
+    """  # noqa: DOCSTRING_CJK
     from main_logic.core import _build_callback_instruction  # noqa: F401
 
     records: list[logging.LogRecord] = []
@@ -316,7 +366,7 @@ def test_passive_drain_path_forces_passive_for_all_origins():
         ],
         passive=True,
     )
-    # No "请...汇报"/"请...回应" verbs in passive mode.
+    # No "请...汇报"/"请...回应" ('please report/respond') verbs in passive mode.
     assert "汇报" not in out
     assert "回应" not in out
     # But each origin still picks its own passive wrapper.
@@ -332,7 +382,7 @@ def test_passive_drain_path_forces_passive_for_all_origins():
 # — they sit in ``pending_extra_replies`` until the next session hot-swap, then
 # get rendered into ``prime_context`` via ``_render_pending_extra_replies_by_origin``.
 # This is a SECOND rendering path that has to honor the same origin distinction;
-# otherwise event-stream pushes get the "汇报先前执行的任务的结果" framing.
+# otherwise event-stream pushes get the "汇报先前执行的任务的结果" ('report earlier task results') framing.
 
 
 def _render_swap(entries):
@@ -373,10 +423,10 @@ def test_voice_swap_event_entries_use_event_wrapper():
             _voice_entry("event", summary="🎁 观众B 送了 1个 小心心", source_name="bilibili_danmaku"),
         ]
     )
-    # Event wrapper: "请...根据下方新消息回应..."
+    # Event wrapper: "请...根据下方新消息回应..." ('please respond based on new messages below')
     assert "新消息" in out
     assert "回应" in out
-    # Critical: NO "汇报先前执行的任务" framing.
+    # Critical: NO "汇报先前执行的任务" ('report earlier tasks') framing.
     assert "汇报" not in out
     assert "先前执行的任务" not in out
     # Content carried.
@@ -385,9 +435,9 @@ def test_voice_swap_event_entries_use_event_wrapper():
 
 
 def test_voice_swap_task_entries_use_task_wrapper():
-    """Real task completions (e.g. finish(delivery="proactive") from
-    pomodoro / sts2) keep the "汇报" framing — this is the pre-existing
-    behavior the refactor must preserve."""
+    """Real task completions (e.g. finish(delivery=\"proactive\") from
+    pomodoro / sts2) keep the \"汇报\" ('report') framing — this is the pre-existing
+    behavior the refactor must preserve."""  # noqa: DOCSTRING_CJK
     out = _render_swap(
         [
             _voice_entry("task_result", summary="番茄钟到点了", source_name="pomodoro"),
@@ -472,9 +522,9 @@ def test_voice_swap_whitespace_summary_does_not_shadow_detail():
 def test_voice_swap_legacy_string_entries_treated_as_event():
     """Defensive: if any old code path enqueues a plain string (pre-
     migration shape), treat it as event — the safer fallback, since
-    fabricating "我刚才执行了任务" for what may actually be a push event
+    fabricating \"我刚才执行了任务\" ('I just executed a task') for what may actually be a push event
     is exactly the bug this PR fixes.
-    """
+    """  # noqa: DOCSTRING_CJK
     out = _render_swap(["遗留字符串条目"])
     assert "新消息" in out
     assert "汇报" not in out

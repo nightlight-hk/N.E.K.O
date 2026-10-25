@@ -25,7 +25,9 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from main_routers import system_router as system_router_module
+from main_routers.system_router import activity_signal as system_router_module
+from main_routers.system_router import _shared as system_router_shared
+from tests.fake_clock import patch_module_clock
 
 
 ACTIVITY_SIGNAL_ENDPOINT = "/api/activity_signal"
@@ -69,7 +71,7 @@ def _fixed_csrf_token(monkeypatch):
     ``test_system_screenshot_router.py`` uses.
     """
     monkeypatch.setattr(
-        system_router_module, "AUTOSTART_CSRF_TOKEN", "test-csrf-token",
+        system_router_shared, "AUTOSTART_CSRF_TOKEN", "test-csrf-token",
     )
     yield
 
@@ -732,9 +734,12 @@ def test_push_accepted_after_interval_elapses(monkeypatch):
     client = _build_client(monkeypatch, {"Aria": mgr})
 
     # Freeze time at t=1000 for the first push, then t=1006 for the second.
+    # The throttle window is computed inside ``activity_signal`` itself
+    # (``now = time.time()`` right above the ``_ACTIVITY_SIGNAL_THROTTLE``
+    # lookup), so the fake clock belongs on that module.
     fake_now = [1000.0]
-    monkeypatch.setattr(
-        system_router_module.time, "time", lambda: fake_now[0],
+    patch_module_clock(
+        monkeypatch, system_router_module, time=lambda: fake_now[0],
     )
 
     resp1 = client.post(ACTIVITY_SIGNAL_ENDPOINT, json={"lanlan_name": "Aria", "idle_seconds": 0})

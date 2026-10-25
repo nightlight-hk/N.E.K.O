@@ -44,9 +44,22 @@ def _bootstrap_page(mock_page: Page) -> None:
                 isTutorialRunning: true,
                 currentPage: 'home',
             };
-            window.__tutorialPromptState = 'completed';
-            window.__tutorialPromptStatePayload = null;
-            window.__tutorialPromptFetchFailuresRemaining = 0;
+            window.__day1Settled = true;
+            window.NekoSevenDayTutorialState = {
+                ready: async function() {},
+                loadState: function() {
+                    return {
+                        completedRounds: window.__day1Settled ? [1] : [],
+                        skippedRounds: [],
+                    };
+                },
+                isRoundSettled: function(state, round) {
+                    return Number(round) === 1 && window.__day1Settled === true;
+                },
+                getNextAutoRound: function() {
+                    return window.__day1Settled ? null : 1;
+                },
+            };
             window.__personaOnboardingState = {
                 status: 'pending',
                 manual_reselect_character_name: '',
@@ -101,15 +114,15 @@ def _bootstrap_page(mock_page: Page) -> None:
                     return new Response(JSON.stringify({
                         success: true,
                         presets: [{
-                            preset_id: 'classic_genki',
-                            display_name: '经典元气猫娘',
-                            summary_fallback: '元气满满',
-                            preview_line: '太棒了喵！',
+                            preset_id: 'frail_younger_sister',
+                            display_name: '病弱妹妹',
+                            summary_fallback: '会主动请你留下，又怕自己的依赖成为负担',
+                            preview_line: '你先别走嘛……再陪我待一会儿，好不好？我会很安静的。',
                             profile: {
-                                '性格原型': '经典元气猫娘',
-                                '口癖': '太棒了喵！ / 喵呜~',
-                                '爱好': '陪伴 / 温暖',
-                                '雷点': '冷漠敷衍 / 否定感受',
+                                '性格原型': '病弱妹妹',
+                                '口癖': '短句轻声 / 偶尔停顿',
+                                '爱好': '热饮 / 毛毯',
+                                '雷点': '大声催促 / 逼迫逞强',
                             },
                         }],
                     }), {
@@ -117,26 +130,6 @@ def _bootstrap_page(mock_page: Page) -> None:
                             headers: { 'Content-Type': 'application/json' },
                         });
                     }
-
-                if (requestUrl === '/api/tutorial-prompt/state') {
-                    if (window.__tutorialPromptFetchFailuresRemaining > 0) {
-                        window.__tutorialPromptFetchFailuresRemaining -= 1;
-                        throw new Error('tutorial prompt unavailable');
-                    }
-                    const payload = window.__tutorialPromptStatePayload;
-                    return new Response(JSON.stringify({
-                        success: true,
-                        state: {
-                            status: (payload && payload.status) || window.__tutorialPromptState || 'completed',
-                            deferred_until: (payload && payload.deferred_until) || 0,
-                            never_remind: !!(payload && payload.never_remind),
-                            user_cohort: (payload && payload.user_cohort) || 'unknown',
-                        },
-                    }), {
-                        status: 200,
-                        headers: { 'Content-Type': 'application/json' },
-                    });
-                }
 
                 if (requestUrl === '/api/characters/persona-reselect-current') {
                     if (method === 'DELETE') {
@@ -182,8 +175,6 @@ def _bootstrap_page(mock_page: Page) -> None:
         }
         """
     )
-
-
 def _has_playwright_browser() -> bool:
     try:
         from playwright.sync_api import sync_playwright
@@ -383,13 +374,13 @@ def test_onboarding_wait_for_tutorial_completion_resolves_on_destroy_terminal_ev
 
 
 @pytest.mark.frontend
-def test_onboarding_waits_for_tutorial_prompt_settlement_before_showing(mock_page: Page):
+def test_onboarding_waits_for_day1_settlement_before_showing(mock_page: Page):
     _bootstrap_page(mock_page)
     mock_page.evaluate(
         """
         () => {
             window.universalTutorialManager.isTutorialRunning = false;
-            window.__tutorialPromptState = 'observing';
+            window.__day1Settled = false;
         }
         """
     )
@@ -409,10 +400,10 @@ def test_onboarding_waits_for_tutorial_prompt_settlement_before_showing(mock_pag
     mock_page.evaluate(
         """
         () => {
-            window.__tutorialPromptState = 'started';
+            window.__day1Settled = false;
             window.universalTutorialManager.isTutorialRunning = true;
             window.dispatchEvent(new CustomEvent('neko:tutorial-started', {
-                detail: { page: 'home', source: 'idle_prompt' }
+                detail: { page: 'home', source: 'auto' }
             }));
         }
         """
@@ -424,140 +415,9 @@ def test_onboarding_waits_for_tutorial_prompt_settlement_before_showing(mock_pag
     mock_page.evaluate(
         """
         () => {
-            window.__tutorialPromptState = 'completed';
+            window.__day1Settled = true;
             window.universalTutorialManager.isTutorialRunning = false;
             window.dispatchEvent(new CustomEvent('neko:tutorial-completed', {
-                detail: { page: 'home', source: 'idle_prompt' }
-            }));
-        }
-        """
-    )
-
-    expect(mock_page.locator("[data-testid='character-personality-overlay']")).to_be_visible()
-
-
-@pytest.mark.frontend
-def test_onboarding_does_not_preempt_new_user_tutorial_prompt_flow(mock_page: Page):
-    _bootstrap_page(mock_page)
-    mock_page.add_style_tag(path=str(PROJECT_ROOT / "static" / "css" / "character_personality_onboarding.css"))
-    mock_page.evaluate(
-        """
-        () => {
-            window.universalTutorialManager.isTutorialRunning = false;
-            window.__tutorialPromptStatePayload = {
-                status: 'observing',
-                deferred_until: 0,
-                never_remind: false,
-                user_cohort: 'new',
-            };
-        }
-        """
-    )
-    mock_page.add_script_tag(path=str(PROJECT_ROOT / "static" / "js" / "character_personality_onboarding.js"))
-
-    mock_page.evaluate(
-        """
-        () => {
-            window.CharacterPersonalityOnboarding.bootstrap();
-        }
-        """
-    )
-
-    mock_page.wait_for_timeout(3400)
-    expect(mock_page.locator("[data-testid='character-personality-overlay']")).to_have_count(0)
-
-    mock_page.evaluate(
-        """
-        () => {
-            window.__tutorialPromptStatePayload = {
-                status: 'completed',
-                deferred_until: 0,
-                never_remind: false,
-                user_cohort: 'new',
-            };
-            window.dispatchEvent(new CustomEvent('neko:tutorial-completed', {
-                detail: { page: 'home', source: 'idle_prompt' }
-            }));
-        }
-        """
-    )
-
-    expect(mock_page.locator("[data-testid='character-personality-overlay']")).to_be_visible()
-
-
-@pytest.mark.frontend
-@pytest.mark.parametrize("prompt_status", ["deferred", "never"])
-def test_onboarding_respects_declined_new_user_tutorial_prompt_decision(
-    mock_page: Page,
-    prompt_status: str,
-):
-    _bootstrap_page(mock_page)
-    mock_page.evaluate(
-        """
-        (promptStatus) => {
-            window.universalTutorialManager.isTutorialRunning = false;
-            window.__tutorialPromptStatePayload = {
-                status: promptStatus,
-                deferred_until: promptStatus === 'deferred' ? Date.now() + 60000 : 0,
-                never_remind: promptStatus === 'never',
-                user_cohort: 'new',
-            };
-        }
-        """,
-        prompt_status,
-    )
-    mock_page.add_script_tag(path=str(PROJECT_ROOT / "static" / "js" / "character_personality_onboarding.js"))
-
-    mock_page.evaluate(
-        """
-        () => {
-            window.CharacterPersonalityOnboarding.bootstrap();
-        }
-        """
-    )
-
-    expect(mock_page.locator("[data-testid='character-personality-overlay']")).to_be_visible(timeout=1000)
-
-
-@pytest.mark.frontend
-def test_onboarding_waits_for_home_tutorial_storage_completion_even_if_prompt_state_completed(mock_page: Page):
-    _bootstrap_page(mock_page)
-    mock_page.evaluate(
-        """
-        () => {
-            window.universalTutorialManager.isTutorialRunning = false;
-            window.universalTutorialManager.hasSeenTutorial = function(page) {
-                return page === 'home'
-                    && window.localStorage.getItem('neko_tutorial_home_yui_v1') === 'true';
-            };
-            window.__tutorialPromptStatePayload = {
-                status: 'completed',
-                deferred_until: 0,
-                never_remind: false,
-                user_cohort: 'new',
-            };
-        }
-        """
-    )
-    mock_page.add_script_tag(path=str(PROJECT_ROOT / "static" / "js" / "character_personality_onboarding.js"))
-
-    mock_page.evaluate(
-        """
-        () => {
-            window.CharacterPersonalityOnboarding.bootstrap();
-        }
-        """
-    )
-
-    mock_page.wait_for_timeout(350)
-    expect(mock_page.locator("[data-testid='character-personality-overlay']")).to_have_count(0)
-
-    mock_page.evaluate(
-        """
-        () => {
-            window.localStorage.setItem('neko_tutorial_home_yui_v1', 'true');
-            window.localStorage.setItem('neko_tutorial_home', 'true');
-            window.dispatchEvent(new CustomEvent('neko:tutorial-skipped', {
                 detail: { page: 'home', source: 'auto' }
             }));
         }
@@ -686,14 +546,7 @@ def test_onboarding_does_not_timeout_while_home_tutorial_is_running(mock_page: P
                 return realSetTimeout(callback, delay, ...args);
             };
             window.universalTutorialManager.isTutorialRunning = true;
-            window.__tutorialPromptStatePayload = {
-                status: 'completed',
-                deferred_until: 0,
-                never_remind: false,
-                home_tutorial_completed: true,
-                manual_home_tutorial_viewed: true,
-                user_cohort: 'existing',
-            };
+            window.__day1Settled = false;
         }
         """
     )
@@ -714,6 +567,7 @@ def test_onboarding_does_not_timeout_while_home_tutorial_is_running(mock_page: P
         """
         () => {
             window.universalTutorialManager.isTutorialRunning = false;
+            window.__day1Settled = true;
             window.dispatchEvent(new CustomEvent('neko:tutorial-skipped', {
                 detail: { page: 'home', source: 'auto' }
             }));
@@ -740,14 +594,7 @@ def test_onboarding_does_not_open_while_home_tutorial_start_is_locked(mock_page:
             window.universalTutorialManager.isTutorialRunning = false;
             window.__homeTutorialLocked = true;
             window.isNekoHomeTutorialInteractionLocked = () => window.__homeTutorialLocked;
-            window.__tutorialPromptStatePayload = {
-                status: 'completed',
-                deferred_until: 0,
-                never_remind: false,
-                home_tutorial_completed: true,
-                manual_home_tutorial_viewed: true,
-                user_cohort: 'existing',
-            };
+            window.__day1Settled = false;
         }
         """
     )
@@ -768,6 +615,7 @@ def test_onboarding_does_not_open_while_home_tutorial_start_is_locked(mock_page:
         """
         () => {
             window.__homeTutorialLocked = false;
+            window.__day1Settled = true;
             window.dispatchEvent(new CustomEvent('neko:tutorial-skipped', {
                 detail: { page: 'home', source: 'auto' }
             }));
@@ -778,23 +626,24 @@ def test_onboarding_does_not_open_while_home_tutorial_start_is_locked(mock_page:
 
 
 @pytest.mark.frontend
-def test_onboarding_waits_when_default_character_makes_new_user_look_existing(mock_page: Page):
+def test_onboarding_does_not_open_while_home_tutorial_is_pending(mock_page: Page):
+    """The pre-lock pending window (cold-start model / first-line intro load) must also
+    hold back persona onboarding so it cannot race ahead of the home tutorial; persona
+    keeps waiting even when the 15s settle timeout fires first."""
     _bootstrap_page(mock_page)
     mock_page.evaluate(
         """
         () => {
-            window.universalTutorialManager.isTutorialRunning = false;
-            window.__tutorialPromptStatePayload = {
-                status: 'observing',
-                shown_count: 0,
-                deferred_until: 0,
-                never_remind: false,
-                home_tutorial_completed: false,
-                manual_home_tutorial_viewed: false,
-                chat_turns: 0,
-                voice_sessions: 0,
-                user_cohort: 'existing',
+            const realSetTimeout = window.setTimeout.bind(window);
+            window.setTimeout = (callback, delay, ...args) => {
+                if (delay === 15000) {
+                    return realSetTimeout(callback, 20, ...args);
+                }
+                return realSetTimeout(callback, delay, ...args);
             };
+            window.universalTutorialManager.isTutorialRunning = false;
+            window.isNekoHomeTutorialPending = true;
+            window.__day1Settled = false;
         }
         """
     )
@@ -808,47 +657,43 @@ def test_onboarding_waits_when_default_character_makes_new_user_look_existing(mo
         """
     )
 
-    mock_page.wait_for_timeout(350)
+    mock_page.wait_for_timeout(120)
     expect(mock_page.locator("[data-testid='character-personality-overlay']")).to_have_count(0)
 
     mock_page.evaluate(
         """
         () => {
-            window.__tutorialPromptStatePayload = {
-                status: 'completed',
-                shown_count: 0,
-                deferred_until: 0,
-                never_remind: false,
-                home_tutorial_completed: true,
-                manual_home_tutorial_viewed: true,
-                chat_turns: 0,
-                voice_sessions: 0,
-                user_cohort: 'existing',
-            };
+            window.isNekoHomeTutorialPending = false;
+            window.__day1Settled = true;
             window.dispatchEvent(new CustomEvent('neko:tutorial-skipped', {
                 detail: { page: 'home', source: 'auto' }
             }));
         }
         """
     )
-
     expect(mock_page.locator("[data-testid='character-personality-overlay']")).to_be_visible()
 
 
 @pytest.mark.frontend
-def test_onboarding_ignores_stale_auto_home_tutorial_start_after_prompt_completed(mock_page: Page):
+def test_onboarding_opens_when_pending_home_tutorial_aborts_via_startup_release(mock_page: Page):
+    """Deadlock safety: when a pending home tutorial aborts (never starts, so there is no
+    tutorial-completed/skipped event and the backend stays new-user 'observing' which never
+    settles), persona onboarding is released by the tutorial's startup-greeting-release
+    (released:true) event instead of being blocked forever."""
     _bootstrap_page(mock_page)
     mock_page.evaluate(
         """
         () => {
-            window.universalTutorialManager.isTutorialRunning = false;
-            window.localStorage.setItem('neko_tutorial_home_yui_v1', 'true');
-            window.__tutorialPromptStatePayload = {
-                status: 'completed',
-                deferred_until: 0,
-                never_remind: false,
-                user_cohort: 'new',
+            const realSetTimeout = window.setTimeout.bind(window);
+            window.setTimeout = (callback, delay, ...args) => {
+                if (delay === 15000) {
+                    return realSetTimeout(callback, 20, ...args);
+                }
+                return realSetTimeout(callback, delay, ...args);
             };
+            window.universalTutorialManager.isTutorialRunning = false;
+            window.isNekoHomeTutorialPending = true;
+            window.__day1Settled = false;
         }
         """
     )
@@ -862,18 +707,94 @@ def test_onboarding_ignores_stale_auto_home_tutorial_start_after_prompt_complete
         """
     )
 
-    expect(mock_page.locator("[data-testid='character-personality-overlay']")).to_be_visible()
+    mock_page.wait_for_timeout(120)
+    expect(mock_page.locator("[data-testid='character-personality-overlay']")).to_have_count(0)
 
     mock_page.evaluate(
         """
         () => {
-            window.dispatchEvent(new CustomEvent('neko:tutorial-started', {
+            window.isNekoHomeTutorialPending = false;
+            window.dispatchEvent(new CustomEvent('neko:startup-greeting-release', {
+                detail: { released: true, page: 'home', reason: 'floating-buttons-not-found' }
+            }));
+        }
+        """
+    )
+    expect(mock_page.locator("[data-testid='character-personality-overlay']")).to_be_visible()
+
+
+@pytest.mark.frontend
+def test_settings_reselect_does_not_hang_after_tutorial_release_when_unlocked(mock_page: Page):
+    """Greptile P1 / deadlock safety: openFromSettings must NOT reset the persistent
+    _tutorialFlowAborted flag when no tutorial is locked. After a startup-greeting-release
+    (released:true) latched the abort with the backend stuck at new-user 'observing' (which never
+    settles and yields no further release), a reset would make waitForTutorialFlowToSettle poll
+    forever and the settings reselect would hang. Keeping the abort lets it open immediately."""
+    _bootstrap_page(mock_page)
+    mock_page.evaluate(
+        """
+        () => {
+            window.universalTutorialManager.isTutorialRunning = false;
+            window.__day1Settled = false;
+        }
+        """
+    )
+    mock_page.add_script_tag(path=str(PROJECT_ROOT / "static" / "js" / "character_personality_onboarding.js"))
+
+    mock_page.evaluate(
+        """
+        () => {
+            // 教程在选人格 settle 之前夭折：abort 标志被监听置位，且当前无任何教程锁。
+            window.dispatchEvent(new CustomEvent('neko:startup-greeting-release', {
+                detail: { released: true, page: 'home', reason: 'floating-buttons-not-found' }
+            }));
+            window.CharacterPersonalityOnboarding.openFromSettings('小天');
+        }
+        """
+    )
+
+    expect(mock_page.locator("[data-testid='character-personality-overlay']")).to_be_visible()
+
+
+@pytest.mark.frontend
+def test_settings_reselect_waits_for_running_home_tutorial(mock_page: Page):
+    """Codex P2 counterpart: when a tutorial IS locked/running at settings-reselect time, the stale
+    abort flag must be cleared so the reselect waits instead of appearing over the running tutorial."""
+    _bootstrap_page(mock_page)
+    mock_page.evaluate(
+        """
+        () => {
+            window.universalTutorialManager.isTutorialRunning = true;
+            window.__day1Settled = false;
+        }
+        """
+    )
+    mock_page.add_script_tag(path=str(PROJECT_ROOT / "static" / "js" / "character_personality_onboarding.js"))
+
+    mock_page.evaluate(
+        """
+        () => {
+            // 先前教程曾结束并置位过 abort，但现在又有教程在运行。
+            window.CharacterPersonalityOnboarding._tutorialFlowAborted = true;
+            window.CharacterPersonalityOnboarding.openFromSettings('小天');
+        }
+        """
+    )
+
+    mock_page.wait_for_timeout(150)
+    expect(mock_page.locator("[data-testid='character-personality-overlay']")).to_have_count(0)
+
+    mock_page.evaluate(
+        """
+        () => {
+            window.universalTutorialManager.isTutorialRunning = false;
+            window.__day1Settled = true;
+            window.dispatchEvent(new CustomEvent('neko:tutorial-completed', {
                 detail: { page: 'home', source: 'auto' }
             }));
         }
         """
     )
-
     expect(mock_page.locator("[data-testid='character-personality-overlay']")).to_be_visible()
 
 
@@ -885,12 +806,7 @@ def test_onboarding_hides_overlay_when_real_auto_tutorial_starts_after_overlay(m
         () => {
             window.universalTutorialManager.isTutorialRunning = false;
             window.localStorage.setItem('neko_tutorial_home_yui_v1', 'true');
-            window.__tutorialPromptStatePayload = {
-                status: 'completed',
-                deferred_until: 0,
-                never_remind: false,
-                user_cohort: 'new',
-            };
+            window.__day1Settled = true;
         }
         """
     )
@@ -923,6 +839,7 @@ def test_onboarding_hides_overlay_when_real_auto_tutorial_starts_after_overlay(m
         """
         () => {
             window.universalTutorialManager.isTutorialRunning = false;
+            window.__day1Settled = true;
             window.dispatchEvent(new CustomEvent('neko:tutorial-completed', {
                 detail: { page: 'home', source: 'auto' }
             }));
@@ -934,64 +851,6 @@ def test_onboarding_hides_overlay_when_real_auto_tutorial_starts_after_overlay(m
 
 
 @pytest.mark.frontend
-def test_onboarding_does_not_treat_tutorial_prompt_fetch_failure_as_settled(mock_page: Page):
-    _bootstrap_page(mock_page)
-    mock_page.evaluate(
-        """
-        () => {
-            window.universalTutorialManager.isTutorialRunning = false;
-            window.__tutorialPromptFetchFailuresRemaining = 5;
-            window.__tutorialPromptState = 'completed';
-        }
-        """
-    )
-    mock_page.add_script_tag(path=str(PROJECT_ROOT / "static" / "js" / "character_personality_onboarding.js"))
-
-    mock_page.evaluate(
-        """
-        () => {
-            window.CharacterPersonalityOnboarding.bootstrap();
-        }
-        """
-    )
-
-    mock_page.wait_for_timeout(200)
-    expect(mock_page.locator("[data-testid='character-personality-overlay']")).to_have_count(0)
-
-    mock_page.wait_for_function("() => window.__tutorialPromptFetchFailuresRemaining === 0")
-    expect(mock_page.locator("[data-testid='character-personality-overlay']")).to_be_visible()
-
-
-@pytest.mark.frontend
-def test_onboarding_started_state_waits_without_busy_fetch_loop(mock_page: Page):
-    _bootstrap_page(mock_page)
-    mock_page.evaluate(
-        """
-        () => {
-            window.universalTutorialManager.isTutorialRunning = false;
-            window.__tutorialPromptState = 'started';
-        }
-        """
-    )
-    mock_page.add_script_tag(path=str(PROJECT_ROOT / "static" / "js" / "character_personality_onboarding.js"))
-
-    mock_page.evaluate(
-        """
-        () => {
-            window.CharacterPersonalityOnboarding.bootstrap();
-        }
-        """
-    )
-
-    mock_page.wait_for_timeout(350)
-    const_requests = mock_page.evaluate(
-        "() => window.__requestLog.filter((entry) => entry.url === '/api/tutorial-prompt/state').length"
-    )
-    assert const_requests <= 4
-    expect(mock_page.locator("[data-testid='character-personality-overlay']")).to_have_count(0)
-
-
-@pytest.mark.frontend
 def test_onboarding_restores_pointer_events_for_clickable_overlay(mock_page: Page):
     _bootstrap_page(mock_page)
     mock_page.add_style_tag(path=str(PROJECT_ROOT / "static" / "css" / "character_personality_onboarding.css"))
@@ -999,7 +858,7 @@ def test_onboarding_restores_pointer_events_for_clickable_overlay(mock_page: Pag
         """
         () => {
             window.universalTutorialManager.isTutorialRunning = false;
-            window.__tutorialPromptState = 'completed';
+            window.__day1Settled = true;
             document.body.style.pointerEvents = 'none';
         }
         """
@@ -1015,7 +874,7 @@ def test_onboarding_restores_pointer_events_for_clickable_overlay(mock_page: Pag
     )
 
     expect(mock_page.locator("[data-testid='character-personality-overlay']")).to_be_visible()
-    mock_page.locator("[data-testid='character-personality-preset-classic_genki']").click()
+    mock_page.locator("[data-testid='character-personality-preset-frail_younger_sister']").click()
     expect(mock_page.locator("[data-testid='character-personality-confirm']")).to_be_visible()
 
     mock_page.locator("[data-testid='character-personality-back']").click()
@@ -1039,7 +898,7 @@ def test_onboarding_marks_overlay_controls_as_no_drag_for_desktop_clicks(mock_pa
         """
     )
 
-    mock_page.locator("[data-testid='character-personality-preset-classic_genki']").click()
+    mock_page.locator("[data-testid='character-personality-preset-frail_younger_sister']").click()
     expect(mock_page.locator("[data-testid='character-personality-confirm']")).to_be_visible()
 
     app_regions = mock_page.evaluate(
@@ -1054,7 +913,7 @@ def test_onboarding_marks_overlay_controls_as_no_drag_for_desktop_clicks(mock_pa
                 shell: read('.character-personality-shell'),
                 skip: read("[data-testid='character-personality-skip']"),
                 confirm: read("[data-testid='character-personality-confirm']"),
-                card: read("[data-testid='character-personality-preset-classic_genki']"),
+                card: read("[data-testid='character-personality-preset-frail_younger_sister']"),
             };
         }
         """
@@ -1076,7 +935,7 @@ def test_manual_character_personality_reselect_opens_directly_on_home_refresh(mo
         """
         () => {
             window.universalTutorialManager.isTutorialRunning = false;
-            window.__tutorialPromptState = 'completed';
+            window.__day1Settled = true;
             window.__personaOnboardingState = {
                 status: 'completed',
                 handled_at: '2026-04-29T12:00:00Z',
@@ -1106,12 +965,7 @@ def test_manual_character_personality_reselect_waits_for_home_tutorial_completio
         """
         () => {
             window.universalTutorialManager.isTutorialRunning = false;
-            window.__tutorialPromptStatePayload = {
-                status: 'observing',
-                deferred_until: 0,
-                never_remind: false,
-                user_cohort: 'new',
-            };
+            window.__day1Settled = false;
             window.__personaOnboardingState = {
                 status: 'completed',
                 handled_at: '2026-04-29T12:00:00Z',
@@ -1136,14 +990,9 @@ def test_manual_character_personality_reselect_waits_for_home_tutorial_completio
     mock_page.evaluate(
         """
         () => {
-            window.__tutorialPromptStatePayload = {
-                status: 'completed',
-                deferred_until: 0,
-                never_remind: false,
-                user_cohort: 'new',
-            };
+            window.__day1Settled = true;
             window.dispatchEvent(new CustomEvent('neko:tutorial-completed', {
-                detail: { page: 'home', source: 'idle_prompt' }
+                detail: { page: 'home', source: 'auto' }
             }));
         }
         """
@@ -1159,7 +1008,7 @@ def test_manual_character_personality_reselect_resumes_after_home_tutorial_early
         """
         () => {
             window.universalTutorialManager.isTutorialRunning = false;
-            window.__tutorialPromptState = 'completed';
+            window.__day1Settled = true;
             window.__personaOnboardingState = {
                 status: 'completed',
                 handled_at: '2026-04-29T12:00:00Z',
@@ -1186,7 +1035,7 @@ def test_manual_character_personality_reselect_resumes_after_home_tutorial_early
         () => {
             window.universalTutorialManager.isTutorialRunning = true;
             window.dispatchEvent(new CustomEvent('neko:tutorial-started', {
-                detail: { page: 'home', source: 'idle_prompt' }
+                detail: { page: 'home', source: 'auto' }
             }));
         }
         """
@@ -1215,7 +1064,7 @@ def test_manual_character_personality_reselect_skip_clears_manual_pending_state(
         """
         () => {
             window.universalTutorialManager.isTutorialRunning = false;
-            window.__tutorialPromptState = 'completed';
+            window.__day1Settled = true;
             window.__personaOnboardingState = {
                 status: 'completed',
                 handled_at: '2026-04-29T12:00:00Z',
@@ -1299,14 +1148,14 @@ def test_onboarding_confirm_dispatches_character_update_event(mock_page: Page):
         """
     )
 
-    mock_page.locator("[data-testid='character-personality-preset-classic_genki']").click()
+    mock_page.locator("[data-testid='character-personality-preset-frail_younger_sister']").click()
     mock_page.locator("[data-testid='character-personality-confirm']").click()
     mock_page.wait_for_function("() => window.__personalityEventDetail !== null")
 
     event_detail = mock_page.evaluate("() => window.__personalityEventDetail")
     assert event_detail == {
         "characterName": "小天",
-        "presetId": "classic_genki",
+        "presetId": "frail_younger_sister",
     }
 
     request_log = mock_page.evaluate("() => window.__requestLog")
@@ -1333,6 +1182,193 @@ def test_onboarding_confirm_dispatches_character_update_event(mock_page: Page):
         and entry["body"] == {"status": "completed"}
         for entry in request_log
     )
+
+
+@pytest.mark.frontend
+@pytest.mark.parametrize(
+    ("explicit_language", "generic_language", "expected_language"),
+    [
+        ("", "ja", "zh-CN"),
+        ("ja", "ko", "ja"),
+    ],
+    ids=["untrusted-cache-is-ignored", "trusted-explicit-wins"],
+)
+def test_personality_selection_persists_only_trusted_explicit_or_live_ui_language(
+    mock_page: Page,
+    explicit_language: str,
+    generic_language: str,
+    expected_language: str,
+):
+    _bootstrap_page(mock_page)
+    mock_page.evaluate(
+        """
+        ([explicitLanguage, genericLanguage]) => {
+            window.universalTutorialManager.isTutorialRunning = false;
+            window.i18next = { language: 'zh-CN' };
+            window.__genericLanguageCalls = 0;
+            window.getExplicitConversationLanguagePreference = (name) => {
+                if (name !== '小天') throw new Error('wrong character scope: ' + name);
+                return explicitLanguage;
+            };
+            window.getConversationLanguagePreference = () => {
+                window.__genericLanguageCalls += 1;
+                return genericLanguage;
+            };
+        }
+        """,
+        [explicit_language, generic_language],
+    )
+    mock_page.add_script_tag(
+        path=str(PROJECT_ROOT / "static" / "js" / "character_personality_onboarding.js")
+    )
+
+    mock_page.evaluate("() => window.CharacterPersonalityOnboarding.bootstrap()")
+    expect(mock_page.locator("[data-testid='character-personality-overlay']")).to_be_visible()
+    mock_page.locator(
+        "[data-testid='character-personality-preset-frail_younger_sister']"
+    ).click()
+    mock_page.locator("[data-testid='character-personality-confirm']").click()
+    expect(mock_page.locator("[data-testid='character-personality-overlay']")).to_be_hidden()
+
+    request_log = mock_page.evaluate("() => window.__requestLog")
+    preset_entries = [
+        entry
+        for entry in request_log
+        if new_url_pathname(entry["url"]) == "/api/characters/persona-presets"
+    ]
+    assert preset_entries
+    preset_language = parse_qs(urlparse(preset_entries[-1]["url"]).query).get(
+        "language", [""]
+    )[0]
+    put_entries = [
+        entry
+        for entry in request_log
+        if entry["url"] == "/api/characters/character/%E5%B0%8F%E5%A4%A9/persona-selection"
+        and entry["method"] == "PUT"
+    ]
+    assert len(put_entries) == 1
+    assert preset_language == expected_language
+    assert put_entries[0]["body"]["i18n_language"] == expected_language
+    assert mock_page.evaluate("() => window.__genericLanguageCalls") == 0
+
+
+@pytest.mark.frontend
+@pytest.mark.parametrize(
+    "response_payload,inflight_action,expected_language,expected_cache_events",
+    [
+        ({"success": True, "language": "ja"}, "", "ja", ["set:ja:server:false"]),
+        ({"success": False, "language": "ja"}, "", "zh-CN", []),
+        ({"success": True, "language": ""}, "", "zh-CN", []),
+        ({"success": True, "language": "ja"}, "set", "ko", ["set:ko:sibling:true"]),
+        ({"success": True, "language": "ja"}, "clear", "zh-CN", ["clear:sibling:true"]),
+    ],
+    ids=["durable", "rejected", "confirmed-empty", "inflight-set", "inflight-clear"],
+)
+def test_personality_selection_waits_for_durable_character_language_hydration(
+    mock_page: Page,
+    response_payload: dict,
+    inflight_action: str,
+    expected_language: str,
+    expected_cache_events: list[str],
+):
+    _bootstrap_page(mock_page)
+    mock_page.evaluate(
+        """
+        (responsePayload) => {
+            window.universalTutorialManager.isTutorialRunning = false;
+            window.i18next = { language: 'zh-CN' };
+            window.__hydratedCharacterLanguage = '';
+            window.__characterLanguageRevision = 0;
+            window.__languagePreferenceCacheEvents = [];
+            window.getExplicitConversationLanguagePreference = (name) => {
+                if (name !== '小天') throw new Error('wrong character scope: ' + name);
+                return window.__hydratedCharacterLanguage;
+            };
+            window.getConversationLanguagePreferenceRevision = (name) => {
+                if (name !== '小天') throw new Error('wrong character scope: ' + name);
+                return window.__characterLanguageRevision;
+            };
+            window.setConversationLanguagePreference = (language, name, options) => {
+                if (name !== '小天') throw new Error('wrong character scope: ' + name);
+                window.__hydratedCharacterLanguage = language;
+                window.__characterLanguageRevision += 1;
+                window.__languagePreferenceCacheEvents.push(`set:${language}:${options.source}:${options.dispatch !== false}`);
+                return true;
+            };
+            window.clearConversationLanguagePreference = (name, options) => {
+                if (name !== '小天') throw new Error('wrong character scope: ' + name);
+                window.__hydratedCharacterLanguage = '';
+                window.__characterLanguageRevision += 1;
+                window.__languagePreferenceCacheEvents.push(`clear:${options.source}:${options.dispatch !== false}`);
+                return true;
+            };
+
+            const originalFetch = window.fetch.bind(window);
+            window.__presetRequestedBeforeLanguageHydration = null;
+            window.fetch = function(url, options) {
+                const requestUrl = String(url);
+                const pathname = new URL(requestUrl, window.location.origin).pathname;
+                if (pathname === '/api/characters/character/%E5%B0%8F%E5%A4%A9/language-preference') {
+                    window.__requestLog.push({ url: requestUrl, method: 'GET', body: null });
+                    return new Promise((resolve) => {
+                        window.__releaseLanguageHydration = () => {
+                            window.__presetRequestedBeforeLanguageHydration = window.__requestLog.some(
+                                (entry) => new URL(entry.url, window.location.origin).pathname
+                                    === '/api/characters/persona-presets'
+                            );
+                            resolve(new Response(JSON.stringify(responsePayload), {
+                                status: 200,
+                                headers: { 'Content-Type': 'application/json' },
+                            }));
+                        };
+                    });
+                }
+                return originalFetch(url, options);
+            };
+        }
+        """,
+        response_payload,
+    )
+    mock_page.add_script_tag(path=str(PROJECT_ROOT / "static" / "js" / "character_personality_onboarding.js"))
+
+    mock_page.evaluate("() => { void window.CharacterPersonalityOnboarding.bootstrap(); }")
+    mock_page.wait_for_function("() => typeof window.__releaseLanguageHydration === 'function'")
+    if inflight_action == "set":
+        mock_page.evaluate(
+            "() => window.setConversationLanguagePreference('ko', '小天', { source: 'sibling' })"
+        )
+    elif inflight_action == "clear":
+        mock_page.evaluate(
+            "() => window.clearConversationLanguagePreference('小天', { source: 'sibling' })"
+        )
+    mock_page.evaluate("() => window.__releaseLanguageHydration()")
+    expect(mock_page.locator("[data-testid='character-personality-overlay']")).to_be_visible()
+    assert mock_page.evaluate("() => window.__presetRequestedBeforeLanguageHydration") is False
+    mock_page.locator(
+        "[data-testid='character-personality-preset-frail_younger_sister']"
+    ).click()
+    mock_page.locator("[data-testid='character-personality-confirm']").click()
+    expect(mock_page.locator("[data-testid='character-personality-overlay']")).to_be_hidden()
+
+    request_log = mock_page.evaluate("() => window.__requestLog")
+    preset_entries = [
+        entry
+        for entry in request_log
+        if new_url_pathname(entry["url"]) == "/api/characters/persona-presets"
+    ]
+    assert len(preset_entries) == 1
+    assert parse_qs(urlparse(preset_entries[0]["url"]).query)["language"] == [
+        expected_language
+    ]
+    put_entries = [
+        entry
+        for entry in request_log
+        if entry["url"] == "/api/characters/character/%E5%B0%8F%E5%A4%A9/persona-selection"
+        and entry["method"] == "PUT"
+    ]
+    assert len(put_entries) == 1
+    assert put_entries[0]["body"]["i18n_language"] == expected_language
+    assert mock_page.evaluate("() => window.__languagePreferenceCacheEvents") == expected_cache_events
 
 
 @pytest.mark.frontend
@@ -1369,7 +1405,7 @@ def test_onboarding_confirm_preserves_event_detail_during_pending_back_navigatio
         """
     )
 
-    mock_page.locator("[data-testid='character-personality-preset-classic_genki']").click()
+    mock_page.locator("[data-testid='character-personality-preset-frail_younger_sister']").click()
     mock_page.locator("[data-testid='character-personality-confirm']").click()
     mock_page.wait_for_function("() => typeof window.__releaseDelayedPersonaSelection === 'function'")
     mock_page.locator("[data-testid='character-personality-back']").click()
@@ -1379,7 +1415,7 @@ def test_onboarding_confirm_preserves_event_detail_during_pending_back_navigatio
     event_detail = mock_page.evaluate("() => window.__personalityEventDetail")
     assert event_detail == {
         "characterName": "小天",
-        "presetId": "classic_genki",
+        "presetId": "frail_younger_sister",
     }
 
 
@@ -1390,7 +1426,7 @@ def test_manual_reselect_confirm_does_not_send_followup_delete(mock_page: Page):
         """
         () => {
             window.universalTutorialManager.isTutorialRunning = false;
-            window.__tutorialPromptState = 'completed';
+            window.__day1Settled = true;
             window.__personaOnboardingState = {
                 status: 'completed',
                 handled_at: '2026-04-29T12:00:00Z',
@@ -1410,7 +1446,7 @@ def test_manual_reselect_confirm_does_not_send_followup_delete(mock_page: Page):
         """
     )
 
-    mock_page.locator("[data-testid='character-personality-preset-classic_genki']").click()
+    mock_page.locator("[data-testid='character-personality-preset-frail_younger_sister']").click()
     mock_page.locator("[data-testid='character-personality-confirm']").click()
     expect(mock_page.locator("[data-testid='character-personality-overlay']")).to_be_hidden()
 
@@ -1452,7 +1488,7 @@ def test_manual_reselect_shows_context_warning_in_both_steps(mock_page: Page):
         """
         () => {
             window.universalTutorialManager.isTutorialRunning = false;
-            window.__tutorialPromptState = 'completed';
+            window.__day1Settled = true;
             window.__personaOnboardingState = {
                 status: 'completed',
                 handled_at: '2026-04-29T12:00:00Z',
@@ -1476,7 +1512,7 @@ def test_manual_reselect_shows_context_warning_in_both_steps(mock_page: Page):
     expect(warning).to_have_count(1)
     expect(warning).to_contain_text("当前角色")
 
-    mock_page.locator("[data-testid='character-personality-preset-classic_genki']").click()
+    mock_page.locator("[data-testid='character-personality-preset-frail_younger_sister']").click()
     expect(mock_page.locator("[data-testid='character-personality-warning']:visible")).to_have_count(1)
     expect(mock_page.locator("[data-testid='character-personality-warning']:visible")).to_contain_text("当前角色")
 
@@ -1495,9 +1531,9 @@ def test_onboarding_preview_streams_selected_personality_copy(mock_page: Page):
         """
     )
 
-    mock_page.locator("[data-testid='character-personality-preset-classic_genki']").click()
+    mock_page.locator("[data-testid='character-personality-preset-frail_younger_sister']").click()
     expect(mock_page.locator("[data-testid='character-personality-preview-stream']")).to_be_visible()
-    expect(mock_page.locator("[data-testid='character-personality-preview-stream']")).to_contain_text("太棒了喵", timeout=5000)
+    expect(mock_page.locator("[data-testid='character-personality-preview-stream']")).to_contain_text("再陪我待一会儿", timeout=5000)
 
 
 @pytest.mark.frontend
@@ -1566,7 +1602,7 @@ def test_onboarding_translate_falls_back_when_window_t_returns_object(mock_page:
     )
     expect(mock_page.locator(".character-personality-card-name")).to_have_text(preset_name)
 
-    mock_page.locator("[data-testid='character-personality-preset-classic_genki']").click()
+    mock_page.locator("[data-testid='character-personality-preset-frail_younger_sister']").click()
     assert_visible_fallback_text(".stage-two-title")
     assert_visible_fallback_text(".character-personality-preview-label")
     assert_visible_fallback_text(".stage-two-subtitle")
@@ -1615,22 +1651,22 @@ def test_onboarding_uses_i18n_copy_for_user_visible_text(mock_page: Page):
                     'memory.characterSelection.chooseHint': 'You can revisit this from settings later.',
                     'memory.characterSelection.currentCharacter': 'Current character: {{name}}',
                     'memory.characterSelection.stageOneIntro': 'Pick the vibe first, then preview how I will sound.',
-                    'memory.characterSelection.classic_genki.name': 'Sunny Spark',
-                    'memory.characterSelection.classic_genki.desc': 'Bright, affectionate, and always on your side.',
-                    'memory.characterSelection.classic_genki.previewLine': 'Yay, let me stay by your side today too.',
-                    'memory.characterSelection.classic_genki.tag1': 'High empathy',
-                    'memory.characterSelection.classic_genki.tag2': 'Cozy energy',
-                    'memory.characterSelection.classic_genki.tag3': 'Emotional recharge',
+                    'memory.characterSelection.frail_younger_sister.name': 'Frail Little Sister',
+                    'memory.characterSelection.frail_younger_sister.desc': 'Asks you to stay, then worries she was too clingy.',
+                    'memory.characterSelection.frail_younger_sister.previewLine': 'Stay with me a little longer. I will be quiet.',
+                    'memory.characterSelection.frail_younger_sister.tag1': 'Asks you to stay',
+                    'memory.characterSelection.frail_younger_sister.tag2': 'Hesitant closeness',
+                    'memory.characterSelection.frail_younger_sister.tag3': 'Accepts no',
                     'memory.characterSelection.previewLabel': 'Voice preview',
                     'memory.characterSelection.previewLead': 'If you pick {{name}} for me, this is how I will sound.',
-                    'memory.characterSelection.classic_genki.profileSummary': 'A bright little sun who notices your mood fast and cheers you on.',
-                    'memory.characterSelection.classic_genki.hiddenRule': 'Emotional reassurance comes first in every interaction.',
-                    'memory.characterSelection.detailSpeechHabits': 'Signature phrases',
+                    'memory.characterSelection.frail_younger_sister.profileSummary': 'A gentle adult younger-sister figure who finds the courage to ask you to stay.',
+                    'memory.characterSelection.frail_younger_sister.hiddenRule': 'She accepts refusal immediately and never uses health or guilt as leverage.',
+                    'memory.characterSelection.detailSpeechHabits': 'Speaking habits',
                     'memory.characterSelection.detailHobbies': 'Favorite moods',
                     'memory.characterSelection.detailBoundaries': 'Hard boundaries',
-                    'memory.characterSelection.classic_genki.speechHabits': 'yay / nyan / you are amazing',
-                    'memory.characterSelection.classic_genki.hobbies': 'company / snacks / cheering you on',
-                    'memory.characterSelection.classic_genki.boundaries': 'cold replies / dismissing the user',
+                    'memory.characterSelection.frail_younger_sister.speechHabits': 'soft hesitant requests / asks once / accepts refusal',
+                    'memory.characterSelection.frail_younger_sister.hobbies': 'warm drinks / blankets / resting together',
+                    'memory.characterSelection.frail_younger_sister.boundaries': 'repeated pleading / illness leverage / emotional coercion',
                 };
                 const options = (
                     fallbackOrOptions && typeof fallbackOrOptions === 'object' && !Array.isArray(fallbackOrOptions)
@@ -1667,19 +1703,141 @@ def test_onboarding_uses_i18n_copy_for_user_visible_text(mock_page: Page):
     expect(mock_page.locator(".character-personality-intro")).to_have_text(
         "Pick the vibe first, then preview how I will sound."
     )
-    expect(mock_page.locator(".character-personality-card-name")).to_have_text("Sunny Spark")
+    expect(mock_page.locator(".character-personality-card-name")).to_have_text("Frail Little Sister")
 
-    mock_page.locator("[data-testid='character-personality-preset-classic_genki']").click()
+    mock_page.locator("[data-testid='character-personality-preset-frail_younger_sister']").click()
     expect(mock_page.locator(".stage-two-title")).to_have_text("Voice preview")
     expect(mock_page.locator(".character-personality-preview-label")).to_have_text("Voice preview")
     expect(mock_page.locator("[data-testid='character-personality-preview-stream']")).to_contain_text(
-        "If you pick Sunny Spark for me",
+        "If you pick Frail Little Sister for me",
         timeout=5000,
     )
-    expect(mock_page.locator(".detail-group-title").first).to_have_text("Signature phrases")
-    expect(mock_page.locator("#detailCatchphrases .detail-pill").nth(0)).to_have_text("yay")
-    expect(mock_page.locator("#detailCatchphrases .detail-pill").nth(1)).to_have_text("nyan")
-    expect(mock_page.locator("#detailCatchphrases .detail-pill").nth(2)).to_have_text("you are amazing")
+    expect(mock_page.locator(".detail-group-title").first).to_have_text("Speaking habits")
+    expect(mock_page.locator("#detailSpeechHabits .detail-pill").nth(0)).to_have_text("soft hesitant requests")
+    expect(mock_page.locator("#detailSpeechHabits .detail-pill").nth(1)).to_have_text("asks once")
+    expect(mock_page.locator("#detailSpeechHabits .detail-pill").nth(2)).to_have_text("accepts refusal")
+
+
+@pytest.mark.frontend
+def test_open_persona_preview_refreshes_and_keeps_selection_on_localechange(mock_page: Page):
+    _bootstrap_page(mock_page)
+    mock_page.evaluate(
+        """
+        () => {
+            window.universalTutorialManager.isTutorialRunning = false;
+            window.i18next = { language: 'en' };
+            window.t = function(key, fallbackOrOptions) {
+                const translations = {
+                    en: {
+                        'memory.characterSelection.frail_younger_sister.name': 'Frail Little Sister',
+                        'memory.characterSelection.previewLabel': 'Voice preview',
+                    },
+                    ja: {
+                        'memory.characterSelection.frail_younger_sister.name': '病弱な妹',
+                        'memory.characterSelection.previewLabel': '声のプレビュー',
+                    },
+                };
+                const options = (
+                    fallbackOrOptions && typeof fallbackOrOptions === 'object' && !Array.isArray(fallbackOrOptions)
+                ) ? fallbackOrOptions : null;
+                const fallback = typeof fallbackOrOptions === 'string'
+                    ? fallbackOrOptions
+                    : (options && typeof options.defaultValue === 'string' ? options.defaultValue : key);
+                return (translations[window.i18next.language] || {})[key] || fallback;
+            };
+        }
+        """
+    )
+    mock_page.add_script_tag(path=str(PROJECT_ROOT / "static" / "js" / "character_personality_onboarding.js"))
+    mock_page.evaluate("() => { window.CharacterPersonalityOnboarding.bootstrap(); }")
+
+    expect(mock_page.locator(".character-personality-card-name")).to_have_text("Frail Little Sister")
+    mock_page.locator("[data-testid='character-personality-preset-frail_younger_sister']").click()
+    expect(mock_page.locator(".stage-two-subtitle")).to_have_text("Frail Little Sister")
+
+    mock_page.evaluate(
+        """
+        () => {
+            window.i18next.language = 'ja';
+            window.dispatchEvent(new CustomEvent('localechange'));
+        }
+        """
+    )
+
+    expect(mock_page.locator(".stage-two-subtitle")).to_have_text("病弱な妹")
+    expect(mock_page.locator(".stage-two-title")).to_have_text("声のプレビュー")
+    expect(mock_page.locator(".character-personality-stage-one")).to_be_hidden()
+    expect(mock_page.locator(".character-personality-stage-two")).to_be_visible()
+    mock_page.wait_for_function(
+        """
+        () => window.__requestLog.some((entry) => {
+            const url = new URL(entry.url, window.location.origin);
+            return url.pathname === '/api/characters/persona-presets'
+                && url.searchParams.get('language') === 'ja';
+        })
+        """
+    )
+
+
+@pytest.mark.frontend
+def test_onboarding_resolves_i18n_names_for_all_four_active_personas(mock_page: Page):
+    _bootstrap_page(mock_page)
+    mock_page.evaluate(
+        """
+        () => {
+            window.universalTutorialManager.isTutorialRunning = false;
+            window.i18next = { language: 'en' };
+            const baseFetch = window.fetch;
+            const ids = [
+                'frail_younger_sister',
+                'empathetic_older_sister',
+                'sharp_tongued_junior',
+                'chaotic_online_friend',
+            ];
+            window.fetch = async function(url, options) {
+                const requestUrl = String(url);
+                if (new URL(requestUrl, window.location.origin).pathname === '/api/characters/persona-presets') {
+                    window.__requestLog.push({ url: requestUrl, method: 'GET', body: null });
+                    return new Response(JSON.stringify({
+                        success: true,
+                        presets: ids.map((id) => ({
+                            preset_id: id,
+                            display_name: id,
+                            summary_fallback: id,
+                            preview_line: id,
+                            profile: {},
+                        })),
+                    }), {
+                        status: 200,
+                        headers: { 'Content-Type': 'application/json' },
+                    });
+                }
+                return baseFetch(url, options);
+            };
+            const names = {
+                'memory.characterSelection.frail_younger_sister.name': 'Frail Little Sister',
+                'memory.characterSelection.empathetic_older_sister.name': 'Understanding Older Sister',
+                'memory.characterSelection.sharp_tongued_junior.name': 'Sharp-Tongued Junior',
+                'memory.characterSelection.chaotic_online_friend.name': 'Chaotic Online Friend',
+            };
+            window.t = function(key, fallbackOrOptions) {
+                const fallback = typeof fallbackOrOptions === 'string'
+                    ? fallbackOrOptions
+                    : (fallbackOrOptions && fallbackOrOptions.defaultValue) || key;
+                return names[key] || fallback;
+            };
+        }
+        """
+    )
+    mock_page.add_script_tag(path=str(PROJECT_ROOT / "static" / "js" / "character_personality_onboarding.js"))
+    mock_page.evaluate("() => { window.CharacterPersonalityOnboarding.bootstrap(); }")
+
+    expect(mock_page.locator(".character-personality-card-name")).to_have_text([
+        "Frail Little Sister",
+        "Understanding Older Sister",
+        "Sharp-Tongued Junior",
+        "Chaotic Online Friend",
+    ])
 
 
 @pytest.mark.frontend
@@ -1697,19 +1855,19 @@ def test_settings_uses_i18n_copy_for_warning_and_user_visible_text(mock_page: Pa
                     'memory.characterSelection.currentCharacter': 'Current character: {{name}}',
                     'memory.characterSelection.stageOneIntro': 'Pick the mood first, then listen to how I sound, nya.',
                     'memory.characterSelection.contextWarning': 'Heads up, nya: switching my personality clears this character\\'s recent chat context.',
-                    'memory.characterSelection.classic_genki.name': 'Sunny Spark',
-                    'memory.characterSelection.classic_genki.desc': 'Bright, affectionate, and always on your side.',
-                    'memory.characterSelection.classic_genki.previewLine': 'Yay, let me stay by your side today too.',
+                    'memory.characterSelection.frail_younger_sister.name': 'Frail Little Sister',
+                    'memory.characterSelection.frail_younger_sister.desc': 'Asks you to stay, then worries she was too clingy.',
+                    'memory.characterSelection.frail_younger_sister.previewLine': 'Stay with me a little longer. I will be quiet.',
                     'memory.characterSelection.previewLabel': 'Voice preview',
                     'memory.characterSelection.previewLead': 'If you pick {{name}} for me, this is how I will sound.',
-                    'memory.characterSelection.classic_genki.profileSummary': 'A bright little sun who notices your mood fast and cheers you on.',
-                    'memory.characterSelection.classic_genki.hiddenRule': 'Emotional reassurance comes first in every interaction.',
-                    'memory.characterSelection.detailSpeechHabits': 'Signature phrases',
+                    'memory.characterSelection.frail_younger_sister.profileSummary': 'A gentle adult younger-sister figure who finds the courage to ask you to stay.',
+                    'memory.characterSelection.frail_younger_sister.hiddenRule': 'She accepts refusal immediately and never uses health or guilt as leverage.',
+                    'memory.characterSelection.detailSpeechHabits': 'Speaking habits',
                     'memory.characterSelection.detailHobbies': 'Favorite moods',
                     'memory.characterSelection.detailBoundaries': 'Hard boundaries',
-                    'memory.characterSelection.classic_genki.speechHabits': 'yay / nyan / you are amazing',
-                    'memory.characterSelection.classic_genki.hobbies': 'company / snacks / cheering you on',
-                    'memory.characterSelection.classic_genki.boundaries': 'cold replies / dismissing the user',
+                    'memory.characterSelection.frail_younger_sister.speechHabits': 'soft hesitant requests / asks once / accepts refusal',
+                    'memory.characterSelection.frail_younger_sister.hobbies': 'warm drinks / blankets / resting together',
+                    'memory.characterSelection.frail_younger_sister.boundaries': 'repeated pleading / illness leverage / emotional coercion',
                     'memory.characterSelection.back': 'Pick again',
                     'memory.characterSelection.confirmGreeting': 'Use this vibe',
                     'memory.characterSelection.skip': 'Maybe later',
@@ -1743,6 +1901,15 @@ def test_settings_uses_i18n_copy_for_warning_and_user_visible_text(mock_page: Pa
         """
     )
 
+    settings_preset_url = mock_page.evaluate(
+        """
+        () => window.__requestLog.find((entry) => (
+            new URL(entry.url, window.location.origin).pathname === '/api/characters/persona-presets'
+        )).url
+        """
+    )
+    assert parse_qs(urlparse(settings_preset_url).query).get("include_legacy") == ["true"]
+
     expect(mock_page.locator("[data-role='eyebrow']")).to_have_text("Persona retune")
     expect(mock_page.locator("[data-role='title']")).to_have_text("Let me switch into a new little vibe for you.")
     expect(mock_page.locator("[data-role='hint']")).to_have_text(
@@ -1756,7 +1923,7 @@ def test_settings_uses_i18n_copy_for_warning_and_user_visible_text(mock_page: Pa
     )
     expect(mock_page.locator("[data-testid='character-personality-skip']")).to_have_text("Maybe later")
 
-    mock_page.locator("[data-testid='character-personality-preset-classic_genki']").click()
+    mock_page.locator("[data-testid='character-personality-preset-frail_younger_sister']").click()
     expect(mock_page.locator("[data-testid='character-personality-warning']:visible")).to_have_text(
         "Heads up, nya: switching my personality clears this character's recent chat context."
     )
@@ -1780,20 +1947,143 @@ def test_onboarding_uses_dynamic_character_name_and_split_detail_pills(mock_page
 
     expect(mock_page.locator(".cph-badge")).to_have_text("小天")
 
-    mock_page.locator("[data-testid='character-personality-preset-classic_genki']").click()
+    mock_page.locator("[data-testid='character-personality-preset-frail_younger_sister']").click()
 
-    expect(mock_page.locator("#previewTitleBadge")).to_have_text("经典元气猫娘")
+    expect(mock_page.locator("#previewTitleBadge")).to_have_text("病弱妹妹")
     expect(mock_page.locator(".preview-avatar")).to_have_text("小天")
 
-    speech_pills = mock_page.locator("#detailCatchphrases .detail-pill")
+    speech_pills = mock_page.locator("#detailSpeechHabits .detail-pill")
     expect(speech_pills).to_have_count(2)
-    expect(speech_pills.nth(0)).to_have_text("太棒了喵！")
-    expect(speech_pills.nth(1)).to_have_text("喵呜~")
+    expect(speech_pills.nth(0)).to_have_text("短句轻声")
+    expect(speech_pills.nth(1)).to_have_text("偶尔停顿")
 
     hobby_pills = mock_page.locator("#detailAtmosphere .detail-pill")
     expect(hobby_pills).to_have_count(2)
-    expect(hobby_pills.nth(0)).to_have_text("陪伴")
-    expect(hobby_pills.nth(1)).to_have_text("温暖")
+    expect(hobby_pills.nth(0)).to_have_text("热饮")
+    expect(hobby_pills.nth(1)).to_have_text("毛毯")
+
+
+@pytest.mark.frontend
+def test_onboarding_persona_grid_is_two_columns_on_desktop_and_one_on_mobile(mock_page: Page):
+    mock_page.set_viewport_size({"width": 1280, "height": 768})
+    _bootstrap_page(mock_page)
+    mock_page.evaluate(
+        """
+        () => {
+            window.universalTutorialManager.isTutorialRunning = false;
+            const originalFetch = window.fetch;
+            window.fetch = async function(url, options) {
+                if (new URL(String(url), window.location.origin).pathname === '/api/characters/persona-presets') {
+                    const ids = [
+                        'frail_younger_sister',
+                        'empathetic_older_sister',
+                        'sharp_tongued_junior',
+                        'chaotic_online_friend',
+                    ];
+                    return new Response(JSON.stringify({
+                        success: true,
+                        presets: ids.map((presetId, index) => ({
+                            preset_id: presetId,
+                            display_name: `人格${index + 1}`,
+                            summary_fallback: '简短的人格介绍文字',
+                            preview_line: '这是一句用于检查紧凑布局的开口预览。',
+                            profile: {'性格原型': `人格${index + 1}`},
+                        })),
+                    }), {status: 200, headers: {'Content-Type': 'application/json'}});
+                }
+                return originalFetch(url, options);
+            };
+        }
+        """
+    )
+    mock_page.add_style_tag(path=str(PROJECT_ROOT / "static" / "css" / "character_personality_onboarding.css"))
+    mock_page.add_script_tag(path=str(PROJECT_ROOT / "static" / "js" / "character_personality_onboarding.js"))
+    mock_page.evaluate("() => { window.CharacterPersonalityOnboarding.bootstrap(); }")
+
+    expect(mock_page.locator(".character-personality-card")).to_have_count(4)
+    desktop_columns = mock_page.locator(".character-personality-grid").evaluate(
+        "element => getComputedStyle(element).gridTemplateColumns.split(' ').length"
+    )
+    assert desktop_columns == 2
+    desktop_fit = mock_page.evaluate(
+        """
+        () => {
+            const shell = document.querySelector('.character-personality-shell');
+            const body = document.querySelector('.character-personality-body');
+            const actions = document.querySelector('.character-personality-actions');
+            return {
+                actionsBottom: actions.getBoundingClientRect().bottom,
+                viewportHeight: window.innerHeight,
+                shellClientHeight: shell.clientHeight,
+                shellScrollHeight: shell.scrollHeight,
+                shellOverflow: getComputedStyle(shell).overflow,
+                bodyOverflowY: getComputedStyle(body).overflowY,
+            };
+        }
+        """
+    )
+    layout_tolerance_px = 4
+    assert desktop_fit["actionsBottom"] <= desktop_fit["viewportHeight"] + layout_tolerance_px
+    assert desktop_fit["shellScrollHeight"] <= desktop_fit["shellClientHeight"] + layout_tolerance_px
+    assert desktop_fit["shellOverflow"] == "hidden"
+    assert desktop_fit["bodyOverflowY"] == "auto"
+
+    def assert_scroll_stays_inside_shell() -> None:
+        scroll_metrics = mock_page.evaluate(
+            """
+            () => {
+                const shell = document.querySelector('.character-personality-shell');
+                const body = document.querySelector('.character-personality-body');
+                const shellRect = shell.getBoundingClientRect();
+                const bodyRect = body.getBoundingClientRect();
+                body.scrollTop = body.scrollHeight;
+
+                return {
+                    viewportHeight: window.innerHeight,
+                    shellTop: shellRect.top,
+                    shellBottom: shellRect.bottom,
+                    bodyTop: bodyRect.top,
+                    bodyBottom: bodyRect.bottom,
+                    shellClientHeight: shell.clientHeight,
+                    shellScrollHeight: shell.scrollHeight,
+                    bodyClientHeight: body.clientHeight,
+                    bodyScrollHeight: body.scrollHeight,
+                    bodyScrollTop: body.scrollTop,
+                };
+            }
+            """
+        )
+        assert scroll_metrics["bodyScrollHeight"] > scroll_metrics["bodyClientHeight"]
+        assert scroll_metrics["bodyScrollTop"] > 0
+        assert scroll_metrics["shellScrollHeight"] <= (
+            scroll_metrics["shellClientHeight"] + layout_tolerance_px
+        )
+        assert scroll_metrics["shellTop"] >= -layout_tolerance_px
+        assert scroll_metrics["shellBottom"] <= (
+            scroll_metrics["viewportHeight"] + layout_tolerance_px
+        )
+        assert scroll_metrics["bodyTop"] >= (
+            scroll_metrics["shellTop"] - layout_tolerance_px
+        )
+        assert scroll_metrics["bodyBottom"] <= (
+            scroll_metrics["shellBottom"] + layout_tolerance_px
+        )
+
+    mock_page.set_viewport_size({"width": 1280, "height": 520})
+    assert_scroll_stays_inside_shell()
+
+    mock_page.set_viewport_size({"width": 820, "height": 900})
+    tablet_columns = mock_page.locator(".character-personality-grid").evaluate(
+        "element => getComputedStyle(element).gridTemplateColumns.split(' ').length"
+    )
+    assert tablet_columns == 2
+
+    mock_page.set_viewport_size({"width": 680, "height": 900})
+    mobile_columns = mock_page.locator(".character-personality-grid").evaluate(
+        "element => getComputedStyle(element).gridTemplateColumns.split(' ').length"
+    )
+    assert mobile_columns == 1
+    assert_scroll_stays_inside_shell()
 
 
 @pytest.mark.frontend
@@ -1814,9 +2104,9 @@ def test_character_panel_exposes_personality_actions(mock_page: Page, running_se
                 '昵称': '测试',
                 '_reserved': {
                     'persona_override': {
-                        'preset_id': 'classic_genki',
+                        'preset_id': 'frail_younger_sister',
                         'profile': {
-                            '性格原型': '经典元气猫娘'
+                            '性格原型': '病弱妹妹'
                         }
                     }
                 }
@@ -1946,7 +2236,7 @@ def test_character_panel_close_removes_personality_update_listener(mock_page: Pa
             await closeCatgirlPanel();
 
             window.dispatchEvent(new CustomEvent('neko:character-personality-updated', {
-                detail: { characterName: '测试角色', presetId: 'classic_genki' }
+                detail: { characterName: '测试角色', presetId: 'frail_younger_sister' }
             }));
 
             await new Promise(resolve => setTimeout(resolve, 50));
@@ -2008,7 +2298,7 @@ def test_character_panel_close_drops_late_personality_refresh_callback(mock_page
             }, false, host);
 
             window.dispatchEvent(new CustomEvent('neko:character-personality-updated', {
-                detail: { characterName: '测试角色', presetId: 'classic_genki' }
+                detail: { characterName: '测试角色', presetId: 'frail_younger_sister' }
             }));
 
             await new Promise(resolve => setTimeout(resolve, 20));
@@ -2017,7 +2307,7 @@ def test_character_panel_close_drops_late_personality_refresh_callback(mock_page
             await new Promise(resolve => setTimeout(resolve, 80));
 
             window.dispatchEvent(new CustomEvent('neko:character-personality-updated', {
-                detail: { characterName: '测试角色', presetId: 'classic_genki' }
+                detail: { characterName: '测试角色', presetId: 'frail_younger_sister' }
             }));
             await new Promise(resolve => setTimeout(resolve, 50));
 

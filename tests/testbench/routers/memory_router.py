@@ -34,17 +34,19 @@ Policy:
 Prerequisites (returned as HTTP 4xx when unmet):
     * No active session → 404 (same convention as Persona / Time).
     * Active session but ``session.persona.character_name`` empty → 409
-      ``NoCharacterSelected`` so the UI can prompt: "先在 Persona 或 Import
-      子页选一个角色".
+      ``NoCharacterSelected`` so the UI can prompt: "First select a character in the Persona or Import
+      sub-page".
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Response
 from pydantic import BaseModel
 
 from utils.config_manager import get_config_manager
@@ -57,6 +59,33 @@ from tests.testbench.chat_messages import (
 )
 from tests.testbench.logger import python_logger
 from tests.testbench.pipeline import memory_runner
+from tests.testbench.pipeline.memory_attribution import (
+    AttributionError,
+    attribute_all_text,
+    attribute_node,
+)
+from tests.testbench.pipeline.embedding_space import (
+    build_bridges,
+    build_cluster_labels,
+    build_clusters,
+    build_duplicates,
+    build_matrix,
+    build_neighbors,
+    build_space_view,
+    install_umap,
+)
+from tests.testbench.pipeline.memory_lineage import build_lineage_snapshot
+from tests.testbench.pipeline.memory_overview import (
+    build_ai_report,
+    build_overview,
+    judge_contradictions,
+)
+from tests.testbench.pipeline.memory_code_leads import build_code_leads
+from tests.testbench.pipeline.memory_export import (
+    MEMORY_EXPORT_DEFAULT_TIER,
+    MEMORY_EXPORT_TIERS,
+    export_memory_analysis,
+)
 from tests.testbench.pipeline.snapshot_store import capture_safe as _snapshot_capture
 from tests.testbench.session_store import (
     SessionConflictError,
@@ -293,6 +322,338 @@ async def list_memory_previews() -> dict[str, Any]:
     }
 
 
+@router.get("/lineage")
+async def get_memory_lineage() -> dict[str, Any]:
+    """Return the read-only memory lineage snapshot for the active character.
+
+    P27.1 — the single aggregation chokepoint behind the memory trace
+    workspace. Pure read: no session lock (safe to run alongside chat.send),
+    no disk writes, and ``time_indexed.db`` is opened read-only with its
+    handle released before returning (see
+    :mod:`tests.testbench.pipeline.conversation_corpus`).
+
+    Declared **before** the dynamic ``/{kind}`` route so the static path wins
+    route resolution (otherwise ``lineage`` is mis-parsed as a memory kind).
+
+    Errors mirror the rest of this router: 404 when there is no active
+    session, 409 ``NoCharacterSelected`` when the session has no character.
+    A character with no memory files yet returns an empty-but-valid snapshot
+    (``nodes: []``) rather than an error — the UI renders an empty canvas.
+    """
+    session = _require_session()
+    character = _require_character(session)
+    return build_lineage_snapshot(character)
+
+
+class LineageAttributePayload(BaseModel):
+    """Body for ``POST /api/memory/lineage/attribute`` (P27.3 Tier C).
+
+    ``node_id`` is the fact / reflection / persona-entry node the tester wants
+    to reverse-attribute to conversation turns. ``use_llm`` opts into the
+    memory-model precision pass (default off = free text similarity).
+    """
+
+    node_id: str
+    use_llm: bool = False
+    top_k: int = 6
+
+
+@router.post("/lineage/attribute")
+async def attribute_memory_lineage(
+    body: LineageAttributePayload,
+) -> dict[str, Any]:
+    """Tier C reverse attribution for one memory node (heuristic, dashed).
+
+    Read-only: never writes memory JSON (blueprint §1.3). The text-similarity
+    path takes no session lock; the ``use_llm`` path runs under
+    ``session_operation`` because it stamps ``session.last_llm_wire`` and calls
+    the memory model (serialize with other memory ops). All results are
+    ``confidence="heuristic"`` edges the UI draws dashed — never solid Tier A.
+
+    Errors: 404 no session / unknown node, 409 NoCharacterSelected /
+    NotAttributable / EmptyTarget, 422 missing node_id.
+    """
+    store = get_session_store()
+    try:
+        if body.use_llm:
+            async with store.session_operation("memory.lineage.attribute") as session:
+                character = _require_character(session)
+                return await attribute_node(
+                    session, character, body.node_id,
+                    use_llm=True, top_k=body.top_k,
+                )
+        session = _require_session()
+        character = _require_character(session)
+        return await attribute_node(
+            session, character, body.node_id,
+            use_llm=False, top_k=body.top_k,
+        )
+    except AttributionError as exc:
+        raise HTTPException(
+            status_code=exc.status,
+            detail={"error_type": exc.code, "message": exc.message},
+        ) from exc
+    except SessionConflictError as exc:
+        raise _wrap_conflict(exc) from exc
+
+
+@router.post("/lineage/attribute_all")
+async def attribute_memory_lineage_all() -> dict[str, Any]:
+    """One-click Tier C: text-similarity reverse-attribution for ALL nodes.
+
+    Runs the deterministic text-similarity pass over every fact / reflection /
+    persona entry at once so the graph shows its (heuristic, dashed) provenance
+    by default instead of forcing the tester to click each node. Read-only (no
+    LLM, no session lock, no disk writes) — every edge is ``heuristic``, never
+    drawn solid.
+
+    Errors: 404 no active session, 409 NoCharacterSelected.
+    """
+    session = _require_session()
+    character = _require_character(session)
+    # attribute_all_text() is sync, O(facts × turns) text-similarity work;
+    # offload it so this route doesn't block the event loop.
+    return await asyncio.to_thread(attribute_all_text, character)
+
+
+@router.get("/embedding/space")
+async def get_embedding_space(reducer: str = "pca") -> dict[str, Any]:
+    """P28.1 — embedding-space 2D scatter plot + health check (①+②).
+
+    Read-only: reads the active character's facts/reflections/persona vectors
+    from disk and returns ``{points, meta}`` (PCA 2D coords + health counts).
+    No model load, no writes. 404 no session / 409 NoCharacterSelected. A
+    character with no embedded vectors returns an empty-but-described payload
+    (``meta`` health counts drive the UI's "no vectors" empty state).
+
+    Declared before ``/{kind}`` so the static path wins route resolution.
+    """  # noqa: DOCSTRING_CJK
+    session = _require_session()
+    character = _require_character(session)
+    # CPU-bound (PCA/UMAP/numpy over up to thousands of vectors). Run off the
+    # event loop so a slow reduction can't freeze every other HTTP request
+    # (other sub-pages / workspaces would otherwise all hang on "加载中", loading).
+    return await asyncio.to_thread(build_space_view, character, reducer=reducer)
+
+
+@router.get("/embedding/neighbors")
+async def get_embedding_neighbors(id: str, k: int = 10) -> dict[str, Any]:
+    """P28.1 — cosine top-k nearest memories for one entry (③ nearest neighbors)."""  # noqa: DOCSTRING_CJK
+    session = _require_session()
+    character = _require_character(session)
+    return await asyncio.to_thread(build_neighbors, character, id, k=k)
+
+
+@router.get("/embedding/bridges")
+async def get_embedding_bridges(top_k: int = 3) -> dict[str, Any]:
+    """P28.1 — semantic vs structural sources (⑥, linked to P27).
+
+    Per reflection: semantic-nearest facts (cosine) vs declared
+    ``source_fact_ids``. Read-only.
+    """  # noqa: DOCSTRING_CJK
+    session = _require_session()
+    character = _require_character(session)
+    return await asyncio.to_thread(build_bridges, character, top_k=top_k)
+
+
+@router.get("/embedding/duplicates")
+async def get_embedding_duplicates(threshold: float = 0.95) -> dict[str, Any]:
+    """P28.2 — near-duplicate pairs (④): entry pairs with cosine ≥ threshold (across types). Read-only."""  # noqa: DOCSTRING_CJK
+    session = _require_session()
+    character = _require_character(session)
+    return await asyncio.to_thread(build_duplicates, character, threshold=threshold)
+
+
+@router.get("/embedding/matrix")
+async def get_embedding_matrix(ids: str = "") -> dict[str, Any]:
+    """P28.3 — similarity matrix (⑤, subset drilldown).
+
+    ``ids`` is a comma-separated subset (empty → whole primary space, clipped
+    to MATRIX_MAX_N). Returns an NxN cosine matrix reordered by seriation.
+    Read-only.
+    """  # noqa: DOCSTRING_CJK
+    session = _require_session()
+    character = _require_character(session)
+    id_list = [s for s in ids.split(",") if s] if ids else None
+    return await asyncio.to_thread(build_matrix, character, ids=id_list)
+
+
+@router.post("/embedding/enable_umap")
+async def post_enable_umap() -> dict[str, Any]:
+    """P28.4 — on-demand online install of ``umap-learn`` (dimensionality-reduction upgrade).
+
+    Environment-level capability toggle (not character-specific), so it does
+    NOT require a session. Runs ``pip install`` off the event loop so the
+    server stays responsive during the (possibly minutes-long) install.
+    Always returns ``{ok, installed, reducer_available, log}`` — never 500s
+    on a failed install; the UI shows ``log`` and stays on PCA.
+    """  # noqa: DOCSTRING_CJK
+    return await asyncio.to_thread(install_umap)
+
+
+@router.get("/embedding/clusters")
+async def get_embedding_clusters() -> dict[str, Any]:
+    """P28.5 — auto-cluster the scatter (no LLM).
+
+    Clusters the primary vector space in its original high-dim cosine geometry
+    (HDBSCAN preferred, numpy connected-components fallback) and returns per-point
+    cluster ids + per-cluster medoid summaries. Read-only, deterministic.
+    """
+    session = _require_session()
+    character = _require_character(session)
+    return await asyncio.to_thread(build_clusters, character)
+
+
+@router.post("/embedding/cluster_labels")
+async def post_embedding_cluster_labels() -> dict[str, Any]:
+    """P28.5 — LLM-name each cluster (refine cluster labels on demand).
+
+    Runs under ``session_operation`` (stamps ``memory.llm`` wire + calls the
+    memory model). Degrades to medoid labels on any LLM failure — never 500s.
+    """  # noqa: DOCSTRING_CJK
+    store = get_session_store()
+    try:
+        async with store.session_operation("memory.embedding.cluster_label") as session:
+            character = _require_character(session)
+            return await build_cluster_labels(session, character)
+    except SessionConflictError as exc:
+        raise _wrap_conflict(exc) from exc
+
+
+@router.get("/overview")
+async def get_memory_overview() -> dict[str, Any]:
+    """P29.1 — read-only memory-system overview (cards + findings + attention items + conclusion confidence).
+
+    Aggregates the P27 lineage snapshot and the P28 embedding space **once each**
+    into a dashboard payload. Read-only; CPU-bound (it reuses the vector views),
+    so it runs off the event loop (P28.5 blocking lesson).
+    """  # noqa: DOCSTRING_CJK
+    session = _require_session()
+    character = _require_character(session)
+    return await asyncio.to_thread(build_overview, character)
+
+
+@router.get("/code_leads")
+async def get_memory_code_leads() -> dict[str, Any]:
+    """P32 — read-only code leads (developers): map mechanical-invariant findings back to investigation hints in the main application's memory code.
+
+    Mirrors ``/overview``: reuses ``build_overview`` once + two deterministic
+    file scans (ID-DUP / EVT-DUP). Read-only, no LLM, takes NO session lock
+    (avoids the autosave side effect — LESSONS L63). CPU-bound → off the event
+    loop. Every lead is a navigational hint, never a bug verdict (blueprint P32).
+    """  # noqa: DOCSTRING_CJK
+    session = _require_session()
+    character = _require_character(session)
+    return await asyncio.to_thread(build_code_leads, character)
+
+
+@router.post("/overview/ai_report")
+async def post_memory_overview_ai_report() -> dict[str, Any]:
+    """P29.2 — LLM health-check report (on demand). Runs under ``session_operation`` (stamps
+    ``memory.llm`` wire). Degrades to ``method='unavailable'`` + actionable
+    reason on any LLM/config failure — never 500s."""  # noqa: DOCSTRING_CJK
+    store = get_session_store()
+    try:
+        async with store.session_operation("memory.overview.ai_report") as session:
+            character = _require_character(session)
+            return await build_ai_report(session, character)
+    except SessionConflictError as exc:
+        raise _wrap_conflict(exc) from exc
+
+
+@router.post("/overview/contradictions")
+async def post_memory_overview_contradictions() -> dict[str, Any]:
+    """P29.2 — L2 contradiction NLI adjudication (on demand, for L1 candidates). Runs under ``session_operation``
+    (stamps ``memory.llm`` wire). Degrades to candidates-only on failure."""  # noqa: DOCSTRING_CJK
+    store = get_session_store()
+    try:
+        async with store.session_operation("memory.overview.contradictions") as session:
+            character = _require_character(session)
+            return await judge_contradictions(session, character)
+    except SessionConflictError as exc:
+        raise _wrap_conflict(exc) from exc
+
+
+def _content_disposition(filename: str) -> str:
+    """Build a ``Content-Disposition`` that survives a non-ASCII (Chinese) name.
+
+    The friendly download name (``NEKO testbench_记忆导出_...``) contains CJK,
+    which a bare ``filename="..."`` cannot carry (header is latin-1). Emit both:
+    an ASCII fallback (``filename=``, for ancient clients) plus the RFC 5987
+    ``filename*=UTF-8''<percent-encoded>`` that every modern browser prefers.
+    """  # noqa: DOCSTRING_CJK
+    ascii_fallback = filename.encode("ascii", "ignore").decode("ascii").strip()
+    # A stray double quote in the fallback would prematurely close filename="…"
+    # and corrupt the whole header, so neutralise it before interpolation.
+    ascii_fallback = ascii_fallback.replace('"', "_")
+    if not ascii_fallback or ascii_fallback in {".zip", "_.zip"}:
+        ascii_fallback = "NEKO_testbench_memory_export.zip"
+    quoted = quote(filename, safe="")
+    return f"attachment; filename=\"{ascii_fallback}\"; filename*=UTF-8''{quoted}"
+
+
+@router.get("/export")
+async def export_memory_analysis_zip(
+    redaction: str = MEMORY_EXPORT_DEFAULT_TIER,
+    include_corpus: bool = True,
+) -> Response:
+    """P30 — one-click redacted memory-analysis export (shareable ZIP).
+
+    Packs the character's redacted raw memory (``raw_data/``) plus the derived
+    analysis conclusions (``analysis/``) into a single ZIP. Read-only, no LLM,
+    no temp file on disk. CPU-bound (reuses the vector views) so it runs off
+    the event loop (P28.5 blocking lesson). Declared before ``/{kind}`` so the static
+    path wins route resolution.
+
+    Query:
+        * ``redaction`` ∈ {minimal, standard, strict} (default standard).
+        * ``include_corpus`` — include the conversation corpus (default true).
+
+    Errors: 400 ``UnknownRedactionTier``; 404 ``NoActiveSession``;
+    409 ``NoCharacterSelected``.
+
+    Pure read — takes NO session lock (mirrors ``/overview`` / ``/lineage``,
+    which read the same aggregators concurrently with chat.send). Deliberately
+    avoids ``session_operation`` so the export triggers no autosave / no write
+    side-effect (blueprint §1.3 "read only, no writes"). No temp file on disk;
+    the ZIP is streamed straight from memory.
+    """  # noqa: DOCSTRING_CJK
+    if redaction not in MEMORY_EXPORT_TIERS:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error_type": "UnknownRedactionTier",
+                "message": (
+                    f"未知脱敏档位 {redaction!r}; 合法值: {sorted(MEMORY_EXPORT_TIERS)}"
+                ),
+            },
+        )
+    session = _require_session()
+    character = _require_character(session)
+    persona = session.persona or {}
+    identity_names = {
+        "character_name": persona.get("character_name"),
+        "master_name": persona.get("master_name"),
+    }
+    zip_bytes, filename = await asyncio.to_thread(
+        export_memory_analysis,
+        character,
+        tier=redaction,
+        include_corpus=include_corpus,
+        identity_names=identity_names,
+    )
+    python_logger().info(
+        "memory_router: exported memory analysis "
+        "(character=%s, tier=%s, corpus=%s, bytes=%d) → %s",
+        character, redaction, include_corpus, len(zip_bytes), filename,
+    )
+    return Response(
+        content=zip_bytes,
+        media_type="application/zip",
+        headers={"Content-Disposition": _content_disposition(filename)},
+    )
+
+
 @router.get("/{kind}")
 async def read_memory(kind: str) -> dict[str, Any]:
     """Return the JSON content of one memory file + metadata envelope.
@@ -344,45 +705,45 @@ async def write_memory(kind: str, body: MemoryWritePayload) -> dict[str, Any]:
 
 # ── recent.json shortcut: import current session.messages ────────────
 #
-# P25 Day 2 polish r6 (2026-04-23): tester 反馈 "把测试区现有对话一键
-# 落盘到最近对话记忆" 是高频操作 — 之前需要手动把 session.messages 转
-# LangChain 规范 ({type:human|ai|system, data:{content}}) 再走
-# PUT /api/memory/recent. 每次都要开 DevTools 拼 JSON 太硬核.
+# P25 Day 2 polish r6 (2026-04-23): testers frequently need one-click persistence of existing testbench
+# conversations into recent memory. Previously they manually converted session.messages to
+# LangChain format ({type:human|ai|system, data:{content}}), then invoked
+# PUT /api/memory/recent. Opening DevTools to assemble JSON each time was too technical.
 #
-# 本端点是 **raw dump** 通道 (不跑 LLM 压缩, 也不抽事实), 和
-# `memory.trigger/recent.compress` 平行共存:
-#     * /memory/recent/import_from_session  →  直接落 session.messages
-#       (user/assistant/system 三类, 按时间顺序, 不走 LLM).
-#     * /memory/trigger/recent.compress     →  跑 LLM 压缩旧记录, 再写
-#       (preview-then-commit 两阶段).
+# This endpoint is a **raw dump** channel, without LLM compression or fact extraction, coexisting with
+# `memory.trigger/recent.compress`:
+#     * /memory/recent/import_from_session -> persist session.messages directly
+#       (user/assistant/system, in chronological order, without LLM calls).
+#     * /memory/trigger/recent.compress -> compress old records through the LLM, then write
+#       (two phases: preview-then-commit).
 #
-# 过滤规则:
-#     * ``source == external_event_banner`` 跳过 — banner 是 UI-only
-#       视觉标记, 不是真实对话 (prompt_builder 在发送 LLM 前也会过滤,
-#       见 chat_messages.py L52-L54); 塞进 recent.json 会让下一次
-#       /chat/send 把 banner 再注回 wire, 造成语义污染.
-#     * role ∉ {user, assistant, system} 跳过 — LangChain
-#       messages_to_dict 只认这三类; 预留的 simuser/script/auto 是
-#       source 标签, role 本身必然是 user/assistant, 不会命中这条.
-#     * content 为空字符串跳过 — recent.json 里的空 content 毫无记忆
-#       价值, 反而会让 compress 阶段误把它当作 "用户沉默一拍".
+# Filtering rules:
+#     * Skip ``source == external_event_banner``: banners are UI-only
+#       visual markers, not actual conversation (prompt_builder also filters them before sending to the LLM;
+#       see chat_messages.py L52-L54). Writing them into recent.json would reinject them into wire on the next
+#       /chat/send, polluting semantics.
+#     * Skip role outside {user, assistant, system}: LangChain
+#       messages_to_dict recognizes only these three. Reserved simuser/script/auto values are
+#       source labels whose roles are necessarily user/assistant, so this rule does not catch them.
+#     * Skip empty-string content: empty content in recent.json has no memory
+#       value and could make compression mistake it for a moment of user silence.
 #
-# 写策略 (body.mode):
-#     * "append" (默认) — 读 existing recent.json, 新消息追加到尾部,
-#       然后整体原子写回; 不去重 (简单对话重复导入就是 tester 自己
-#       的意图).
-#     * "replace" — 不读 existing, 直接用本轮消息覆盖整个文件.
+# Write policy (body.mode):
+#     * "append" (default): read existing recent.json, append new messages,
+#       then atomically write the whole file; no deduplication (reimporting simple conversations is the tester's
+#       own intent).
+#     * "replace": overwrite the whole file with this pass's messages without reading existing data.
 #
-# 单写 choke-point: 走 ``session_operation`` 锁, 同 write_memory.
+# Single write choke point: use the ``session_operation`` lock, as write_memory does.
 
 
 class RecentImportFromSessionPayload(BaseModel):
     """Body for ``POST /api/memory/recent/import_from_session``.
 
     ``mode``:
-        * ``"append"`` (default) — 原子读 + 合并 + 写回; 旧条目保留, 新
-          条目追加到尾部.
-        * ``"replace"`` — 直接用本轮 session.messages 覆盖整个文件.
+        * ``"append"`` (default) — atomic read + merge + write-back; retain old entries, append new
+          entries to the end.
+        * ``"replace"`` — overwrite the whole file directly with this pass's session.messages.
     """
 
     mode: str = "append"
@@ -439,7 +800,7 @@ async def import_recent_from_session(
 ) -> dict[str, Any]:
     """One-click dump ``session.messages`` into ``recent.json``.
 
-    Shortcut for the Chat workspace "把当前对话内容添加到最近对话记忆"
+    Shortcut for the Chat workspace "Add the current conversation to recent conversation memory"
     button. See module-level comment "recent.json shortcut" for the full
     policy (filtering rules, append vs replace semantics).
 
@@ -454,7 +815,7 @@ async def import_recent_from_session(
     Error mapping:
         * 400 ``InvalidMode``        — ``mode`` ∉ {append, replace}.
         * 404 ``NoActiveSession``    — no session (standard).
-        * 409 ``NoCharacterSelected``— character_name 为空.
+        * 409 ``NoCharacterSelected``— character_name is empty.
         * 409 ``NoMessagesToImport`` — filtered list is empty (tester
           pressed button with empty chat, or only banners).
         * 409 ``SessionBusy``        — another op holds the session lock.
@@ -473,7 +834,7 @@ async def import_recent_from_session(
 
     # Pre-flight: no session → clean 404 instead of letting session_operation
     # raise raw LookupError (which the global handler maps to opaque 500).
-    # UI toast for this path is "先创建会话", so keeping the error actionable
+    # UI toast for this path is "先创建会话" (create a session first), so keeping the error actionable
     # matters; the server's existing memory.trigger handlers accept a 500
     # here for historical reasons (see PROGRESS.md L406), but new endpoints
     # should be crisp.
@@ -666,7 +1027,7 @@ async def prompt_preview_memory_op(
     """Show what wire ``op`` would send to the memory LLM, without calling it.
 
     P25 r7 — the Chat page's Preview Panel is now chat-only; memory LLM
-    wires are exposed here so the Memory sub-page [预览 prompt] button
+    wires are exposed here so the Memory sub-page [Preview prompt] button
     can fetch the wire without paying the 2-10 s LLM round trip.
 
     Behavior:

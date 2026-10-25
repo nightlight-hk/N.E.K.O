@@ -1,18 +1,34 @@
 # -*- coding: utf-8 -*-
+# Copyright 2025-2026 Project N.E.K.O. Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 Evidence math and derived-status helpers (docs/design/memory-evidence-rfc.md).
 
-本模块只放纯函数 + 背景辅助，**不放常量**（所有常量统一在
-`config/__init__.py`，RFC §3.8.2 与 §7 全局约束）。
+This module holds pure functions + background helpers only — **no constants**
+(all constants live in `config/__init__.py`, RFC §3.8.2 and the §7 global
+constraints).
 
-核心设计（RFC §3.1.1 / §3.5.1）：
-- Decay 是**读时现算**，不是 state transition；调用方每次读 entry 时
-  通过 `evidence_score()` / `effective_*()` 拿到 effective 值。
-- rein 和 disp 有各自独立的时间戳 `rein_last_signal_at` /
-  `disp_last_signal_at`；一侧 signal 不影响另一侧的衰减时钟（§3.1.1
-  末段的场景说明）。
-- `protected=True` 的 entry（character_card 来源）evidence_score 返回
-  `float('inf')`——永不被淘汰 / 归档 / budget 挤出。
+Core design (RFC §3.1.1 / §3.5.1):
+- Decay is **computed at read time**, not a state transition; each time a
+  caller reads an entry it obtains effective values via `evidence_score()` /
+  `effective_*()`.
+- rein and disp have independent timestamps `rein_last_signal_at` /
+  `disp_last_signal_at`; a signal on one side does not affect the other
+  side's decay clock (scenario described at the end of §3.1.1).
+- Entries with `protected=True` (character_card source) get `float('inf')`
+  from evidence_score — never evicted / archived / squeezed out by budget.
 """
 from __future__ import annotations
 
@@ -53,13 +69,13 @@ __all__ = [
 _SOURCE_USER_FACT = "user_fact"
 
 
-# 用 tuple 定义更紧凑的分档表，避免 if 链；[(importance_threshold, rein), ...]
-# 含义：importance >= threshold → 得到对应的 initial rein seed；
-# 从高到低第一条命中的即为结果，其余跳过。
-# RFC §3.1.2 本来让所有新 reflection 从 score=0 起步；这里开了个例外：
-# 通过 fact importance 给"关键节点"型 reflection（昵称/身份/用户明确说请记住）
-# 一个初始鼓励，使其可以用更少 user_fact reinforces 穿越 CONFIRMED/PROMOTED。
-# 阈值梯度（用户指定）：10→0.8, 9→0.6, 8→0.4, 7→0.2, ≤6→0.0
+# Compact tuple-based tiers avoid an if chain: [(importance_threshold, rein), ...].
+# importance >= threshold yields that initial reinforcement seed;
+# use the first descending match and skip the rest.
+# RFC section 3.1.2 originally started all reflections at score=0; this exception
+# uses fact importance to encourage pivotal reflections (nicknames/identity/explicit remember requests)
+# so fewer user_fact reinforcements are needed to cross CONFIRMED/PROMOTED thresholds.
+# User-specified thresholds: 10->0.8, 9->0.6, 8->0.4, 7->0.2, <=6->0.0.
 _IMPORTANCE_TO_INITIAL_REIN: tuple[tuple[int, float], ...] = (
     (10, 0.8),
     (9, 0.6),
@@ -73,14 +89,14 @@ def initial_reinforcement_from_importance(max_importance: int) -> float:
     initial `reinforcement` seed.
 
     Rationale: high-importance facts (nicknames, IDs, critical relationship
-    markers, or user-flagged "请记住 X") should fast-track through the
-    pending→confirmed→promoted pipeline without waiting for multiple
+    markers, or user-flagged "请记住 X" / "remember X") should fast-track through
+    the pending→confirmed→promoted pipeline without waiting for multiple
     natural reinforcement cycles. Low-importance noise still starts at 0.
 
     Thresholds are MAX-based (not avg / sum) because one high-importance
     fact in the batch is enough to mark the synthesized reflection as
     important; averaging would dilute that signal.
-    """
+    """  # noqa: DOCSTRING_CJK
     try:
         imp = int(max_importance)
     except (ValueError, TypeError):
@@ -101,7 +117,7 @@ def _age_days(ts: str | None, now: datetime) -> float:
         return 0.0
     delta = (now - parsed).total_seconds()
     if delta <= 0:
-        # 时钟回拨或时间戳来自未来（迁移 / 测试）：age=0 不衰减
+        # Clock rollback or future timestamps (migration/tests): age=0, without decay.
         return 0.0
     return delta / 86400
 
@@ -109,8 +125,9 @@ def _age_days(ts: str | None, now: datetime) -> float:
 def effective_reinforcement(entry: dict, now: datetime) -> float:
     """Compute decayed reinforcement value at `now`.
 
-    独立时间戳：`rein_last_signal_at` 只在 reinforcement 侧被触动时重置；
-    `disp` 事件不影响本函数计算（§3.1.1）。
+    Independent timestamps: `rein_last_signal_at` is only reset when the
+    reinforcement side is touched; `disp` events do not affect this
+    computation (§3.1.1).
     """
     r = float(entry.get("reinforcement", 0.0) or 0.0)
     if r == 0.0:
@@ -135,8 +152,8 @@ def effective_disputation(entry: dict, now: datetime) -> float:
 def evidence_score(entry: dict, now: datetime) -> float:
     """Net evidence strength (+rein -disp) at `now`.
 
-    `protected=True` 的 entry 返回 `float('inf')`——character_card 条目
-    永不被归档 / 预算淘汰，语义见 §3.5.7。
+    Entries with `protected=True` return `float('inf')` — character_card
+    entries are never archived / budget-evicted; semantics in §3.5.7.
     """
     if entry.get("protected"):
         return float("inf")
@@ -172,16 +189,17 @@ def compute_evidence_snapshot(
     the same combo logic for user_fact reinforces.
 
     Independent clocks (RFC §3.1.1):
-      只重置被触动的一侧的 last_signal_at。
-    Disputation非负：
-      §3.1.5 只有 reinforcement 允许为负，disputation 永远 >= 0。
-    User_fact combo bonus (RFC §3.1.8)：
-      base rein delta 0.5；累计 user_fact reinforce count 超过
-      USER_FACT_REINFORCE_COMBO_THRESHOLD（默认 2）后，每条新 signal
-      额外加 USER_FACT_REINFORCE_COMBO_BONUS（默认 0.5）。
-      只对 `source='user_fact'` + `delta.reinforcement > 0` 触发。
-      Count 永不清零（combo 是终生累计，配合 §3.5.3 "归档更积极"对称
-      思路：正向累计也终生生效，但 decay 仍按 rein_last_signal_at 发生）。
+      only the touched side's last_signal_at is reset.
+    Disputation is non-negative:
+      per §3.1.5 only reinforcement may go negative; disputation is always >= 0.
+    User_fact combo bonus (RFC §3.1.8):
+      base rein delta 0.5; once the cumulative user_fact reinforce count
+      exceeds USER_FACT_REINFORCE_COMBO_THRESHOLD (default 2), each new
+      signal adds an extra USER_FACT_REINFORCE_COMBO_BONUS (default 0.5).
+      Triggers only for `source='user_fact'` + `delta.reinforcement > 0`.
+      The count is never reset (the combo accumulates for life, symmetric
+      with §3.5.3's "archive more aggressively" idea: positive accumulation
+      is also lifelong, while decay still follows rein_last_signal_at).
 
     Returns a dict containing:
       reinforcement, disputation, rein_last_signal_at, disp_last_signal_at,
@@ -196,7 +214,7 @@ def compute_evidence_snapshot(
 
     # Combo logic: only on user_fact reinforces (indirect positive signal).
     # Counter increments BEFORE threshold check so the threshold reads as
-    # "this is the N-th signal"；第 3 条起满足 count > 2 条件。
+    # "This is the N-th signal"; count > 2 begins with the third signal.
     new_count = int(entry.get("user_fact_reinforce_count", 0) or 0)
     if source == _SOURCE_USER_FACT and rein_delta > 0:
         new_count += 1
@@ -218,15 +236,18 @@ def compute_evidence_snapshot(
 def maybe_mark_sub_zero(entry: dict, now: datetime) -> bool:
     """Background-loop helper; called by `_periodic_archive_sweep_loop`.
 
-    PR-1 SCAFFOLD: the signature is frozen here for forward-compat; real
-    归档触发逻辑（§3.5.3）在 PR-2 补完 + wire 进背景循环。当前实现只做：
-    - `score >= 0` → 不动（累计不回退，"归档更积极"——§3.5.3）
-    - `score < 0` 且今天还没累计过 → `sub_zero_days += 1` +
+    PR-1 SCAFFOLD: the signature is frozen here for forward-compat; the real
+    archive-trigger logic (§3.5.3) lands in PR-2 along with wiring into the
+    background loop. The current implementation only does:
+    - `score >= 0` → untouched (the tally never rolls back; "archive more
+      aggressively" — §3.5.3)
+    - `score < 0` and not yet counted today → `sub_zero_days += 1` +
       `sub_zero_last_increment_date = today`
 
     Returns True if `sub_zero_days` was incremented this call.
 
-    Protected 条目：永远 return False 不累加（evidence_score 返回 inf）。
+    Protected entries: always return False without incrementing
+    (evidence_score returns inf).
     """
     if entry.get("protected"):
         return False

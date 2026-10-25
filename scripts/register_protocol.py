@@ -1,13 +1,27 @@
-"""注册 neko:// URI Scheme 协议处理器。
+# Copyright 2025-2026 Project N.E.K.O. Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
-各平台注册方式：
-- Windows: 写入注册表 HKCU\\Software\\Classes\\neko
-- macOS: 生成 .app bundle 的 Info.plist（需要 .app 结构）
-- Linux: 创建 .desktop 文件并注册 MIME type
+"""Register the neko:// URI scheme protocol handler.
 
-使用：
-  python scripts/register_protocol.py          # 注册
-  python scripts/register_protocol.py --remove # 移除
+Per-platform registration:
+- Windows: write to the registry HKCU\\Software\\Classes\\neko
+- macOS: generate a .app bundle Info.plist (requires the .app structure)
+- Linux: create a .desktop file and register the MIME type
+
+Usage:
+  python scripts/register_protocol.py          # register
+  python scripts/register_protocol.py --remove # remove
 """
 
 from __future__ import annotations
@@ -17,13 +31,13 @@ import platform
 import sys
 from pathlib import Path
 
-# N.E.K.O 项目根目录
+# N.E.K.O project root.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-# Python 解释器路径
+# Python interpreter path.
 PYTHON_EXE = sys.executable
-# 协议处理器模块
+# Protocol-handler module.
 HANDLER_MODULE = "plugin.server.market_protocol_handler"
-# 协议处理命令
+# Protocol-handler command.
 HANDLER_CMD = f'"{PYTHON_EXE}" -m {HANDLER_MODULE} "%1"'
 
 
@@ -63,7 +77,7 @@ def _posix_shell_quote(value: str) -> str:
 
 
 def register() -> bool:
-    """注册 neko:// 协议。"""
+    """Register the neko:// protocol."""
     system = platform.system()
     if system == "Windows":
         return _register_windows()
@@ -77,7 +91,7 @@ def register() -> bool:
 
 
 def remove() -> bool:
-    """移除 neko:// 协议注册。"""
+    """Remove the neko:// protocol registration."""
     system = platform.system()
     if system == "Windows":
         return _remove_windows()
@@ -93,22 +107,22 @@ def remove() -> bool:
 # ─── Windows ───────────────────────────────────────────────────────
 
 def _register_windows() -> bool:
-    """Windows: 写入 HKCU\\Software\\Classes\\neko"""
+    """Windows: write HKCU\\Software\\Classes\\neko"""
     try:
         import winreg
 
-        # 创建 neko 键
+        # Create the neko key.
         key_path = r"Software\Classes\neko"
         with winreg.CreateKey(winreg.HKEY_CURRENT_USER, key_path) as key:
             winreg.SetValueEx(key, "", 0, winreg.REG_SZ, "N.E.K.O Protocol")
             winreg.SetValueEx(key, "URL Protocol", 0, winreg.REG_SZ, "")
 
-        # 创建 DefaultIcon
+        # Create DefaultIcon.
         icon_path = str(PROJECT_ROOT / "static" / "favicon.ico")
         with winreg.CreateKey(winreg.HKEY_CURRENT_USER, f"{key_path}\\DefaultIcon") as key:
             winreg.SetValueEx(key, "", 0, winreg.REG_SZ, icon_path)
 
-        # 创建 shell\open\command
+        # Create shell\open\command.
         #
         # ``set "PYTHONPATH=...;%PYTHONPATH%"`` quotes the assignment so spaces
         # in the repo path are tolerated, and cmd.exe strips those outer
@@ -135,7 +149,7 @@ def _register_windows() -> bool:
 
 
 def _remove_windows() -> bool:
-    """Windows: 删除注册表键。"""
+    """Windows: delete the registry key."""
     try:
         import winreg
 
@@ -164,7 +178,7 @@ def _remove_windows() -> bool:
 # ─── macOS ─────────────────────────────────────────────────────────
 
 def _register_macos() -> bool:
-    """macOS: 创建 helper .app 并注册 URL scheme。"""
+    """macOS: create the helper .app and register the URL scheme."""
     app_dir = Path.home() / "Applications" / "NekoProtocolHandler.app"
     contents = app_dir / "Contents"
     macos_dir = contents / "MacOS"
@@ -200,7 +214,7 @@ def _register_macos() -> bool:
 """
     (contents / "Info.plist").write_text(plist_content)
 
-    # 可执行脚本
+    # Executable script.
     quoted_project_root = _posix_shell_quote(str(PROJECT_ROOT))
     quoted_python_exe = _posix_shell_quote(PYTHON_EXE)
     handler_script = f"""#!/bin/bash
@@ -212,7 +226,7 @@ exec {quoted_python_exe} -m {HANDLER_MODULE} "$@"
     handler_path.write_text(handler_script)
     handler_path.chmod(0o755)
 
-    # 注册 URL scheme
+    # Register the URL scheme.
     os.system("/System/Library/Frameworks/CoreServices.framework/Frameworks/"
               "LaunchServices.framework/Support/lsregister "
               f"-R '{app_dir}'")
@@ -223,7 +237,7 @@ exec {quoted_python_exe} -m {HANDLER_MODULE} "$@"
 
 
 def _remove_macos() -> bool:
-    """macOS: 删除 helper app。"""
+    """macOS: delete the helper app."""
     import shutil
     app_dir = Path.home() / "Applications" / "NekoProtocolHandler.app"
     if app_dir.exists():
@@ -235,7 +249,7 @@ def _remove_macos() -> bool:
 # ─── Linux ─────────────────────────────────────────────────────────
 
 def _register_linux() -> bool:
-    """Linux: 创建 .desktop 文件并注册 MIME type。"""
+    """Linux: create the .desktop file and register the MIME type."""
     desktop_dir = Path.home() / ".local" / "share" / "applications"
     desktop_dir.mkdir(parents=True, exist_ok=True)
 
@@ -252,9 +266,9 @@ MimeType=x-scheme-handler/neko;
 """
     desktop_file.write_text(desktop_content)
 
-    # 注册 MIME type
+    # Register the MIME type.
     os.system(f"xdg-mime default neko-protocol-handler.desktop x-scheme-handler/neko")
-    # 更新 desktop database
+    # Update the desktop database.
     os.system(f"update-desktop-database {desktop_dir} 2>/dev/null || true")
 
     print(f"[OK] Registered neko:// protocol (Linux)")
@@ -263,7 +277,7 @@ MimeType=x-scheme-handler/neko;
 
 
 def _remove_linux() -> bool:
-    """Linux: 删除 .desktop 文件。"""
+    """Linux: delete the .desktop file."""
     desktop_file = Path.home() / ".local" / "share" / "applications" / "neko-protocol-handler.desktop"
     if desktop_file.exists():
         desktop_file.unlink()
@@ -272,7 +286,7 @@ def _remove_linux() -> bool:
     return True
 
 
-# ─── 入口 ──────────────────────────────────────────────────────────
+# -- Entry point --
 
 if __name__ == "__main__":
     if "--remove" in sys.argv or "--unregister" in sys.argv:

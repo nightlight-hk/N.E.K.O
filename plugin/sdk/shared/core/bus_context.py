@@ -11,6 +11,7 @@ import inspect
 from dataclasses import dataclass, field
 from typing import Any, Callable, Generic, Iterable, Mapping, Protocol, TypeVar, cast
 
+from plugin._types.bus_sort import bus_sort_key
 from plugin.sdk.shared.models import Err, Ok
 
 
@@ -274,6 +275,74 @@ class SdkBusConversationRecord:
         return self.conversation_id or f"{self.lanlan_name or ''}:{self.timestamp or 0}"
 
     def version(self) -> int | None:
+        return int(self.timestamp) if self.timestamp is not None else None
+
+
+@dataclass(slots=True)
+class SdkBusFrameRecord:
+    """One frame the host already pushed to the model provider.
+
+    Lossy by contract: see ``plugin/core/bus/frames.py``. The base64 image is
+    carried once; there is no raw-bytes twin to read.
+    """
+
+    frame_id: str | None = None
+    type: str = "provider_frame"
+    timestamp: float | None = None
+    # Keep both names with the same value: ``timestamp`` is the shared sorting field
+    # for all bus records, while ``captured_at`` is the public field for frames (present on core's FrameRecord
+    # and documented in the SDK). Collapsing it to timestamp alone would cause plugins written according to the docs to
+    # AttributeError。
+    captured_at: float | None = None
+    source: str | None = None
+    image_base64: str | None = None
+    mime: str | None = None
+    turn_id: str | None = None
+    generation: int | None = None
+    lanlan_name: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_raw(cls, raw: object) -> "SdkBusFrameRecord":
+        generation = _read_first(raw, "generation")
+        captured_at = _as_float(_read_first(raw, "captured_at", "timestamp", "time"))
+        return cls(
+            frame_id=_as_str(_read_first(raw, "frame_id", "id")),
+            type=_as_str(_read_first(raw, "type")) or "provider_frame",
+            timestamp=captured_at,
+            captured_at=captured_at,
+            source=_as_str(_read_first(raw, "source")),
+            image_base64=_as_str(_read_first(raw, "image_base64")),
+            mime=_as_str(_read_first(raw, "mime")),
+            turn_id=_as_str(_read_first(raw, "turn_id")),
+            generation=_as_int(generation) if generation is not None else None,
+            lanlan_name=_as_str(_read_first(raw, "lanlan_name")),
+            metadata=_as_dict(_read_first(raw, "metadata")),
+        )
+
+    def dump(self) -> dict[str, Any]:
+        return {
+            "frame_id": self.frame_id,
+            "type": self.type,
+            "timestamp": self.timestamp,
+            "captured_at": self.captured_at,
+            "source": self.source,
+            "image_base64": self.image_base64,
+            "mime": self.mime,
+            "turn_id": self.turn_id,
+            "generation": self.generation,
+            "lanlan_name": self.lanlan_name,
+            "metadata": dict(self.metadata),
+        }
+
+    def key(self) -> str:
+        return self.frame_id or f"{self.source or ''}:{self.timestamp or 0}"
+
+    def version(self) -> int | None:
+        # The store's own generation counter beats the wall clock: two frames
+        # can share a timestamp at this resolution, generations cannot.
+        if self.generation is not None:
+            return self.generation
         return int(self.timestamp) if self.timestamp is not None else None
 
 
@@ -598,25 +667,58 @@ class SdkBusList(Generic[TRecord]):
             base_filtered = self._local_filter(kwargs, strict=strict)
 
         if callable(flt):
+            # An arbitrary predicate cannot be serialized into the host replay
+            # plan. Do not retain the structured filter's raw list here:
+            # doing so would let watch() start and then silently drop the
+            # predicate on its first refresh.
             return SdkBusList(
                 [item for item in base_filtered.items if flt(item)],
                 namespace=self._namespace,
                 record_factory=self._record_factory,
                 host_ctx=self._host_ctx,
-                raw_list=getattr(base_filtered, "_raw_list", None),
             )
         return base_filtered
 
     def where(self, predicate: Callable[[TRecord], bool]) -> "SdkBusList[TRecord]":
         return self.filter(predicate)
 
-    def where_in(self, field: str, values: Iterable[object]) -> "SdkBusList[TRecord]":
-        raw_where_in = getattr(self._raw_list, "where_in", None)
-        if callable(raw_where_in):
-            return self._wrap_raw(raw_where_in(field, values))
-        value_set = set(values)
+    def sort(
+        self,
+        *,
+        by: str | Iterable[str] | None = None,
+        key: Callable[[TRecord], Any] | None = None,
+        cast: str | None = None,
+        reverse: bool = False,
+    ) -> "SdkBusList[TRecord]":
+        if key is not None and by is not None:
+            raise ValueError(
+                "只能指定 'key' 或 'by' 其中一个。 / "
+                "Specify only one of 'key' or 'by'. / "
+                "'key' または 'by' のどちらか一方だけを指定してください。"
+            )
+
+        raw_sort = getattr(self._raw_list, "sort", None)
+        if callable(raw_sort) and key is None and not isinstance(self._raw_list, list):
+            return self._wrap_raw(raw_sort(by=by, cast=cast, reverse=reverse))
+
+        if by is None:
+            fields = ["timestamp", "created_at", "time"]
+        elif isinstance(by, str):
+            fields = [by]
+        else:
+            fields = list(by)
+
+        sort_key: Callable[[TRecord], Any]
+        if key is not None:
+            sort_key = key
+        else:
+            sort_key = lambda item: tuple(
+                bus_sort_key(self._item_value(item, field), cast)
+                for field in fields
+            )
+
         return SdkBusList(
-            [item for item in self.items if self._item_value(item, field) in value_set],
+            sorted(self.items, key=sort_key, reverse=reverse),
             namespace=self._namespace,
             record_factory=self._record_factory,
             host_ctx=self._host_ctx,
@@ -628,55 +730,6 @@ class SdkBusList(Generic[TRecord]):
             return self._wrap_raw(raw_limit(size))
         return SdkBusList(
             list(self.items[:size]),
-            namespace=self._namespace,
-            record_factory=self._record_factory,
-            host_ctx=self._host_ctx,
-        )
-
-    @staticmethod
-    def _dedupe_key(item: object) -> str:
-        key_fn = getattr(item, "key", None)
-        if callable(key_fn):
-            return str(key_fn())
-        return str(item)
-
-    def _log_fallback_error(self, operation: str, error: Exception) -> None:
-        logger = getattr(self._host_ctx, "logger", None)
-        debug = getattr(logger, "debug", None)
-        if not callable(debug):
-            return
-        try:
-            debug(f"sdk bus fallback for {self._namespace}.{operation}: {error}")
-        except Exception:
-            return
-
-    def __add__(self, other: "SdkBusList[TRecord]") -> "SdkBusList[TRecord]":
-        raw_add = getattr(self._raw_list, "__add__", None)
-        if callable(raw_add) and getattr(other, "_raw_list", None) is not None:
-            try:
-                return self._wrap_raw(raw_add(other._raw_list))
-            except Exception as error:
-                self._log_fallback_error("__add__", error)
-        merged: dict[str, TRecord] = {}
-        for item in [*self.items, *other.items]:
-            merged[self._dedupe_key(item)] = item
-        return SdkBusList(
-            list(merged.values()),
-            namespace=self._namespace,
-            record_factory=self._record_factory,
-            host_ctx=self._host_ctx,
-        )
-
-    def __and__(self, other: "SdkBusList[TRecord]") -> "SdkBusList[TRecord]":
-        raw_and = getattr(self._raw_list, "__and__", None)
-        if callable(raw_and) and getattr(other, "_raw_list", None) is not None:
-            try:
-                return self._wrap_raw(raw_and(other._raw_list))
-            except Exception as error:
-                self._log_fallback_error("__and__", error)
-        other_keys = {self._dedupe_key(item) for item in other.items}
-        return SdkBusList(
-            [item for item in self.items if self._dedupe_key(item) in other_keys],
             namespace=self._namespace,
             record_factory=self._record_factory,
             host_ctx=self._host_ctx,
@@ -795,6 +848,14 @@ class SdkConversationsBus(_SdkBusNamespace[SdkBusConversationRecord]):
         return self.get(conversation_id=conversation_id, max_count=max_count, timeout=timeout)
 
 
+class SdkFramesBus(_SdkBusNamespace[SdkBusFrameRecord]):
+    def __init__(self, raw_namespace: object, *, host_ctx: object) -> None:
+        super().__init__(raw_namespace, namespace="frames", record_factory=SdkBusFrameRecord, host_ctx=host_ctx)
+
+    def get(self, **kwargs: Any) -> object:
+        return self._call("get", **kwargs)
+
+
 class SdkMemoryBus(_SdkBusNamespace[SdkBusMemoryRecord]):
     def __init__(self, raw_namespace: object, *, host_ctx: object) -> None:
         super().__init__(raw_namespace, namespace="memory", record_factory=SdkBusMemoryRecord, host_ctx=host_ctx)
@@ -838,6 +899,7 @@ class SdkBusContext:
         self.events = SdkEventsBus(getattr(raw_bus, "events", object()), host_ctx=host_ctx)
         self.lifecycle = SdkLifecycleBus(getattr(raw_bus, "lifecycle", object()), host_ctx=host_ctx)
         self.conversations = SdkConversationsBus(getattr(raw_bus, "conversations", object()), host_ctx=host_ctx)
+        self.frames = SdkFramesBus(getattr(raw_bus, "frames", object()), host_ctx=host_ctx)
         self.memory = SdkMemoryBus(getattr(raw_bus, "memory", object()), host_ctx=host_ctx)
 
 
@@ -852,6 +914,7 @@ __all__ = [
     "SdkBusConversationRecord",
     "SdkBusDelta",
     "SdkBusEventRecord",
+    "SdkBusFrameRecord",
     "SdkBusLifecycleRecord",
     "SdkBusList",
     "SdkBusMemoryRecord",
@@ -859,6 +922,7 @@ __all__ = [
     "SdkBusWatcher",
     "SdkConversationsBus",
     "SdkEventsBus",
+    "SdkFramesBus",
     "SdkLifecycleBus",
     "SdkMemoryBus",
     "SdkMessagesBus",

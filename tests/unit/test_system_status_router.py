@@ -5,7 +5,8 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from main_routers import system_router as system_router_module
+from main_routers.system_router import status as system_router_module
+from main_routers.system_router import _shared as system_router_shared
 from main_routers.shared_state import init_shared_state
 from utils import storage_location_bootstrap as storage_location_bootstrap_module
 from utils.storage_migration import create_pending_storage_migration
@@ -13,6 +14,8 @@ from utils.storage_policy import save_storage_policy
 
 
 SYSTEM_STATUS_ENDPOINT = "/api/system/status"
+SYSTEM_CLIENT_ID_ENDPOINT = "/api/system/client-id"
+SYSTEM_SOCIAL_CONFIG_ENDPOINT = "/api/system/social/config"
 
 
 @pytest.fixture(autouse=True)
@@ -23,7 +26,6 @@ def _reset_shared_state_after_test():
         steamworks=None,
         templates=None,
         config_manager=None,
-        logger=None,
     )
 
 
@@ -58,11 +60,100 @@ def _build_client(config_manager):
         steamworks=None,
         templates=None,
         config_manager=config_manager,
-        logger=None,
     )
     app = FastAPI()
     app.include_router(system_router_module.router)
     return TestClient(app)
+
+
+@pytest.mark.unit
+def test_system_client_id_fails_closed_when_fresh_id_cannot_be_persisted(tmp_path):
+    class _UnsavableClientIdConfigManager(_DummyConfigManager):
+        def ensure_cloudsave_client_credentials(self):
+            raise OSError("disk unavailable")
+
+    with _build_client(_UnsavableClientIdConfigManager(tmp_path)) as client:
+        response = client.get(SYSTEM_CLIENT_ID_ENDPOINT)
+
+    assert response.status_code == 500
+    assert response.json() == {"ok": False, "error": "internal_error"}
+    assert "disk unavailable" not in response.text
+    assert "no-store" in response.headers["Cache-Control"]
+
+
+@pytest.mark.unit
+def test_system_client_id_persists_fresh_identity_before_returning(tmp_path):
+    class _FreshClientIdConfigManager(_DummyConfigManager):
+        def __init__(self, root):
+            super().__init__(root)
+            self.ensure_calls = 0
+
+        def ensure_cloudsave_client_credentials(self):
+            self.ensure_calls += 1
+            return "fresh-client-id", "p" * 43
+
+    config_manager = _FreshClientIdConfigManager(tmp_path)
+    with _build_client(config_manager) as client:
+        response = client.get(SYSTEM_CLIENT_ID_ENDPOINT)
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True, "client_id": "fresh-client-id"}
+    assert config_manager.ensure_calls == 1
+    assert "no-store" in response.headers["Cache-Control"]
+
+
+@pytest.mark.unit
+def test_system_social_config_trims_override_and_falls_back(monkeypatch, tmp_path):
+    config_manager = _DummyConfigManager(tmp_path)
+    monkeypatch.setenv("NEKO_SOCIAL_BASE_URL", "  https://social.example.test/api/  ")
+    monkeypatch.setenv("NEKO_AUTH_URL", "  https://auth.example.test/  ")
+
+    with _build_client(config_manager) as client:
+        configured = client.get(SYSTEM_SOCIAL_CONFIG_ENDPOINT)
+        monkeypatch.setenv("NEKO_SOCIAL_BASE_URL", "   ")
+        monkeypatch.delenv("NEKO_AUTH_URL")
+        fallback = client.get(SYSTEM_SOCIAL_CONFIG_ENDPOINT)
+
+    assert configured.status_code == 200
+    assert configured.json() == {
+        "ok": True,
+        "social_base_url": "https://social.example.test/api",
+        "auth_public_url": "https://auth.example.test",
+        "enabled": True,
+    }
+    assert fallback.json()["social_base_url"] == "https://community.project-neko.cn"
+    assert fallback.json()["auth_public_url"] == "https://auth.project-neko.cn"
+    assert "no-store" in configured.headers["Cache-Control"]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("value", [
+    "https://auth.example.test?x=1",
+    "https://auth.example.test/#frag",
+    "ftp://auth.example.test",
+    "auth.example.test",
+])
+def test_validate_http_url_rejects_values_that_cannot_take_a_path(value):
+    from utils import social_base
+
+    with pytest.raises(ValueError):
+        social_base.validate_http_url(value, name="NEKO_AUTH_URL")
+
+
+@pytest.mark.unit
+def test_invalid_auth_url_falls_back_and_is_reported_once(monkeypatch, caplog):
+    from utils import social_base
+
+    social_base._resolve_auth_public_url.cache_clear()
+    monkeypatch.setenv("NEKO_AUTH_URL", "https://auth.example.test?x=1")
+    with caplog.at_level("ERROR", logger=social_base.logger.name):
+        results = {social_base.auth_public_url() for _ in range(3)}
+    social_base._resolve_auth_public_url.cache_clear()
+
+    assert results == {"https://auth.project-neko.cn"}
+    errors = [r for r in caplog.records if "NEKO_AUTH_URL" in r.getMessage()]
+    assert len(errors) == 1
+    assert errors[0].levelname == "ERROR"
 
 
 @pytest.mark.unit
@@ -90,11 +181,11 @@ def test_system_status_uses_runtime_config_manager_fallback_when_shared_state_is
     config_manager = _DummyConfigManager(tmp_path)
 
     with patch.object(
-        system_router_module,
+        system_router_shared,
         "get_config_manager",
         side_effect=RuntimeError("shared_state unavailable"),
     ), patch.object(
-        system_router_module,
+        system_router_shared,
         "get_runtime_config_manager",
         return_value=config_manager,
     ):

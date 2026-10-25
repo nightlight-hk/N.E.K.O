@@ -42,6 +42,7 @@ type McpServerView = {
   tools_count?: number
   error?: string | null
   tools?: Array<{ name?: string; description?: string }>
+  inject_to_chat?: boolean
 }
 
 type McpPanelState = {
@@ -65,18 +66,30 @@ type ImportServerConfig = {
   args?: unknown
   url?: unknown
   env?: unknown
+  headers?: unknown
   enabled?: unknown
+  inject_to_chat?: unknown
   autoConnect?: unknown
 }
 
-const defaultImportJson = `{
-  "name": "example",
-  "transport": "stdio",
-  "command": "uvx",
-  "args": ["mcp-server-example"],
-  "enabled": true,
-  "auto_connect": true
-}`
+const defaultImportJson = `[
+  {
+    "name": "example",
+    "transport": "stdio",
+    "command": "uvx",
+    "args": ["mcp-server-example"],
+    "enabled": true,
+    "auto_connect": true
+  },
+  {
+    "name": "remote-api",
+    "transport": "streamable-http",
+    "url": "https://api.example.com/mcp",
+    "headers": { "Authorization": "Bearer your_token_here" },
+    "enabled": true,
+    "auto_connect": true
+  }
+]`
 
 const emptyServerForm = {
   name: "",
@@ -85,6 +98,8 @@ const emptyServerForm = {
   args: "",
   url: "",
   env: "",
+  headers: "",
+  injectToChat: false,
   autoConnect: true,
 }
 type ServerFormValues = typeof emptyServerForm
@@ -110,6 +125,7 @@ export default function McpAdapterPanel(props: PluginSurfaceProps<McpPanelState>
   const connectServer = safeActions.find((action) => action.id === "connect_server")
   const disconnectServer = safeActions.find((action) => action.id === "disconnect_server")
   const removeServers = safeActions.find((action) => action.id === "remove_servers")
+  const setChatInjection = safeActions.find((action) => action.id === "set_chat_injection")
   const firstServer = servers[0]
   const [selectedServerName, setSelectedServerName] = props.useLocalState("selectedServerName", firstServer?.name || "")
   const [selectedServerNames, setSelectedServerNames] = props.useLocalState<string[]>("selectedServerNames", [])
@@ -152,6 +168,19 @@ auto_connect = true`
 
   const parseArgs = (value) => String(value || "").split(",").map((item) => item.trim()).filter(Boolean)
 
+  // Accept only boolean or literal "true"/"false"; ignore any other type so it
+  // falls back to the backend default. A string "false" must NOT be coerced to
+  // true by !! (would silently enable chat injection on JSON import).
+  const resolveInjectToChatValue = (server: Partial<ServerFormValues> | ImportServerConfig): boolean | undefined => {
+    let raw: unknown
+    if ("injectToChat" in server) raw = server.injectToChat
+    else if ("inject_to_chat" in server) raw = server.inject_to_chat
+    if (typeof raw === "boolean") return raw
+    if (raw === "true") return true
+    if (raw === "false") return false
+    return undefined
+  }
+
   const buildServerPayload = (server: Partial<ServerFormValues> | ImportServerConfig, autoConnectOverride?: boolean) => {
     const name = String(server.name || "").trim()
     const transport = String(server.transport || "stdio").trim() || "stdio"
@@ -162,6 +191,8 @@ auto_connect = true`
       auto_connect: autoConnectOverride === undefined ? !!server.autoConnect : !!autoConnectOverride,
     }
     if ("enabled" in server && server.enabled !== undefined) payload.enabled = !!server.enabled
+    const injectToChat = resolveInjectToChatValue(server)
+    if (injectToChat !== undefined) payload.inject_to_chat = injectToChat
     if (transport === "stdio") {
       const command = String(server.command || "").trim()
       if (!command) throw new Error(t("panel.form.errors.commandRequired"))
@@ -177,6 +208,11 @@ auto_connect = true`
       payload.env = server.env
     } else if (String(server.env || "").trim()) {
       payload.env = JSON.parse(String(server.env))
+    }
+    if (server.headers && typeof server.headers === "object" && !Array.isArray(server.headers)) {
+      payload.headers = server.headers
+    } else if (String(server.headers || "").trim()) {
+      payload.headers = JSON.parse(String(server.headers))
     }
     return payload
   }
@@ -211,7 +247,9 @@ auto_connect = true`
           args: server.args,
           url: server.url,
           env: server.env,
+          headers: server.headers,
           enabled: server.enabled,
+          inject_to_chat: server.inject_to_chat,
         }
       })
   }
@@ -286,6 +324,16 @@ auto_connect = true`
       else set.add(serverName)
       return Array.from(set)
     })
+  }
+
+  const toggleChatInjection = async (serverName, value) => {
+    if (!serverName) return
+    try {
+      await props.api.call("set_chat_injection", { server_name: serverName, inject_to_chat: !!value })
+      await props.api.refresh()
+    } catch (error) {
+      toast.error(error && error.message ? error.message : String(error))
+    }
   }
 
   const removeSelectedServers = async () => {
@@ -396,6 +444,17 @@ auto_connect = true`
                 { key: "connected", label: "Connected" },
                 { key: "tools_count", label: "Tools" },
                 {
+                  key: "inject_to_chat",
+                  label: t("panel.servers.columns.chatInjection"),
+                  render: (server) => (
+                    <Switch
+                      checked={!!server?.inject_to_chat}
+                      disabled={!setChatInjection}
+                      onChange={(value) => toggleChatInjection(server?.name || "", value)}
+                    />
+                  ),
+                },
+                {
                   key: "tools",
                   label: t("panel.servers.columns.toolNames"),
                   render: (server) => {
@@ -460,6 +519,12 @@ auto_connect = true`
               <Field label={t("panel.form.env")} help={t("panel.form.envHelp")}>
                 <Textarea value={serverForm.values.env} placeholder='{"TOKEN":"..."}' onChange={(value) => updateServerForm({ env: value })} />
               </Field>
+              {serverForm.values.transport !== "stdio" ? (
+                <Field label={t("panel.form.headers")} help={t("panel.form.headersHelp")}>
+                  <Textarea value={serverForm.values.headers} placeholder='{"Authorization":"Bearer ..."}' onChange={(value) => updateServerForm({ headers: value })} />
+                </Field>
+              ) : null}
+              <Switch checked={serverForm.values.injectToChat} label={t("panel.form.injectToChat")} onChange={(value) => updateServerForm({ injectToChat: value })} />
               <Switch checked={serverForm.values.autoConnect} label={t("panel.form.autoConnect")} onChange={(value) => updateServerForm({ autoConnect: value })} />
               <Button tone="success" onClick={addServerFromForm}>{t("panel.addServer.submit")}</Button>
             </Stack>

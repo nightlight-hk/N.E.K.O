@@ -5,7 +5,7 @@ import json
 
 import pytest
 
-import main_routers.characters_router as characters_router
+import main_routers.characters_router.voice_registry as characters_router
 from utils.config_manager import ensure_default_yui_voice_for_free_api, get_reserved
 
 
@@ -15,12 +15,31 @@ YUI_FREE_VOICE_ID = "voice-tone-RcH2svtsrw"
 class _FakeConfigManager:
     def __init__(self, characters: dict, core_config: dict | None = None, non_mainland: bool = False):
         self.characters = deepcopy(characters)
-        self.core_config = deepcopy(core_config or {})
+        # Production aget_core_config() returns **assembled** config: get_core_config fills URLs
+        # by profile, while persisted raw config contains only coreApi / assistApi. Stubs supply a free snapshot
+        # with URLs too, or the route-depends-on-region gate is distorted (missing URLs
+        # imply no dependency, binding overseas users to mainland voices).
+        if core_config is None:
+            core_config = {
+                'coreApi': 'free',
+                'assistApi': 'free',
+                'CORE_URL': (
+                    'wss://www.lanlan.app/core' if non_mainland
+                    else 'wss://www.lanlan.tech/core'
+                ),
+            }
+        self.core_config = deepcopy(core_config)
         self.saved_characters = None
         self._non_mainland = non_mainland
 
     def _check_non_mainland(self) -> bool:
         return self._non_mainland
+
+    def _region_verdict_is_provisional(self, cfg=None) -> bool:
+        # These cases test binding logic itself, assuming regional detection has settled; before that,
+        # ensure_default_yui_voice_for_free_api skips binding to avoid persisting a guessed region's
+        # voice that would never be overwritten. State this precondition explicitly here.
+        return False
 
     async def aload_characters(self):
         return deepcopy(self.characters)
@@ -97,17 +116,29 @@ async def test_free_api_bind_can_use_current_core_config_when_reader_entry_calls
 
 @pytest.mark.asyncio
 async def test_overseas_free_binds_yui_sentinel_voice(monkeypatch):
-    """海外免费（free + *.lanlan.app）默认音色绑定品牌 yui（下发字面量 "yui"），
-    而非国内的 free_voices 阶跃音色。"""
+    """Overseas free (free + *.lanlan.app) binds the branded ``yui`` voice.
+
+    ``non_mainland=True`` was added later: the fake used to hold a self
+    contradictory state — ``CORE_URL`` already rewritten to ``.app`` while
+    ``_check_non_mainland()`` reported mainland. Production cannot produce that
+    combination (``.app`` only ever comes from an overseas verdict), and the
+    contradiction is exactly what hid the bug PR #2454 fixes: when Steam
+    provisionally says overseas the snapshot already carries ``.app``, and if the
+    authoritative IP verdict then resolves mainland, inferring the region from
+    that URL would bind ``yui`` to a mainland user forever.
+    """
     monkeypatch.setattr(
         "utils.api_config_loader.get_free_voices",
         lambda: {"yui_cn": YUI_FREE_VOICE_ID},
     )
-    config_manager = _FakeConfigManager(_characters_with_current_yui(voice_id=""))
+    config_manager = _FakeConfigManager(
+        _characters_with_current_yui(voice_id=""),
+        non_mainland=True,
+    )
 
     changed = await ensure_default_yui_voice_for_free_api(
         config_manager,
-        {"coreApi": "free", "assistApi": "free", "CORE_URL": "wss://lanlan.app/realtime"},
+        {"coreApi": "free", "assistApi": "free", "CORE_URL": "wss://www.lanlan.app/realtime"},
     )
 
     assert changed is True
@@ -117,9 +148,9 @@ async def test_overseas_free_binds_yui_sentinel_voice(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_overseas_free_binds_yui_with_raw_lanlan_tech_url(monkeypatch):
-    """回归 Codex P2：update_core_config 传入的 raw core_cfg 里 CORE_URL 仍是
-    lanlan.tech（区域改写在 get_core_config 才发生），此时海外用户应靠
-    _check_non_mainland 兜底判海外、绑 yui，而不是落到国内 voice-tone-* 预设。"""
+    """Codex P2 regression: raw core_cfg passed to update_core_config still has CORE_URL
+    lanlan.tech (region rewriting occurs in get_core_config); overseas users must rely on
+    _check_non_mainland to detect overseas and bind yui, not domestic voice-tone-* presets."""
     monkeypatch.setattr(
         "utils.api_config_loader.get_free_voices",
         lambda: {"yui_cn": YUI_FREE_VOICE_ID},
@@ -244,3 +275,25 @@ async def test_clear_voice_ids_rebinds_default_yui_for_free_api(monkeypatch):
     other = config_manager.characters["猫娘"]["别的角色"]
     assert get_reserved(yui, "voice_id", default="") == YUI_FREE_VOICE_ID
     assert get_reserved(other, "voice_id", default="") == ""
+
+
+@pytest.mark.asyncio
+async def test_provisional_region_defers_default_voice_binding():
+    """Binding on a guessed region writes data that later cannot be corrected.
+
+    The mainland binding is ``yui_cn`` and the overseas one the literal ``yui``; the
+    two are not interchangeable, and this helper refuses to overwrite any nonempty
+    voice afterwards. So while the verdict is provisional it must not bind at all —
+    not even read the character data. Waiting one round costs nothing.
+    """
+    mgr = _FakeConfigManager({"猫娘": {"YUI": {"昵称": "YUI", "_reserved": {"voice_id": ""}}}},
+                             core_config={"coreApi": "free"})
+    mgr._region_verdict_is_provisional = lambda *_a: True
+
+    async def _boom():
+        raise AssertionError('区域未落定时不应读取角色数据')
+
+    mgr.aload_characters = _boom
+
+    assert await ensure_default_yui_voice_for_free_api(mgr) is False
+    assert mgr.saved_characters is None, '未落定时不应写入任何角色数据'

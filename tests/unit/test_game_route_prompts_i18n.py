@@ -1,7 +1,8 @@
 import pytest
 
-from config.prompts.prompts_game_route import (
+from config.prompts.prompts_minigame_route import (
     GAME_CONTEXT_SIGNAL_GROUP_KEYS,
+    get_game_archive_fallback_highlight_labels,
     get_game_archive_highlight_source_labels,
     get_game_archive_memory_highlighter_system_prompt,
     get_game_archive_memory_highlighter_user_prompt,
@@ -11,14 +12,18 @@ from config.prompts.prompts_game_route import (
     get_game_context_formatter_labels,
     get_game_context_organizer_system_prompt,
     get_game_context_organizer_user_prompt,
+    get_game_dialog_memory_line_labels,
     get_game_postgame_context_labels,
     get_game_postgame_event_texts,
     get_game_postgame_realtime_nudge_labels,
+    get_game_recent_history_message_labels,
 )
 from main_routers import game_router
+from main_routers.game_router import game_context as gr_game_context
+from main_routers.game_router import runtime as gr_runtime
 
 
-LOCALES = ("zh", "en", "ja", "ko", "ru")
+LOCALES = ("zh", "en", "ja", "ko", "ru", "es", "pt")
 LEGACY_SIGNAL_GROUP_KEYS = ("玩家信号", "关系互动信号", "猫娘信号", "本局事实", "口头声明")
 
 
@@ -32,9 +37,12 @@ def test_game_route_prompt_getters_return_locale_content(locale):
 
     label_getters = (
         get_game_archive_highlight_source_labels,
+        get_game_archive_fallback_highlight_labels,
         get_game_archive_memory_summary_labels,
         get_game_archive_memory_text_labels,
         get_game_context_formatter_labels,
+        get_game_dialog_memory_line_labels,
+        get_game_recent_history_message_labels,
         get_game_postgame_context_labels,
         get_game_postgame_realtime_nudge_labels,
         get_game_postgame_event_texts,
@@ -69,8 +77,21 @@ def test_naked_game_route_user_prompts_keep_chinese_watermark(locale):
 
 
 @pytest.mark.unit
+def test_english_archive_prompts_keep_literal_localized_markers():
+    system_prompt = get_game_archive_memory_highlighter_system_prompt("en")
+    source_labels = get_game_archive_highlight_source_labels("en")
+
+    assert 'literal marker "Player:"' in system_prompt
+    assert '"event text" inside "Game event" lines' in system_prompt
+    assert 'literal marker "Player:"' in source_labels["role_explanation"]
+    assert '"event text" inside "Game event" lines' in source_labels["role_explanation"]
+    assert "explicitly marked as player speech" not in system_prompt
+    assert "explicitly marked as player speech" not in source_labels["role_explanation"]
+
+
+@pytest.mark.unit
 def test_game_context_signal_normalizer_accepts_legacy_zh_group_keys():
-    normalized = game_router._normalize_game_context_signals({
+    normalized = gr_game_context._normalize_game_context_signals({
         "玩家信号": [{
             "signalLabel": "玩家在意追分",
             "summary": "玩家多次提到追分。",
@@ -90,12 +111,12 @@ def test_game_context_signal_normalizer_accepts_legacy_zh_group_keys():
 
 @pytest.mark.unit
 def test_router_formatter_uses_requested_english_locale():
-    zh_text = game_router._compact_realtime_context_text(
+    zh_text = gr_runtime._compact_realtime_context_text(
         "soccer",
         {"state": {"score": {"player": 1, "ai": 2}}, "pendingItems": []},
         "zh",
     )
-    en_text = game_router._compact_realtime_context_text(
+    en_text = gr_runtime._compact_realtime_context_text(
         "soccer",
         {"state": {"score": {"player": 1, "ai": 2}}, "pendingItems": []},
         "en",

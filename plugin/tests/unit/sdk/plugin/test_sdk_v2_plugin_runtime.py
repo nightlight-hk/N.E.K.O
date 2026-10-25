@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import fields
+from types import SimpleNamespace
 
 import pytest
 
+import plugin.sdk.plugin.activity as activity_api
 from plugin.sdk.plugin import runtime as rt
 from plugin.sdk.shared.models.errors import ErrorCode
 from plugin.sdk.shared.models.exceptions import TransportError, ValidationError
@@ -103,7 +105,63 @@ def test_hook_executor_mixin_not_implemented() -> None:
 
 
 @pytest.mark.asyncio
-async def test_plugin_config_contract_methods_raise_not_implemented() -> None:
+async def test_os_activity_snapshot_narrows_system_signal_payload(monkeypatch: pytest.MonkeyPatch) -> None:
+    system_snapshot = SimpleNamespace(
+        idle_seconds="42.25",
+        os_signals_available=True,
+    )
+
+    monkeypatch.setattr(activity_api, "_read_system_signal_snapshot", lambda: system_snapshot)
+    monkeypatch.setattr(
+        activity_api,
+        "_active_window_from_system_snapshot",
+        lambda snapshot: SimpleNamespace(category="Gaming"),
+    )
+
+    snapshot = await activity_api.get_os_activity_snapshot("study_companion", now=12.5)
+
+    assert snapshot.os_signals_available is True
+    assert snapshot.foreground_category == "gaming"
+    assert snapshot.system_idle_seconds == 42.25
+    assert snapshot.privacy_state == "visible"
+
+
+@pytest.mark.asyncio
+async def test_os_activity_snapshot_privacy_and_unavailable_states(monkeypatch: pytest.MonkeyPatch) -> None:
+    private_snapshot_raw = SimpleNamespace(
+        idle_seconds=7,
+        os_signals_available=True,
+    )
+
+    monkeypatch.setattr(
+        activity_api, "_read_system_signal_snapshot", lambda: private_snapshot_raw
+    )
+    monkeypatch.setattr(
+        activity_api,
+        "_active_window_from_system_snapshot",
+        lambda snapshot: SimpleNamespace(category="private"),
+    )
+    private_snapshot = await activity_api.get_os_activity_snapshot("study_companion")
+    assert private_snapshot.privacy_state == "private"
+    assert private_snapshot.foreground_category == "private"
+
+    unavailable_snapshot_raw = SimpleNamespace(
+        idle_seconds=7,
+        os_signals_available=False,
+    )
+
+    monkeypatch.setattr(
+        activity_api, "_read_system_signal_snapshot", lambda: unavailable_snapshot_raw
+    )
+    unavailable_snapshot = await activity_api.get_os_activity_snapshot("study_companion")
+    assert unavailable_snapshot.os_signals_available is False
+    assert unavailable_snapshot.foreground_category is None
+    assert unavailable_snapshot.system_idle_seconds is None
+    assert unavailable_snapshot.privacy_state == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_plugin_config_contract_methods() -> None:
     cfg = rt.PluginConfig(_Ctx())
     dumped = await cfg.dump()
     assert dumped["feature"]["enabled"] is True
@@ -113,10 +171,8 @@ async def test_plugin_config_contract_methods_raise_not_implemented() -> None:
     assert required is True
     with pytest.raises((ValidationError, TransportError)):
         await cfg.require("feature.missing")
-    with pytest.raises((ValidationError, TransportError)):
-        await cfg.set("feature.new", True)
-    with pytest.raises((ValidationError, TransportError)):
-        await cfg.update({"x": 1})
+    assert await cfg.set("feature.new", True) is None
+    assert await cfg.update({"x": 1}) == {"x": 1}
 
 
 @pytest.mark.asyncio
@@ -292,39 +348,6 @@ async def test_system_info_runtime_behaviors() -> None:
     assert (await no_system.get_system_config()).is_err()
     assert (await no_system.get_server_settings()).is_err()
 
-
-@pytest.mark.asyncio
-async def test_memory_client_runtime_behaviors() -> None:
-    class _CtxMem(_Ctx):
-        async def query_memory(self, lanlan_name: str, query: str, timeout: float = 5.0) -> dict[str, object]:
-            return {"bucket": lanlan_name, "query": query}
-
-        @property
-        def bus(self):
-            class _Bus:
-                class memory:
-                    @staticmethod
-                    async def get(bucket_id: str, limit: int = 20, timeout: float = 5.0):
-                        class _List:
-                            @staticmethod
-                            def dump_records():
-                                return [{"bucket": bucket_id, "limit": limit}]
-                        return rt.Ok(_List())
-            return _Bus()
-
-    mem = rt.MemoryClient(_CtxMem())
-    queried = await mem.query("b", "q")
-    assert queried.is_ok()
-    got = await mem.get("b")
-    assert got.is_ok()
-    assert got.unwrap()[0]["bucket"] == "b"
-
-    class _CtxNoMem:
-        plugin_id = "demo"
-
-    no_mem = rt.MemoryClient(_CtxNoMem())
-    assert (await no_mem.query("b", "q")).is_err()
-    assert (await no_mem.get("b")).is_err()
 
 
 @pytest.mark.asyncio

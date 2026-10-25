@@ -1,13 +1,28 @@
+# Copyright 2025-2026 Project N.E.K.O. Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
-本模块用于将lanlan的消息转发至所有相关服务器，包括：
-1. Bullet Server。对实时内容进行监听并与直播间弹幕进行交互。
-2. Monitor Server。将实时内容转发至所有副终端。副终端会同步播放与主终端完全相同的内容，但不具备交互性。同一时间只有一个主终端可以交互。
-3. Memory Server。对对话历史进行总结、分析，并转为持久化记忆。
-注意，cross server是一个单向的转发器，不会将任何内容回传给主进程。如需回传，目前仍需要建立专门的双向连接。
+This module forwards lanlan's messages to all related servers, including:
+1. Bullet Server: listens to real-time content and interacts with live-stream chat (danmaku).
+2. Monitor Server: forwards real-time content to all secondary terminals. Secondary terminals play exactly the same content as the primary terminal but are non-interactive. Only one primary terminal can interact at a time.
+3. Memory Server: summarizes and analyzes conversation history and converts it into persistent memory.
+Note that the cross server is a one-way forwarder and never sends anything back to the main process. If a backchannel is needed, a dedicated bidirectional connection still has to be established.
 """
 
 import ssl
 import uuid
+import inspect
 from urllib.parse import quote
 
 import asyncio
@@ -15,7 +30,8 @@ import time
 import pickle
 import aiohttp
 from config import (
-    MONITOR_SERVER_PORT,
+    MONITOR_SYNC_URL,
+    MONITOR_TOKEN,
     MEMORY_SERVER_PORT,
     COMMENTER_SERVER_PORT,
     AVATAR_INTERACTION_DEDUPE_WINDOW_MS,
@@ -27,8 +43,11 @@ import re
 import httpx
 from utils.frontend_utils import replace_blank, is_only_punctuation
 from utils.internal_http_client import get_internal_http_client
+from utils.language_utils import is_supported_language_code
+from utils.llm_tool_leak_filter import strip_tool_call_leaks
 from utils.logger_config import get_module_logger
 from main_logic.agent_event_bus import publish_analyze_request_reliably
+from services.chat_sync.source import LATE_TEXT_GRACE_SECONDS, AssistantOriginalBuffer
 
 # Setup logger for this module
 logger = get_module_logger(__name__, "Main")
@@ -45,9 +64,46 @@ emoji_pattern2 = re.compile("["
 emotion_pattern = re.compile('<(.*?)>')
 
 
-async def _publish_analyze_request_with_fallback(lanlan_name: str, trigger: str, messages: list[dict], *, conversation_id: str | None = None) -> bool:
-    """Publish analyze request via EventBus with ack/retry."""
+async def _publish_analyze_request_with_fallback(lanlan_name: str, trigger: str, messages: list[dict], *, conversation_id: str | None = None, had_user_input: bool = True, language: str | None = None) -> bool:
+    """Publish analyze request via EventBus with ack/retry.
+
+    ``had_user_input`` is False for a proactive turn (lanlan spoke with no fresh
+    user input). Such turns carry NO user-text gate hint (master-emotion never
+    re-ran, and the "latest user message" here is a stale prior turn) and are
+    marked ``proactive=True`` so the agent routes them through its throttled
+    proactive path instead of the user-turn dedupe (which would drop them).
+
+    ``language`` is the live session locale, taken from the same
+    ``_current_user_language()`` provider that already feeds the memory-server
+    calls and the agent task-result rendering. The agent process cannot read the
+    session's ``user_language`` on its own, so its analyzer prompts would
+    otherwise follow the machine's Steam/system locale instead of the UI language.
+    """
     try:
+        # Optional optimization hint: the cheap pre-gate signal the master-emotion
+        # call produced at input-time, matched to THIS turn's latest user message.
+        # It must NEVER block or abort the publish — wrapped in its own try so any
+        # lazy-import/read failure degrades to None (the agent gate then fails open
+        # and runs its assessment). turn_end also never blocks on the emotion call,
+        # so this only reads an already-cached value. Cache miss / disabled / stale
+        # (different turn) / no-signal / proactive turn → None.
+        external_intent = None
+        if had_user_input:
+            try:
+                from main_logic.activity.master_emotion import gate_signal_for
+                _latest_user_msg = next(
+                    (m for m in reversed(messages) if isinstance(m, dict) and m.get("role") == "user"),
+                    None,
+                )
+                # Skip the gate hint when the latest user turn carries attachments:
+                # the actionable intent may live in the image, which the text-only
+                # signal never saw → leave external_intent None so the agent fails
+                # open and assesses the turn (never drop an image-driven task).
+                if _latest_user_msg is not None and not _latest_user_msg.get("attachments"):
+                    _latest_user_text = str(_latest_user_msg.get("content") or _latest_user_msg.get("text") or "")
+                    external_intent = gate_signal_for(lanlan_name, _latest_user_text)
+            except Exception:
+                external_intent = None
         sent = await publish_analyze_request_reliably(
             lanlan_name=lanlan_name,
             trigger=trigger,
@@ -55,6 +111,9 @@ async def _publish_analyze_request_with_fallback(lanlan_name: str, trigger: str,
             ack_timeout_s=0.8,
             retries=1,
             conversation_id=conversation_id,
+            external_intent=external_intent,
+            proactive=not had_user_input,
+            language=language,
         )
         if sent:
             logger.debug(
@@ -75,7 +134,7 @@ async def _publish_analyze_request_with_fallback(lanlan_name: str, trigger: str,
     return False
 
 
-def normalize_text(text):  # 对文本进行基本预处理
+def normalize_text(text):  # Perform basic text preprocessing.
     text = text.strip()
     text = replace_blank(text)
 
@@ -87,7 +146,31 @@ def normalize_text(text):  # 对文本进行基本预处理
     return text
 
 
-# Mirror schema + detection now lives in main_logic.mirror_meta;
+# The time stamp ``run_sync_connector`` starts every reply buffer with
+# (``strftime('[%Y%m%d %a %H:%M] ')``; the weekday may be localized).
+_REPLY_STAMP_RE = re.compile(r"\[\d{8} [^\]\s]+ \d{2}:\d{2}\] ")
+
+
+def normalize_assistant_text(text, tool_names=None):
+    """``normalize_text`` for a reply, with any tool call it spoke as text cut.
+
+    A model that stops calling a tool natively writes the call into its reply
+    (``asynccall:name{...}``, ``name(param=...)``). Stored, that line is shown
+    to every later session as an example to copy, so it is cut before memory
+    sees it. ``tool_names`` are the registered tools, which also lets a bare
+    ``name(param=...)`` count. A reply that was nothing but such a call comes
+    back empty rather than as its bare time stamp.
+    """
+    stamp = _REPLY_STAMP_RE.match(text)
+    head = stamp.group(0) if stamp else ""
+    body = text[len(head):]
+    stripped = strip_tool_call_leaks(body, tool_names=tool_names)
+    if stripped != body and not normalize_text(stripped):
+        return ""
+    return normalize_text(head + stripped)
+
+
+# Mirror schema + detection lives in utils.mirror_meta (re-exported by main_logic.mirror_meta);
 # cross_server only consumes those helpers — does not own the schema.
 from main_logic.mirror_meta import (
     MIRROR_USER_INPUT_TYPES,
@@ -95,12 +178,15 @@ from main_logic.mirror_meta import (
     is_mirror_turn_end_meta,
 )
 
+_USER_IMAGE_INPUT_TYPES = frozenset({"screen", "camera", "avatar_drop_image", "user_image"})
+AVATAR_DROP_SOURCE = "avatar-drop"
+
 
 def merge_unsynced_tail_assistants(chat_history, last_synced_index):
-    """合并 last_synced_index 之后末尾连续的 assistant 消息为一条。
+    """Merge the trailing run of consecutive assistant messages after last_synced_index into one.
 
-    只触碰未同步到 memory 的主动搭话消息，不影响已同步的正常回复。
-    返回被消除的消息数（0 表示无需合并）。
+    Only touches proactive-chat messages not yet synced to memory; synced normal replies
+    are unaffected. Returns the number of messages eliminated (0 means nothing to merge).
     """
     tail = chat_history[last_synced_index:]
     if len(tail) < 2:
@@ -129,8 +215,8 @@ def merge_unsynced_tail_assistants(chat_history, last_synced_index):
     if not parts:
         return 0
 
-    # 只保留最后一条主动搭话，丢弃之前的冗余内容，避免持久记忆膨胀
-    merged = {'role': 'assistant', 'content': [{'type': 'text', 'text': parts[-1]}]}
+    # Keep only the latest proactive message, discarding older redundancy to avoid persistent-memory growth.
+    merged = {**chat_history[-1], 'content': [{'type': 'text', 'text': parts[-1]}]}
     removed = consecutive - 1
     chat_history[first_idx:] = [merged]
     logger.info(f"[cleanup] 精简了 {consecutive} 条未同步的连续主动搭话消息，仅保留最后一条")
@@ -190,17 +276,191 @@ def _should_persist_avatar_interaction_memory(
     return True
 
 
+def _iter_source_values(value: object) -> list[str]:
+    if isinstance(value, str):
+        source = value.strip()
+        return [source] if source else []
+    if isinstance(value, (list, tuple, set, frozenset)):
+        values: list[str] = []
+        for item in value:
+            values.extend(_iter_source_values(item))
+        return values
+    return []
+
+
+def _message_has_source(message: dict, source: str) -> bool:
+    if not isinstance(message, dict):
+        return False
+    expected = str(source or "").strip()
+    if not expected:
+        return False
+
+    if expected in _iter_source_values(message.get("source")):
+        return True
+
+    for metadata_key in ("metadata", "meta"):
+        metadata = message.get(metadata_key)
+        if not isinstance(metadata, dict):
+            continue
+        if expected in _iter_source_values(metadata.get("source")):
+            return True
+        if expected in _iter_source_values(metadata.get("sources")):
+            return True
+
+    attachments = message.get("attachments")
+    if isinstance(attachments, list):
+        for attachment in attachments:
+            if not isinstance(attachment, dict):
+                continue
+            if expected in _iter_source_values(attachment.get("source")):
+                return True
+            if expected == AVATAR_DROP_SOURCE and str(attachment.get("input_type") or "") == "avatar_drop_image":
+                return True
+
+    return False
+
+
+def _latest_user_message_has_source(messages: list[dict], source: str) -> bool:
+    for message in reversed(messages or []):
+        if isinstance(message, dict) and message.get("role") == "user":
+            return _message_has_source(message, source)
+    return False
+
+
+def _append_user_input_cache_to_history(chat_history: list, text: object, sources: set[str], proof=None) -> bool:
+    user_text = str(text or "")
+    if not user_text:
+        sources.clear()
+        return False
+
+    item = {'role': 'user', 'content': [{"type": "text", "text": user_text}]}
+    normalized_sources = sorted({source for source in sources if source})
+    if normalized_sources:
+        item["metadata"] = {"sources": normalized_sources}
+        if len(normalized_sources) == 1:
+            item["source"] = normalized_sources[0]
+    if proof:
+        item.setdefault("metadata", {})["chat_original_source"] = dict(proof)
+    chat_history.append(item)
+    sources.clear()
+    return True
+
+
+def _assistant_history_message(text, proof):
+    """Preserve producer identity in the original archive, outside model context."""
+    item = {'role': 'assistant', 'content': [{'type': 'text', 'text': text}]}
+    if proof:
+        item['metadata'] = {'chat_original_source': dict(proof)}
+    return item
+
+
 def _normalize_pending_user_attachments(pending_user_images: list) -> list[dict]:
     attachments = []
     for raw in pending_user_images or []:
-        url = str(raw or "").strip()
+        input_type = ""
+        source = ""
+        if isinstance(raw, dict):
+            url = str(raw.get("data") or raw.get("url") or "").strip()
+            input_type = str(raw.get("input_type") or "").strip()
+            source = str(raw.get("source") or "").strip()
+        else:
+            url = str(raw or "").strip()
         if not url:
             continue
-        attachments.append({
+        attachment = {
             "type": "image_url",
             "url": url,
-        })
+        }
+        if input_type:
+            attachment["input_type"] = input_type
+        if source:
+            attachment["source"] = source
+        attachments.append(attachment)
     return attachments
+
+
+def _append_pending_user_image(
+    pending_user_images: list,
+    data: object,
+    request_id: object,
+    input_type: object = None,
+    *,
+    source: object = None,
+) -> bool:
+    """Append a real user image entry and return whether one was queued.
+
+    Empty data means the caller only sent metadata, so the placeholder is skipped.
+    """
+    image_data = str(data or "").strip()
+    if not image_data:
+        return False
+    entry = {
+        "data": image_data,
+        "request_id": request_id or "",
+    }
+    if input_type:
+        entry["input_type"] = input_type
+    source_value = str(source or "").strip()
+    if source_value:
+        entry["source"] = source_value
+    pending_user_images.append(entry)
+    if len(pending_user_images) > PENDING_USER_IMAGES_MAX:
+        del pending_user_images[:-PENDING_USER_IMAGES_MAX]
+    return True
+
+
+def _select_pending_user_images_for_turn(pending_user_images: list, request_id: object) -> list:
+    turn_request_id = str(request_id or "")
+    selected = []
+    for raw in pending_user_images or []:
+        if not isinstance(raw, dict):
+            if turn_request_id:
+                continue
+            selected.append(raw)
+            continue
+        image_request_id = str(raw.get("request_id") or "")
+        if image_request_id and image_request_id != turn_request_id:
+            continue
+        selected.append(raw)
+    return selected
+
+
+def _partition_pending_user_images_for_turn(
+    pending_user_images: list,
+    request_id: object,
+    *,
+    consume_untagged: bool = True,
+) -> tuple[list, list]:
+    turn_request_id = str(request_id or "")
+    selected = []
+    remaining = []
+    for raw in pending_user_images or []:
+        if not isinstance(raw, dict):
+            if not consume_untagged:
+                remaining.append(raw)
+                continue
+            if not turn_request_id:
+                selected.append(raw)
+            continue
+        image_request_id = str(raw.get("request_id") or "")
+        if image_request_id and image_request_id != turn_request_id:
+            remaining.append(raw)
+            continue
+        if not image_request_id and not consume_untagged:
+            remaining.append(raw)
+            continue
+        selected.append(raw)
+    return selected, remaining
+
+
+def _select_pending_user_images_for_session_end(pending_user_images: list, request_id: object) -> list:
+    session_request_id = str(request_id or "")
+    if not session_request_id:
+        for raw in reversed(pending_user_images or []):
+            if isinstance(raw, dict) and str(raw.get("request_id") or ""):
+                session_request_id = str(raw.get("request_id") or "")
+                break
+    return _select_pending_user_images_for_turn(pending_user_images, session_request_id)
 
 
 def _build_recent_analyze_messages(
@@ -225,7 +485,12 @@ def _build_recent_analyze_messages(
         txt = str(txt or '')
         if txt == '':
             continue
-        recent.append({'role': item.get('role'), 'content': txt})
+        recent_item = {'role': item.get('role'), 'content': txt}
+        if item.get("source"):
+            recent_item["source"] = item.get("source")
+        if isinstance(item.get("metadata"), dict) and item.get("metadata"):
+            recent_item["metadata"] = item.get("metadata").copy()
+        recent.append(recent_item)
         if item.get('role') == 'user':
             last_user_idx = len(recent) - 1
             last_user_source_idx = source_idx
@@ -250,7 +515,7 @@ def _build_recent_analyze_messages(
 
 
 async def _safe_close(target) -> None:
-    """关 ws / session 的统一兜底。已进入清理阶段，close 失败不影响后续流程。"""
+    """Unified fallback for closing ws / session. We are already in the cleanup phase, so a failed close must not affect the rest of the flow."""
     if target is None:
         return
     try:
@@ -260,10 +525,11 @@ async def _safe_close(target) -> None:
 
 
 class _WSSlot:
-    """单 ws 端点的共享状态。主 loop / reader / maintainer 三方读写。
+    """Shared state for a single ws endpoint. Read/written by the main loop, reader, and maintainer.
 
-    主 loop 只对 ``ws`` / ``dead_event`` 做读 + 标死，从不调 ws_connect / close；
-    全部生命周期由 :func:`_slot_maintainer` 在独立 task 里管理。
+    The main loop only reads ``ws`` / ``dead_event`` and marks them dead; it never calls
+    ws_connect / close. The entire lifecycle is managed by :func:`_slot_maintainer` in a
+    separate task.
     """
     __slots__ = ("name", "url", "lanlan_name", "ws_kwargs",
                  "ws", "session", "reader", "maintainer", "dead_event")
@@ -278,20 +544,21 @@ class _WSSlot:
         self.reader: asyncio.Task | None = None
         self.maintainer: asyncio.Task | None = None
         self.dead_event = asyncio.Event()
-        self.dead_event.set()  # 初始即"死" → maintainer 第一次 wait 立即返回，触发首连
+        self.dead_event.set()  # Initially dead -> maintainer's first wait returns immediately, triggering initial connection.
 
 
 def _mark_dead(slot: _WSSlot) -> None:
-    """标记 slot 为断开。幂等。主 loop send 失败 / reader 检测 close 都调这个。"""
+    """Mark the slot as disconnected. Idempotent. Called both when the main loop's send fails and when the reader detects a close."""
     slot.ws = None
     slot.dead_event.set()
 
 
 async def _slot_reader(slot: _WSSlot, ws: aiohttp.ClientWebSocketResponse) -> None:
-    """绑定到具体 ws 实例的读循环。检测 close → mark_dead 唤醒 maintainer。
+    """Read loop bound to a specific ws instance. Detects close → mark_dead wakes the maintainer.
 
-    ws 通过参数传入而不是从 slot 读，避免 maintainer 已经替换 slot.ws 后老 reader
-    误标新 ws 为死。被 maintainer 主动 cancel 时不调 mark_dead。
+    The ws is passed as a parameter instead of read from the slot, so that an old reader
+    cannot mistakenly mark a new ws dead after the maintainer has already replaced
+    slot.ws. Does not call mark_dead when actively cancelled by the maintainer.
     """
     try:
         while True:
@@ -305,7 +572,7 @@ async def _slot_reader(slot: _WSSlot, ws: aiohttp.ClientWebSocketResponse) -> No
                 return
     except Exception:
         pass
-    # 仅当当前 slot.ws 仍是这条 ws 时才标死，避免覆盖 maintainer 刚装上的新连接
+    # Mark dead only if slot.ws still references this socket, avoiding overwriting the maintainer's replacement.
     if slot.ws is ws:
         _mark_dead(slot)
 
@@ -315,25 +582,27 @@ async def _slot_maintainer(
     *,
     backoff_min: float = 0.25,
     backoff_max: float = 1.5,
+    auth_retry: float = 30.0,
 ) -> None:
-    """单 slot 的 reconnect 循环，事件驱动 + 指数退避。
+    """Per-slot reconnect loop, event-driven + exponential backoff.
 
-    monitor 是外挂；不在的时候这条 task 会以 backoff_max 节奏静默重试，主 sync loop
-    完全不感知。
+    The monitor is an optional add-on; when absent, this task silently retries at the
+    backoff_max cadence and the main sync loop is completely unaware.
 
-    周期保证：每次尝试 = ``wait_for(ws_connect, timeout=backoff)``，所以 cycle 时长
-    被 backoff 双向夹住——
-    - 上限：connect 挂到 timeout 才失败，cycle ≈ backoff
-    - 下限：connect 极速 fail（refused），sleep 补足到 backoff，cycle = backoff
+    Cycle guarantee: each attempt = ``wait_for(ws_connect, timeout=backoff)``, so the
+    cycle duration is clamped by backoff on both sides —
+    - upper bound: connect hangs until timeout before failing, cycle ≈ backoff
+    - lower bound: connect fails instantly (refused), sleep pads up to backoff, cycle = backoff
 
-    backoff_max=1.5s 即"最差 1.5s 轮询"。Windows 上裸 ws_connect 失败有时要 ~4s
-    （TCP SYN timeout），不加 wait_for 这条保证就破了。
+    backoff_max=1.5s means "worst case 1.5s polling". On Windows a bare ws_connect
+    failure can take ~4s (TCP SYN timeout); without wait_for this guarantee would break.
     """
     backoff = backoff_min
+    auth_warned = False
     while True:
         await slot.dead_event.wait()
 
-        # 旧 reader / session 异步清理（不阻塞重连本身）
+        # Clean old readers/sessions asynchronously without blocking reconnection.
         old_reader = slot.reader
         old_session = slot.session
         slot.reader = None
@@ -354,24 +623,35 @@ async def _slot_maintainer(
         except asyncio.CancelledError:
             raise
         except Exception as e:
+            # Reap failed sessions in the background immediately to prevent lingering.
+            asyncio.create_task(_safe_close(new_session))
+            slot.session = None
+            if isinstance(e, aiohttp.WSServerHandshakeError) and e.status in (401, 403):
+                # Token mismatch cannot recover through fast retries; notify once and slow retries rather than flooding Monitor every 1.5 s.
+                if not auth_warned:
+                    logger.warning(
+                        f"[{slot.lanlan_name}] {slot.name} Monitor 拒绝认证 (HTTP {e.status})，"
+                        f"请检查主服务与 Monitor 的 NEKO_MONITOR_TOKEN 是否一致；{auth_retry:.0f}s 后重试"
+                    )
+                    auth_warned = True
+                await asyncio.sleep(auth_retry)
+                continue
             logger.debug(
                 f"[{slot.lanlan_name}] {slot.name} ws_connect 失败: "
                 f"{type(e).__name__}: {e} (backoff {backoff:.2f}s)"
             )
-            # 失败的 session 立即后台收，避免 lingering
-            asyncio.create_task(_safe_close(new_session))
-            slot.session = None
-            # 拉到 backoff 周期：fast-fail (refused, ms 级) 时补 sleep；
-            # timeout 到点失败时基本不 sleep 直接进下一轮
+            # Maintain the backoff period: add sleep after millisecond-scale refused fast failures;
+            # deadline timeouts need little/no sleep before retry.
             elapsed = time.monotonic() - cycle_start
             if elapsed < backoff:
                 await asyncio.sleep(backoff - elapsed)
             backoff = min(backoff * 2, backoff_max)
-            continue  # dead_event 仍 set，下轮立即再试
+            continue  # dead_event remains set, triggering immediate retry next round.
 
-        # 顺序很重要：先把 ws 装上 + 清 dead_event，再创建 reader。
-        # 否则 reader 可能在 clear() 之前就 mark_dead，clear 会把这个信号擦掉。
+        # Ordering matters: install ws and clear dead_event before creating its reader;
+        # otherwise reader mark_dead may occur before clear(), which erases the signal.
         slot.ws = new_ws
+        auth_warned = False
         slot.dead_event.clear()
         slot.reader = asyncio.create_task(
             _slot_reader(slot, new_ws),
@@ -381,7 +661,7 @@ async def _slot_maintainer(
 
 
 async def _try_send_json(slot: _WSSlot | None, payload: dict) -> bool:
-    """fail-soft 发送。slot 不存在 / ws 死 / send 抛异常都返回 False，不向上传播。"""
+    """Fail-soft send. Returns False when the slot is missing / ws is dead / send raises; never propagates upward."""
     if slot is None:
         return False
     ws = slot.ws
@@ -415,15 +695,28 @@ async def _post_memory_server(
     payload: list[dict],
     *,
     timeout_s: float,
+    language: str | None = None,
+    render_language: str | None = None,
 ) -> tuple[bool, str, dict]:
     """Post history payload to memory_server and treat only 2xx+valid JSON as success."""
     encoded_name = quote(lanlan_name, safe="")
     url = f"http://127.0.0.1:{MEMORY_SERVER_PORT}/{endpoint}/{encoded_name}"
 
     client = get_internal_http_client()
+    request_payload = {
+        "input_history": json.dumps(payload, indent=2, ensure_ascii=False),
+    }
+    # Only a live explicit frontend/session locale is durable provenance.
+    # A renderer locale is a request-local fallback, never a substitute for the
+    # durable ``language`` field.  Keep the two wire fields mutually exclusive
+    # so downstream persistence cannot mistake UI evidence for a preference.
+    if is_supported_language_code(language):
+        request_payload["language"] = language
+    elif is_supported_language_code(render_language):
+        request_payload["render_language"] = render_language
     response = await client.post(
         url,
-        json={"input_history": json.dumps(payload, indent=2, ensure_ascii=False)},
+        json=request_payload,
         timeout=timeout_s,
     )
     raw_body = response.text
@@ -488,30 +781,80 @@ def _mark_memory_cache_exception(
         logger.warning(msg)
 
 
+async def _complete_session_end_memory_barrier(message: dict, lanlan_name: str) -> None:
+    """Run an optional post-settlement callback and resolve its in-process ack.
+
+    Language-preference changes attach this private control data to the ordinary
+    ``session end`` queue item.  Running the callback here keeps it ordered after
+    every older chat message and after the terminal memory-server write, while the
+    future lets the caller avoid returning before the isolation step completes.
+    """
+    callback = message.get("_after_memory_settlement")
+    completion = message.get("_memory_settlement_done")
+    if not callable(callback):
+        if isinstance(completion, asyncio.Future) and not completion.done():
+            completion.set_result(None)
+        return
+
+    try:
+        callback_result = callback()
+        if inspect.isawaitable(callback_result):
+            await callback_result
+    except Exception as exc:
+        logger.warning(
+            "[%s] session-end post-settlement callback failed: %s: %s",
+            lanlan_name,
+            type(exc).__name__,
+            exc,
+            exc_info=True,
+        )
+        if isinstance(completion, asyncio.Future) and not completion.done():
+            completion.set_exception(exc)
+    else:
+        if isinstance(completion, asyncio.Future) and not completion.done():
+            completion.set_result(None)
+
+
 async def run_sync_connector(
     message_queue: asyncio.Queue,
     lanlan_name,
-    sync_server_url=f"ws://127.0.0.1:{MONITOR_SERVER_PORT}",
+    sync_server_url=MONITOR_SYNC_URL,
     config=None,
     status_callback=None,
+    user_language_provider=None,
+    render_language_provider=None,
+    monitor_auth_token: str | None = MONITOR_TOKEN or None,
+    tool_names_provider=None,
 ):
-    """Async-native 同步连接器，跑在调用方主 event loop 上。
+    """Async-native sync connector, running on the caller's main event loop.
 
-    架构：
-    - 主 loop：``await message_queue.get()`` 阻塞等消息，处理后用 ``_try_send_*``
-      把数据塞进 ws；ws 死/不存在时 fail-soft 跳过。**主 loop 永远不调
-      ws_connect / session.close / ws.close**，所以 monitor 没启动或断线
-      不会阻塞 memory 等其它 await 路径。
-    - 每个 ws 一个 :func:`_slot_maintainer` 后台 task：``dead_event`` 唤醒 +
-      指数退避重连（0.25s → 2s 封顶）。失败时静默重试，不打扰主 loop。
-    - 每条活 ws 一个 :func:`_slot_reader` 后台 task：检测服务端 close →
-      ``_mark_dead`` → 唤醒 maintainer。
-    - 应用层 heartbeat 已删除：aiohttp 底层 ``heartbeat=10`` 的 ping/pong
-      会在 ~10s 内把死连接变成 reader 看得见的 ``CLOSED``。
+    Architecture:
+    - Main loop: blocks on ``await message_queue.get()`` for messages, then pushes data
+      into the ws via ``_try_send_*``; fail-soft skips when the ws is dead/missing.
+      **The main loop never calls ws_connect / session.close / ws.close**, so a monitor
+      that hasn't started or is disconnected never blocks other await paths like memory.
+    - One :func:`_slot_maintainer` background task per ws: woken by ``dead_event`` +
+      exponential-backoff reconnect (0.25s → capped at 2s). Retries silently on failure
+      without disturbing the main loop.
+    - One :func:`_slot_reader` background task per live ws: detects server close →
+      ``_mark_dead`` → wakes the maintainer.
+    - The application-level heartbeat has been removed: aiohttp's underlying
+      ``heartbeat=10`` ping/pong turns a dead connection into a ``CLOSED`` the reader
+      can see within ~10s.
 
     Args:
-        status_callback: 可选 ``Callable[[str], None]``。运行在主 loop 上，
-            可直接 ``asyncio.create_task(...)``，无需 ``run_coroutine_threadsafe``。
+        status_callback: optional ``Callable[[str], None]``. Runs on the main loop, so it
+            may call ``asyncio.create_task(...)`` directly without
+            ``run_coroutine_threadsafe``.
+        user_language_provider: optional callable returning the live session locale.
+        render_language_provider: optional callable returning the current renderer
+            locale when the session has no explicit language preference.
+        monitor_auth_token: Monitor bearer token, defaulting to the configured
+            ``MONITOR_TOKEN``. When set it is sent as an Authorization header on
+            Monitor sync WebSocket connections.
+        tool_names_provider: optional callable returning the session's registered
+            tool names, used to cut tool calls a reply spoke as text
+            (``normalize_assistant_text``) before it is stored.
     """
     chat_history: list = []
     default_config = {'bullet': True, 'monitor': True}
@@ -519,33 +862,79 @@ async def run_sync_connector(
         config = {}
     config = default_config | config
 
-    # 历史保留：旧 thread 版本里多处 ``if shutdown_event.is_set(): break`` 用于
-    # 子进程时代跳过对正在关闭的 memory_server 的 HTTP 调用。改 async 后取消
-    # 由 await 点自然 raise CancelledError 顶替，guard 不再有意义。统一替换成
-    # 永远 False 的 stub，避免大面积重排缩进；这些 guard 现在是死代码，但语义
-    # 仍然正确（不阻挡正常路径），后续清理 PR 可一并删。
+    def _current_user_language() -> str | None:
+        if not callable(user_language_provider):
+            return None
+        try:
+            selected = user_language_provider()
+        except Exception as exc:
+            logger.debug("[%s] session language provider failed: %s", lanlan_name, exc)
+            return None
+        return selected if is_supported_language_code(selected) else None
+
+    def _current_render_language() -> str | None:
+        if not callable(render_language_provider):
+            return None
+        try:
+            selected = render_language_provider()
+        except Exception as exc:
+            logger.debug("[%s] render language provider failed: %s", lanlan_name, exc)
+            return None
+        return selected if is_supported_language_code(selected) else None
+
+    def _normalized_reply(text: str) -> str:
+        tool_names = None
+        if callable(tool_names_provider):
+            try:
+                tool_names = tool_names_provider()
+            except Exception as exc:
+                logger.debug("[%s] tool names provider failed: %s", lanlan_name, exc)
+        return normalize_assistant_text(text, tool_names)
+
+    def _current_memory_languages() -> tuple[str | None, str | None]:
+        """Snapshot mutually exclusive durable and render-only memory hints."""
+        language = _current_user_language()
+        if language is not None:
+            return language, None
+        return None, _current_render_language()
+
+    def _current_analyze_language() -> str | None:
+        """Use the visible locale for one analyzer request without persisting it."""
+        language, render_language = _current_memory_languages()
+        return language or render_language
+
+    # Historical preservation: threaded code used ``if shutdown_event.is_set(): break`` to skip HTTP calls
+    # to a shutting-down memory_server in subprocess mode. Async cancellation now raises
+    # CancelledError naturally at awaits, making guards redundant. Replace uniformly with
+    # always-False stubs to avoid mass reindentation. They are now dead code but retain correct
+    # semantics by allowing normal paths; a later cleanup PR may remove them together.
     class _NeverShutdown:
         @staticmethod
         def is_set() -> bool:
             return False
     shutdown_event = _NeverShutdown()
 
-    # ws slots：config 里关掉的端点压根不创建 maintainer，零成本。
+    # WS slots: disabled config endpoints create no maintainer and cost nothing.
     sync_slot: _WSSlot | None = None
     binary_slot: _WSSlot | None = None
     bullet_slot: _WSSlot | None = None
     if config['monitor']:
+        monitor_ws_kwargs = {'heartbeat': 10}
+        if monitor_auth_token:
+            monitor_ws_kwargs['headers'] = {
+                'Authorization': f'Bearer {monitor_auth_token}',
+            }
         sync_slot = _WSSlot(
             'sync',
             f"{sync_server_url}/sync/{lanlan_name}",
             lanlan_name,
-            ws_kwargs={'heartbeat': 10},
+            ws_kwargs=monitor_ws_kwargs,
         )
         binary_slot = _WSSlot(
             'binary',
             f"{sync_server_url}/sync_binary/{lanlan_name}",
             lanlan_name,
-            ws_kwargs={'heartbeat': 10},
+            ws_kwargs=monitor_ws_kwargs.copy(),
         )
     if config['bullet']:
         bullet_slot = _WSSlot(
@@ -562,14 +951,19 @@ async def run_sync_connector(
         )
 
     user_input_cache = ''
-    text_output_cache = ''  # lanlan的当前消息
+    user_input_proof = None
+    user_input_sources: set[str] = set()
+    text_output_cache = ''  # lanlan's current message.
     text_output_request_id = None
+    text_output_proof = None
+    # Raw originals use server-created identities and never normalized memory text.
+    original_output = AssistantOriginalBuffer(tail_grace=LATE_TEXT_GRACE_SECONDS)
     current_turn = 'user'
-    had_user_input_this_turn = False  # 当前 turn 是否有用户输入（False = 主动搭话）
+    had_user_input_this_turn = False  # Whether the current turn has user input; False means proactive chat.
     current_turn_start_index = 0
     last_screen = None
     pending_user_images: list = []
-    last_synced_index = 0  # 用于 turn end 时仅同步新增消息到 memory，避免 memory_browser 不更新
+    last_synced_index = 0  # Sync only new messages to memory at turn end so memory_browser updates correctly.
     avatar_interaction_memory_cache: dict[str, dict[str, int | str]] = {}
     memory_cache_health_state = {
         MEMORY_CACHE_SCOPE_AVATAR: False,
@@ -578,14 +972,14 @@ async def run_sync_connector(
 
     try:
         while True:
-            # 阻塞等消息。无消息时主 loop 完全沉默——ws 维护已下沉到 _slot_maintainer，
-            # 不再需要周期唤醒做 reconnect/heartbeat 巡检。
+            # Block awaiting messages. With none, the main loop stays silent because WS maintenance lives in _slot_maintainer,
+            # eliminating periodic reconnect/heartbeat inspection wakeups.
             message = await message_queue.get()  # noqa: ASYNC_BLOCK — asyncio.Queue, not queue.Queue
 
             if message is not None:
                 try:
                     if message["type"] == "json":
-                        # Forward to monitor if enabled (fail-soft: monitor 不在直接跳过)
+                        # Forward to monitor if enabled, failing softly by skipping absent monitors.
                         await _try_send_json(sync_slot, message["data"])
 
                         # Only treat assistant turn when it's a gemini_response
@@ -597,15 +991,18 @@ async def run_sync_connector(
                                     (message["data"].get("metadata") or {}).get("source"),
                                 )
                                 continue
+                            original_output.append(message["data"])
                             if current_turn == 'user':  # assistant new message starts
                                 had_user_input_this_turn = bool(user_input_cache)
                                 if user_input_cache:
-                                    chat_history.append({'role': 'user', 'content': [{"type": "text", "text": user_input_cache}]})
+                                    _append_user_input_cache_to_history(chat_history, user_input_cache, user_input_sources, user_input_proof)
                                     user_input_cache = ''
                                 current_turn = 'assistant'
                                 text_output_request_id = message["data"].get("request_id")
                                 current_turn_start_index = len(chat_history)
                                 text_output_cache = datetime.now().strftime('[%Y%m%d %a %H:%M] ')
+                                text_output_proof = message['data'].get('chat_original_source')
+                                text_output_proof = dict(text_output_proof) if isinstance(text_output_proof, dict) else None
 
                                 if bullet_slot is not None and bullet_slot.ws is not None:
                                     try:
@@ -638,14 +1035,23 @@ async def run_sync_connector(
                     elif message["type"] == "binary":
                         await _try_send_bytes(binary_slot, message["data"])
 
-                    elif message["type"] == "user":  # 准备转录
+                    elif message["type"] == "user":  # Prepare transcription.
                         data = message["data"].get("data")
                         input_type = message["data"].get("input_type")
-                        if input_type == "transcript": # 暂时只处理语音，后续还需要记录图片
+                        if input_type == "transcript": # Handle only audio for now; images still need recording later.
+                            for source_value in _iter_source_values(message["data"].get("source")):
+                                user_input_sources.add(source_value)
+                            transcript_metadata = message["data"].get("metadata")
+                            if isinstance(transcript_metadata, dict):
+                                for source_value in _iter_source_values(transcript_metadata.get("source")):
+                                    user_input_sources.add(source_value)
+                                for source_value in _iter_source_values(transcript_metadata.get("sources")):
+                                    user_input_sources.add(source_value)
                             if user_input_cache == '':
-                                await _try_send_json(sync_slot, {'type': 'user_activity'})  # 用于打断前端声音播放
+                                user_input_proof = message['data'].get('chat_original_source')
+                                await _try_send_json(sync_slot, {'type': 'user_activity'})  # Interrupt frontend audio playback.
                             user_input_cache += data
-                            # 发送用户转录到 monitor 供副终端显示
+                            # Send user transcripts to monitor for secondary-terminal display.
                             if data:
                                 await _try_send_json(sync_slot, {'type': 'user_transcript', 'text': data})
                         elif input_type in MIRROR_USER_INPUT_TYPES:
@@ -658,74 +1064,93 @@ async def run_sync_connector(
                             if data:
                                 await _try_send_json(sync_slot, {'type': 'user_transcript', 'text': data})
                             await _try_send_json(sync_slot, {'type': 'user_activity'})
-                        elif input_type == "screen":
-                            last_screen = data
-                            if data:
-                                pending_user_images.append(data)
-                                if len(pending_user_images) > PENDING_USER_IMAGES_MAX:
-                                    del pending_user_images[:-PENDING_USER_IMAGES_MAX]
-                        elif input_type == "camera":
-                            last_screen = data
-                            if data:
-                                pending_user_images.append(data)
-                                if len(pending_user_images) > PENDING_USER_IMAGES_MAX:
-                                    del pending_user_images[:-PENDING_USER_IMAGES_MAX]
+                        elif input_type in _USER_IMAGE_INPUT_TYPES:
+                            if input_type in {"screen", "camera"}:
+                                last_screen = data
+                            appended_image = _append_pending_user_image(
+                                pending_user_images,
+                                data,
+                                message["data"].get("request_id") or "",
+                                input_type,
+                                source=message["data"].get("source"),
+                            )
+                            if not appended_image and message["data"].get("has_image"):
+                                await _try_send_json(sync_slot, {'type': 'user_activity'})
 
                     elif message["type"] == "system":
                         try:
+                            if message["data"] == "chat original tool":
+                                # Provenance only: keep the whole reply local,
+                                # without changing memory or forwarding a UI event.
+                                original_output.mark_tool(message.get("chat_original_id"))
+                                if text_output_proof and text_output_proof.get('recordId') == message.get('chat_original_id'):
+                                    text_output_proof['origin'] = 'tool'
+                                continue
                             if message["data"] == "google disconnected":
+                                original_output.discard()
                                 if len(text_output_cache) > 0:
                                     chat_history.append({'role': 'system', 'content': [
                                         {'type': 'text', 'text': "网络错误，您已断开连接！"}]})
                                 text_output_cache = ''
                                 text_output_request_id = None
+                                text_output_proof = None
                             
                             elif message["data"] == "response_discarded_clear":
+                                original_output.discard()
                                 logger.debug(f"[{lanlan_name}] 收到 response_discarded_clear，清空当前输出缓存")
                                 text_output_cache = ''
                                 text_output_request_id = None
+                                text_output_proof = None
                             
                             if message["data"] == "renew session":
-                                # 检查是否正在关闭
+                                # Check shutdown state.
                                 if shutdown_event.is_set():
                                     logger.info(f"[{lanlan_name}] 进程正在关闭，跳过renew session处理")
                                     break
+                                # The existing reset persists completed/partial output at this boundary.
+                                await original_output.finish(lanlan_name)
                                 
-                                # 先处理未完成的用户输入缓存（如果有）
+                                # First process unfinished user-input buffers, if any.
                                 if user_input_cache:
-                                    chat_history.append({'role': 'user', 'content': [{"type": "text", "text": user_input_cache}]})
+                                    _append_user_input_cache_to_history(chat_history, user_input_cache, user_input_sources, user_input_proof)
                                     user_input_cache = ''
                                 
-                                # 再处理未完成的输出缓存（如果有）
+                                # Then process unfinished output buffers, if any.
                                 current_turn = 'user'
-                                text_output_cache = normalize_text(text_output_cache)
+                                text_output_cache = _normalized_reply(text_output_cache)
                                 if len(text_output_cache) > 0:
                                     chat_history.append(
-                                            {'role': 'assistant', 'content': [{'type': 'text', 'text': text_output_cache}]})
+                                            _assistant_history_message(text_output_cache, text_output_proof))
                                 text_output_cache = ''
                                 text_output_request_id = None
+                                text_output_proof = None
                                 current_turn_start_index = len(chat_history)
-                                # 合并未同步的连续主动搭话消息
+                                # Merge unsynced consecutive proactive-chat messages.
                                 merge_unsynced_tail_assistants(chat_history, last_synced_index)
 
-                                # 再次检查关闭状态
+                                # Recheck shutdown state.
                                 if shutdown_event.is_set():
                                     logger.info(f"[{lanlan_name}] 进程正在关闭，跳过memory_server请求")
                                     chat_history.clear()
                                     break
                                 
-                                # 增量发送：只发 /cache 未覆盖的剩余消息，触发 LLM 结算
+                                # Send only remaining messages not covered by /cache, triggering LLM settlement.
                                 remaining = chat_history[last_synced_index:]
                                 logger.info(f"[{lanlan_name}] 热重置：聊天历史 {len(chat_history)} 条，增量 {len(remaining)} 条")
-                                # 确定调用端点：有增量走 /renew，无增量走 /settle（补全摘要+时间戳）
+                                # Select /renew for new messages, otherwise /settle to complete summaries/timestamps.
                                 _renew_endpoint = "renew" if remaining else "settle"
                                 _renew_payload = remaining if remaining else []
+                                _memory_language, _memory_render_language = (
+                                    _current_memory_languages()
+                                )
                                 try:
                                     ok, err_detail, _ = await _post_memory_server(
                                         _renew_endpoint,
                                         lanlan_name,
                                         _renew_payload,
                                         timeout_s=30.0,
+                                        language=_memory_language,
+                                        render_language=_memory_render_language,
                                     )
                                     if not ok:
                                         logger.error(f"[{lanlan_name}] 热重置记忆处理失败 ({_renew_endpoint}): {err_detail}")
@@ -746,14 +1171,15 @@ async def run_sync_connector(
                                 chat_history.clear()
                                 last_synced_index = 0
 
-                            if message["data"] in ('turn end', 'turn end agent_callback'): # lanlan的消息结束了
+                            if message["data"] in ('turn end', 'turn end agent_callback'): # lanlan's message ended.
                                 is_agent_callback_turn_end = (message["data"] == 'turn end agent_callback')
-                                # 后端打标：meta 与 turn end 事件原子绑定，不再依赖独立通道
-                                # 的 pending_* 状态。game-only 足球台词在这里先截断，避免
-                                # 未打标的兼容镜像文本先 append 到 ordinary chat_history。
+                                # Backend labeling atomically binds meta to turn-end events, removing reliance on separate-channel
+                                # pending_* state. Truncate game-only soccer dialogue here before
+                                # unlabeled compatibility mirror text can enter ordinary chat_history.
                                 turn_end_meta = message.get("meta") if isinstance(message, dict) else None
                                 if not isinstance(turn_end_meta, dict):
                                     turn_end_meta = None
+                                turn_request_id = message.get("request_id") if isinstance(message, dict) else None
                                 was_assistant_turn = current_turn == 'assistant'
                                 if is_mirror_turn_end_meta(turn_end_meta):
                                     # Mirror turn-end: mirror assistant messages
@@ -781,26 +1207,34 @@ async def run_sync_connector(
                                     # current ordinary turn was in flight, leave
                                     # user-side alone.
                                     if was_assistant_turn:
+                                        original_output.discard()
                                         text_output_cache = ''
                                         text_output_request_id = None
+                                        text_output_proof = None
                                         current_turn = 'user'
                                         current_turn_start_index = len(chat_history)
                                         had_user_input_this_turn = False
                                     await _try_send_json(sync_slot, {'type': 'turn end'})
                                     logger.debug("[%s] mirror turn end skipped for ordinary memory/analyzer", lanlan_name)
                                     continue
+                                # Terminal metadata excludes avatar/tool output before raw persistence.
+                                await original_output.finish(
+                                    lanlan_name, message.get('chat_original_id'),
+                                    excluded=bool(turn_end_meta and turn_end_meta.get('kind') == 'avatar_interaction'),
+                                )
                                 current_turn = 'user'
-                                text_output_cache = normalize_text(text_output_cache)
+                                text_output_cache = _normalized_reply(text_output_cache)
                                 if len(text_output_cache) > 0:
                                     chat_history.append(
-                                        {'role': 'assistant', 'content': [{'type': 'text', 'text': text_output_cache}]})
+                                        _assistant_history_message(text_output_cache, text_output_proof))
                                 text_output_cache = ''
                                 text_output_request_id = None
-                                # kind == 'avatar_interaction' 才进入隔离路径，其它情况按
-                                # proactive / normal 处理。
-                                # meta 由 core 端 turn end 原子打标；avatar 互动若被用户
-                                # 接管则 core 会清空 meta，所以这里不再需要 had_user_input
-                                # 二次兜底，避免"用户语音缓存刚好先入队"误落回普通路径。
+                                text_output_proof = None
+                                # Only kind == 'avatar_interaction' enters isolation; otherwise process as
+                                # proactive / normal.
+                                # Core labels turn-end meta atomically and clears it if user input takes over avatar
+                                # interactions. No had_user_input fallback is needed here, avoiding ordinary-path
+                                # misclassification when user audio buffers happen to enqueue first.
                                 is_avatar_interaction_turn = (
                                     turn_end_meta is not None
                                     and turn_end_meta.get("kind") == "avatar_interaction"
@@ -810,7 +1244,7 @@ async def run_sync_connector(
                                 avatar_turn_assistant_text = ''
                                 if is_avatar_interaction_turn and avatar_turn_slice:
                                     avatar_turn_assistant_text = _extract_chat_item_text(avatar_turn_slice[-1]).strip()
-                                # 主动搭话（无用户输入）时：合并未同步的连续 assistant 消息，不写入 /cache
+                                # For proactive turns without user input, merge unsynced consecutive assistant messages without /cache writes.
                                 if not had_user_input_this_turn and not is_avatar_interaction_turn:
                                     merge_unsynced_tail_assistants(chat_history, last_synced_index)
                                 await _try_send_json(sync_slot, {'type': 'turn end'})
@@ -821,8 +1255,8 @@ async def run_sync_connector(
                                     memory_note = str(turn_end_meta.get('memory_note') or '').strip()
                                     memory_dedupe_key = str(turn_end_meta.get('memory_dedupe_key') or '').strip()
                                     memory_dedupe_rank = turn_end_meta.get('memory_dedupe_rank', 1)
-                                    # 先快照 dedupe 槽位，/cache 失败时回滚，避免 8s 窗口内后续
-                                    # 真实互动被误判为"已记录"丢失。
+                                    # Snapshot dedupe slots first and roll back on /cache failure, preventing real interactions
+                                    # in the next 8 s from being dropped as already recorded.
                                     dedupe_rollback_key = (memory_dedupe_key or memory_note).strip()
                                     dedupe_prior_entry = avatar_interaction_memory_cache.get(dedupe_rollback_key)
                                     should_persist_avatar_turn = (
@@ -840,12 +1274,17 @@ async def run_sync_connector(
                                             {'role': 'assistant', 'content': [{'type': 'text', 'text': avatar_turn_assistant_text}]},
                                         ]
                                         cache_persist_failed = False
+                                        _memory_language, _memory_render_language = (
+                                            _current_memory_languages()
+                                        )
                                         try:
                                             ok, err_detail, _ = await _post_memory_server(
                                                 "cache",
                                                 lanlan_name,
                                                 avatar_memory_messages,
                                                 timeout_s=10.0,
+                                                language=_memory_language,
+                                                render_language=_memory_render_language,
                                             )
                                             if ok:
                                                 _mark_memory_cache_success(
@@ -881,33 +1320,56 @@ async def run_sync_connector(
                                             last_synced_index = len(chat_history)
 
                                     current_turn_start_index = len(chat_history)
-                                    # avatar 分支 continue 会跳过正常 finally 的 pending_user_images
-                                    # 清理，陈旧截图/摄像帧若留到下一轮 analyzer 会变成"跨轮污染"。
+                                    # The avatar branch's continue skips ordinary finally cleanup of pending_user_images;
+                                    # leftover screenshots/camera frames would contaminate the next analyzer turn.
                                     pending_user_images = []
                                     continue
-                                # 非阻塞地向tool_server发送最近对话，供分析器识别潜在任务。
-                                # 仅 agent-callback 专用通道会显式跳过，避免任务结果回调引发二次分析。
+                                # Send recent conversation to tool_server nonblockingly for potential-task analysis.
+                                # Skip only the dedicated agent-callback channel to avoid reanalyzing task-result callbacks.
                                 if not shutdown_event.is_set():
+                                    selected_pending_user_images, remaining_pending_user_images = (
+                                        _partition_pending_user_images_for_turn(
+                                            pending_user_images,
+                                            turn_request_id,
+                                            consume_untagged=had_user_input_this_turn,
+                                        )
+                                    )
                                     try:
-                                        # 构造最近的消息摘要，并保留本轮最近的图片附件
+                                        # Build recent-message summaries and retain this turn's latest image attachments.
                                         recent = _build_recent_analyze_messages(
                                             chat_history,
-                                            pending_user_images,
+                                            selected_pending_user_images,
                                             allow_attach_to_last_user=had_user_input_this_turn,
                                         )
                                         has_user = any(m.get('role') == 'user' for m in recent)
+                                        latest_user_is_avatar_drop = _latest_user_message_has_source(
+                                            recent,
+                                            AVATAR_DROP_SOURCE,
+                                        )
                                         logger.info(
                                             f"[{lanlan_name}] turn_end analyze check: "
                                             f"history={len(chat_history)} recent={len(recent)} "
                                             f"has_user={has_user} had_input={had_user_input_this_turn} "
-                                            f"agent_callback_turn={is_agent_callback_turn_end}"
+                                            f"agent_callback_turn={is_agent_callback_turn_end} "
+                                            f"avatar_drop_turn={latest_user_is_avatar_drop}"
                                         )
-                                        if recent and not is_agent_callback_turn_end:
+                                        if recent and has_user and latest_user_is_avatar_drop:
+                                            logger.info(f"[{lanlan_name}] analyze_request skipped (avatar_drop turn_end), messages={len(recent)}")
+                                        elif recent and not is_agent_callback_turn_end:
+                                            # had_user_input gates the proactive marking: a turn with no
+                                            # user text but WITH a fresh user image (screenshot/camera) is
+                                            # still a user turn — count its attachments as input so it is
+                                            # NOT mis-marked proactive (which, with the feature off, would
+                                            # drop the image task). Only a genuinely self-initiated turn
+                                            # (no text, no image) is proactive.
+                                            _turn_had_user_input = had_user_input_this_turn or bool(selected_pending_user_images)
                                             sent = await _publish_analyze_request_with_fallback(
                                                 lanlan_name=lanlan_name,
                                                 trigger="turn_end",
                                                 messages=recent,
                                                 conversation_id=uuid.uuid4().hex,
+                                                had_user_input=_turn_had_user_input,
+                                                language=_current_analyze_language(),
                                             )
                                             if sent:
                                                 logger.debug(f"[{lanlan_name}] analyze_request dispatch success (turn_end), messages={len(recent)}")
@@ -923,18 +1385,23 @@ async def run_sync_connector(
                                     except Exception as e:
                                         logger.debug(f"[{lanlan_name}] 发送到analyzer失败: {e}")
                                     finally:
-                                        pending_user_images = []
+                                        pending_user_images = remaining_pending_user_images
 
-                                # Turn end 轻量缓存：仅写入 recent history，不触发 LLM 摘要/整理
-                                # 主动搭话不写缓存——等用户回应后随下一轮正常 turn 一起入库
+                                # Lightweight turn-end cache: write recent history only, without LLM summarization/organization.
+                                # Do not cache proactive chat; persist with the next ordinary turn after the user's response.
                                 if had_user_input_this_turn and not shutdown_event.is_set() and last_synced_index < len(chat_history):
                                     new_messages = chat_history[last_synced_index:]
+                                    _memory_language, _memory_render_language = (
+                                        _current_memory_languages()
+                                    )
                                     try:
                                         ok, err_detail, _ = await _post_memory_server(
                                             "cache",
                                             lanlan_name,
                                             new_messages,
                                             timeout_s=10.0,
+                                            language=_memory_language,
+                                            render_language=_memory_render_language,
                                         )
                                         if ok:
                                             _mark_memory_cache_success(
@@ -958,46 +1425,64 @@ async def run_sync_connector(
                                             memory_cache_health_state,
                                         )
 
-                            elif message["data"] == 'session end': # 当前session结束了
-                                # 检查是否正在关闭，如果是则跳过网络操作
+                            elif message["data"] == 'session end': # Current session ended.
+                                is_context_reset_barrier = callable(
+                                    message.get("_after_memory_settlement")
+                                )
+                                # Skip network operations during shutdown.
                                 if shutdown_event.is_set():
                                     logger.info(f"[{lanlan_name}] 进程正在关闭，跳过session end处理")
                                     break
+                                await original_output.finish(lanlan_name)
                                 
-                                # 先处理未完成的用户输入缓存（如果有）
+                                # First process any unfinished user-input buffers.
                                 if user_input_cache:
-                                    chat_history.append({'role': 'user', 'content': [{"type": "text", "text": user_input_cache}]})
+                                    _append_user_input_cache_to_history(chat_history, user_input_cache, user_input_sources, user_input_proof)
                                     user_input_cache = ''
                                 
-                                # 再处理未完成的输出缓存（如果有）
+                                # Then process any unfinished output buffers.
                                 current_turn = 'user'
-                                text_output_cache = normalize_text(text_output_cache)
+                                text_output_cache = _normalized_reply(text_output_cache)
                                 if len(text_output_cache) > 0:
                                     chat_history.append(
-                                        {'role': 'assistant', 'content': [{'type': 'text', 'text': text_output_cache}]})
+                                        _assistant_history_message(text_output_cache, text_output_proof))
                                 text_output_cache = ''
                                 text_output_request_id = None
+                                text_output_proof = None
                                 current_turn_start_index = len(chat_history)
-                                # 合并未同步的连续主动搭话消息
+                                # Merge unsynced consecutive proactive-chat messages.
                                 merge_unsynced_tail_assistants(chat_history, last_synced_index)
 
-                                # 向tool_server发送最近对话，供分析器识别潜在任务（与turn end逻辑相同）
-                                # 再次检查关闭状态
+                                # Send recent conversation to tool_server for potential-task analysis, matching turn-end handling.
+                                # Recheck shutdown state.
                                 if not shutdown_event.is_set():
                                     try:
-                                        # 构造最近的消息摘要，并保留本轮最近的图片附件
+                                        # Build recent-message summaries and retain this turn's latest image attachments.
                                         recent = _build_recent_analyze_messages(
                                             chat_history,
-                                            pending_user_images,
+                                            _select_pending_user_images_for_session_end(
+                                                pending_user_images,
+                                                message.get("request_id"),
+                                            ),
                                             allow_attach_to_last_user=had_user_input_this_turn,
                                         )
                                         has_user = any(m.get('role') == 'user' for m in recent)
-                                        if recent and has_user:
+                                        latest_user_is_avatar_drop = _latest_user_message_has_source(
+                                            recent,
+                                            AVATAR_DROP_SOURCE,
+                                        )
+                                        if recent and has_user and latest_user_is_avatar_drop:
+                                            logger.info(f"[{lanlan_name}] analyze_request skipped (avatar_drop session_end), messages={len(recent)}")
+                                        elif recent and has_user:
                                             sent = await _publish_analyze_request_with_fallback(
                                                 lanlan_name=lanlan_name,
                                                 trigger="session_end",
                                                 messages=recent,
                                                 conversation_id=uuid.uuid4().hex,
+                                                language=_current_analyze_language(),
+                                                # session_end is terminal — never treated as proactive
+                                                # (had_user_input defaults True), so it always takes the
+                                                # ordinary user-turn path.
                                             )
                                             if sent:
                                                 logger.info(f"[{lanlan_name}] analyze_request dispatch success (session_end), messages={len(recent)}")
@@ -1015,27 +1500,40 @@ async def run_sync_connector(
                                     finally:
                                         pending_user_images = []
                                 
-                                # 再次检查关闭状态
+                                # Recheck shutdown state.
                                 if shutdown_event.is_set():
                                     logger.info(f"[{lanlan_name}] 进程正在关闭，跳过 session end 收尾")
                                     chat_history.clear()
                                     last_synced_index = 0
                                     break
                                 
-                                # 会话结算：
-                                # - 有增量（未被 /cache 覆盖）→ /process
-                                # - 无增量但有历史（已全部 /cache）→ /settle，补全摘要/时间索引/事实提取
+                                # Ordinary-session settlement: /process with new messages, otherwise /settle.
+                                # The language-switch barrier authoritatively clears recent.json afterward, so skip
+                                # summaries destined for deletion; write only unsynced tails through lightweight /cache into
+                                # the time index/outbox. Without a tail, proceed directly to cleanup callbacks.
                                 remaining = chat_history[last_synced_index:]
                                 logger.info(f"[{lanlan_name}] 会话结束：聊天历史 {len(chat_history)} 条，增量 {len(remaining)} 条")
-                                _settle_endpoint = "process" if remaining else "settle"
+                                if is_context_reset_barrier:
+                                    _settle_endpoint = "cache" if remaining else None
+                                else:
+                                    _settle_endpoint = "process" if remaining else "settle"
                                 _settle_payload = remaining if remaining else []
-                                if not shutdown_event.is_set():
+                                if _settle_endpoint is not None and not shutdown_event.is_set():
+                                    _memory_language, _memory_render_language = (
+                                        _current_memory_languages()
+                                    )
                                     try:
                                         ok, err_detail, _ = await _post_memory_server(
                                             _settle_endpoint,
                                             lanlan_name,
                                             _settle_payload,
-                                            timeout_s=30.0,
+                                            timeout_s=(
+                                                10.0
+                                                if is_context_reset_barrier
+                                                else 30.0
+                                            ),
+                                            language=_memory_language,
+                                            render_language=_memory_render_language,
                                         )
                                         if not ok:
                                             logger.warning(f"[{lanlan_name}] session end 记忆结算失败 ({_settle_endpoint}): {err_detail}")
@@ -1059,15 +1557,54 @@ async def run_sync_connector(
                             logger.error(f"[{lanlan_name}] System message error: {e}", exc_info=True)
                 except Exception as e:
                     logger.error(f"[{lanlan_name}] Message processing error: {e}", exc_info=True)
+                finally:
+                    is_memory_barrier = (
+                        isinstance(message, dict)
+                        and message.get("type") == "system"
+                        and message.get("data") == "session end"
+                        and (
+                            callable(message.get("_after_memory_settlement"))
+                            or isinstance(
+                                message.get("_memory_settlement_done"),
+                                asyncio.Future,
+                            )
+                        )
+                    )
+                    if is_memory_barrier:
+                        # Even when terminal persistence failed unexpectedly, the
+                        # old connector-local tail must not survive the isolation
+                        # callback and leak into a later session.  Normal session
+                        # ends already clear these fields in their success path;
+                        # repeating the reset here makes the barrier fail closed.
+                        chat_history.clear()
+                        last_synced_index = 0
+                        user_input_cache = ''
+                        user_input_sources.clear()
+                        text_output_cache = ''
+                        text_output_request_id = None
+                        text_output_proof = None
+                        current_turn = 'user'
+                        had_user_input_this_turn = False
+                        current_turn_start_index = 0
+                        pending_user_images = []
+                        await _complete_session_end_memory_barrier(
+                            message,
+                            lanlan_name,
+                        )
 
-            # ws 维护已下沉到独立 _slot_maintainer task，主 loop 不再做巡检。
+            # WS maintenance lives in independent _slot_maintainer tasks; the main loop no longer inspects it.
 
     except asyncio.CancelledError:
         raise
     finally:
-        # cleanup 顺序：先 cancel maintainer + reader（停止新建连接 / 读循环），
-        # 再 close 现存的 ws + session。maintainer 自己持有 session 引用，cancel
-        # 后我们从 slot 里读出来一并关。
+        # Completed replies may still wait out their late-transcript grace.
+        try:
+            await original_output.flush_terminated()
+        except Exception:
+            print("[chat-sync] original_save_failed")
+        # Cleanup ordering: cancel maintainers/readers first to stop new connections/read loops,
+        # then close existing sockets/sessions. Maintainers own session references; after cancellation,
+        # retrieve them from slots and close together.
         for s in slots:
             if s.maintainer is not None:
                 s.maintainer.cancel()
@@ -1083,7 +1620,7 @@ async def run_sync_connector(
             *(_safe_close(s.session) for s in slots),
             return_exceptions=True,
         )
-        # 注意：不在这里调用 aclose_internal_http_client_current_loop()。
-        # 旧版子进程/独立线程拥有自己的 event loop，其 http client 也是 per-loop
-        # 缓存的，退出时需要 close。现在合并到主 loop，client 由主代码共享，
-        # 我们没有所有权，不应当 close。
+        # Do not call aclose_internal_http_client_current_loop() here.
+        # Old subprocesses/dedicated threads owned their loops and per-loop cached HTTP clients,
+        # requiring closure on exit. Now merged into the main loop, clients are shared with main code;
+        # we do not own them and must not close them.

@@ -1,3 +1,17 @@
+# Copyright 2025-2026 Project N.E.K.O. Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Emotion-tier LLM enrichment for ActivitySnapshot.
 
 Two functions, both calling the small ``emotion`` model tier with strict
@@ -33,21 +47,36 @@ import asyncio
 import json
 import logging
 import re
+import threading
 import time
 from typing import Any
 
-from config.prompts.prompts_activity import ACTIVITY_GUESS_PROMPTS, OPEN_THREADS_PROMPTS
+from config.prompts.prompts_activity import (
+    ACTIVITY_GUESS_PROMPTS,
+    DEEP_SEARCH_QUERY_PROMPTS,
+    OPEN_THREADS_PROMPTS,
+    TOPIC_CANDIDATE_PROMPTS,
+)
 from utils.file_utils import robust_json_loads
+from utils.tokenize import truncate_to_tokens
 
-logger = logging.getLogger(__name__)
+# Named into the Main service tree, not __name__. setup_logging(service_name=
+# "Main") installs handlers on "N.E.K.O.Main" with propagate=False, and nothing
+# is installed on root — so a `main_logic.*` logger reaches no handler at all
+# and its records fall through to logging.lastResort (bare text on stderr,
+# WARNING and above, never the log file). The sibling main_logic/topic modules
+# already name themselves this way; this module did not, which is why its
+# failure reasons were invisible even before they were only at debug level.
+logger = logging.getLogger("N.E.K.O.Main.activity.llm_enrichment")
 
 
 # Input cap: the emotion tier is small and cheap, but we still don't
 # want pathological prompt sizes from a long-running session. 8 turns
 # of each side covers the realistic "what's hanging" window without
-# ballooning latency.
+# ballooning latency. Per-turn cap is in tokens (not chars) so the
+# recent-conversation and global-evidence inputs share one budget unit.
 _MAX_CONV_TURNS_PER_SIDE = 8
-_MAX_CONV_CHARS_PER_TURN = 200
+_MAX_CONV_TOKENS_PER_TURN = 300
 
 # Soft-score keys the LLM is asked to fill. Skipping ``transitioning``,
 # ``away``, ``stale_returning`` because those are purely temporal /
@@ -58,6 +87,7 @@ _SCORED_STATES: tuple[str, ...] = (
     'gaming',
     'focused_work',
     'casual_browsing',
+    'focused_video',
     'chatting',
     'voice_engaged',
     'idle',
@@ -68,21 +98,109 @@ _SCORED_STATES: tuple[str, ...] = (
 # i18n convention (multi-language str→str dicts must live in config/prompts/prompts_*).
 
 
+# ── Failure reporting ───────────────────────────────────────────────
+#
+# Enrichment failures used to land on logger.debug, so a permanently
+# misconfigured tier showed up only as the caller's "no result" symptom with
+# no visible cause. Reporting them costs two constraints:
+#
+#   1. No conversation text, ever. Both the prompt and the model's reply are
+#      built from the user's own turns, so neither may reach a log line.
+#      Reports carry a fixed reason slug plus, at most, an exception class
+#      name and an HTTP status code.
+#   2. Throttle per (label, reason). These calls hang off 20s / 40s
+#      heartbeats — logging every failure would just move the flood from
+#      INFO to WARNING. One line per window, and the next line to get
+#      through says how many were suppressed behind it.
+_FAILURE_LOG_INTERVAL_SECONDS = 300.0
+# {(label, reason): [last_emitted_monotonic, suppressed_since]}
+_failure_log_state: dict[tuple[str, str], list[float]] = {}
+_failure_log_lock = threading.Lock()
+
+
+def _failure_detail(exc: BaseException) -> str:
+    """Exception class name plus HTTP status when present — never its message.
+
+    Provider exception messages routinely echo back a slice of the request
+    body, which here is the conversation itself.
+    """
+    status = getattr(exc, 'status_code', None)
+    if status is None:
+        status = getattr(getattr(exc, 'response', None), 'status_code', None)
+    if isinstance(status, int):
+        return f'{type(exc).__name__} HTTP {status}'
+    return type(exc).__name__
+
+
+def _report_failure(label: str, reason: str, detail: str = '') -> None:
+    """Log one enrichment failure, throttled per (label, reason)."""
+    key = (label, reason)
+    now = time.monotonic()
+    with _failure_log_lock:
+        state = _failure_log_state.get(key)
+        if state is not None and now - state[0] < _FAILURE_LOG_INTERVAL_SECONDS:
+            state[1] += 1
+            return
+        suppressed = int(state[1]) if state is not None else 0
+        _failure_log_state[key] = [now, 0]
+    logger.warning(
+        'enrichment %s failed: %s%s%s',
+        label,
+        reason,
+        f' ({detail})' if detail else '',
+        (
+            f'; {suppressed} more suppressed in the last '
+            f'{int(_FAILURE_LOG_INTERVAL_SECONDS)}s'
+        ) if suppressed else '',
+    )
+
+
 # ── Helpers ─────────────────────────────────────────────────────────
 
 def _normalize_lang(lang: str) -> str:
     if not lang:
         return 'zh'
     low = lang.lower()
+    if low.startswith('zh-tw') or low.startswith('zh_hant') or low.startswith('zh-hant'):
+        return 'zh-TW'
     if low.startswith('zh'):
         return 'zh'
     if low.startswith('ja'):
         return 'ja'
     if low.startswith('ko'):
         return 'ko'
+    if low.startswith('es'):
+        return 'es'
+    if low.startswith('pt'):
+        return 'pt'
     if low.startswith('ru'):
         return 'ru'
     return 'en'
+
+
+def _select_lang_template(prompts: dict, lang_key: str):
+    """Pick a prompt template for ``lang_key`` with a zh-family fallback.
+
+    ``_normalize_lang`` can return ``zh-TW`` (Traditional), but not every
+    prompt dict carries a ``zh-TW`` entry. A plain ``.get(lang_key, en)`` would
+    then drop Traditional Chinese sessions straight to English — regressing
+    them from the Simplified ``zh`` prompt. Fall back zh-* → zh → en instead.
+    """
+    if lang_key in prompts:
+        return prompts[lang_key]
+    if lang_key.startswith('zh') and 'zh' in prompts:
+        return prompts['zh']
+    return prompts['en']
+
+
+def _topic_interest_too_short(interest: str) -> bool:
+    if len(interest) >= 4:
+        return False
+    compact = re.sub(r'\s+', '', interest)
+    cjk_chars = re.findall(r'[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]', compact)
+    if len(cjk_chars) >= 2:
+        return False
+    return True
 
 
 def _format_conversation(
@@ -92,8 +210,8 @@ def _format_conversation(
     """Interleave user / AI messages by timestamp, render as plain lines.
 
     Each side is capped to ``_MAX_CONV_TURNS_PER_SIDE`` (most recent),
-    each text truncated to ``_MAX_CONV_CHARS_PER_TURN``. Empty input
-    returns a placeholder so the prompt still parses.
+    each text truncated to ``_MAX_CONV_TOKENS_PER_TURN`` tokens. Empty
+    input returns a placeholder so the prompt still parses.
     """
     items: list[tuple[float, str, str]] = []
     for ts, text in user_msgs[-_MAX_CONV_TURNS_PER_SIDE:]:
@@ -114,9 +232,10 @@ def _format_conversation(
             age_str = f'{int(age / 60)}min ago'
         else:
             age_str = f'{int(age / 3600)}h ago'
-        clip = text.strip()
-        if len(clip) > _MAX_CONV_CHARS_PER_TURN:
-            clip = clip[:_MAX_CONV_CHARS_PER_TURN] + '…'
+        stripped = text.strip()
+        clip = truncate_to_tokens(stripped, _MAX_CONV_TOKENS_PER_TURN)
+        if clip != stripped:
+            clip = clip + '…'
         out_lines.append(f'[{age_str}] {who}: {clip}')
     return '\n'.join(out_lines)
 
@@ -165,7 +284,7 @@ async def call_activity_guess(
         LLM can choose to confirm or override.
     """
     lang_key = _normalize_lang(lang)
-    template = ACTIVITY_GUESS_PROMPTS.get(lang_key, ACTIVITY_GUESS_PROMPTS['en'])
+    template = _select_lang_template(ACTIVITY_GUESS_PROMPTS, lang_key)
 
     prompt = template.format(
         signals=_format_signals(snapshot_signals),
@@ -180,13 +299,13 @@ async def call_activity_guess(
 
     parsed = _safe_parse_json(raw)
     if not isinstance(parsed, dict):
-        logger.debug('activity_guess: LLM did not return a JSON object: %r', raw[:200])
+        _report_failure('activity_guess', 'reply_not_json_object')
         return None
 
     raw_scores = parsed.get('scores')
     guess = parsed.get('guess', '') or ''
     if not isinstance(raw_scores, dict) or not isinstance(guess, str):
-        logger.debug('activity_guess: malformed JSON shape: %r', parsed)
+        _report_failure('activity_guess', 'reply_shape_unexpected')
         return None
 
     # Sanitise: keep only allowed state keys and clamp to [0, 1].
@@ -217,7 +336,7 @@ async def call_open_threads(
     hanging" (``[]``) from "LLM call failed" (``None``).
     """
     lang_key = _normalize_lang(lang)
-    template = OPEN_THREADS_PROMPTS.get(lang_key, OPEN_THREADS_PROMPTS['en'])
+    template = _select_lang_template(OPEN_THREADS_PROMPTS, lang_key)
 
     if not user_msgs and not ai_msgs:
         return []
@@ -230,16 +349,100 @@ async def call_open_threads(
 
     parsed = _safe_parse_json(raw)
     if not isinstance(parsed, dict):
-        logger.debug('open_threads: LLM did not return a JSON object: %r', raw[:200])
+        _report_failure('open_threads', 'reply_not_json_object')
         return None
 
     threads = parsed.get('open_threads')
     if not isinstance(threads, list):
+        _report_failure('open_threads', 'reply_missing_open_threads')
         return None
     cleaned: list[str] = []
     for entry in threads[:5]:
         if isinstance(entry, str) and entry.strip():
             cleaned.append(entry.strip())
+    return cleaned
+
+
+async def call_topic_candidates(
+    *,
+    lang: str,
+    global_signals: str = "",
+    timeout: float = 8.0,
+) -> list[dict[str, Any]] | None:
+    """Extract low-frequency deeper topic hooks for the background pool.
+
+    Background-only helper. Its only conversation input is the slow
+    cross-window evidence the signal store keeps (``global_signals``); it
+    distils that into short topic materials, so proactive chat never needs to
+    pull raw conversation text synchronously.
+    """
+    lang_key = _normalize_lang(lang)
+    template = _select_lang_template(TOPIC_CANDIDATE_PROMPTS, lang_key)
+
+    evidence = (global_signals or "").strip()
+    if not evidence:
+        return []
+
+    prompt = template.format(global_signals=evidence)
+
+    raw = await _invoke_emotion_tier(prompt, timeout=timeout, label='topic_candidates')
+    if raw is None:
+        return None
+
+    parsed = _safe_parse_json(raw)
+    if not isinstance(parsed, dict):
+        _report_failure('topic_candidates', 'reply_not_json_object')
+        return None
+
+    topics = parsed.get('topics')
+    if not isinstance(topics, list):
+        _report_failure('topic_candidates', 'reply_missing_topics')
+        return None
+
+    cleaned: list[dict[str, Any]] = []
+    for item in topics[:4]:
+        if not isinstance(item, dict):
+            continue
+        interest = str(item.get('interest') or '').strip()
+        if _topic_interest_too_short(interest):
+            continue
+        try:
+            relevance = int(item.get('relevance', 70))
+        except (TypeError, ValueError):
+            relevance = 70
+        try:
+            risk = int(item.get('risk', 20))
+        except (TypeError, ValueError):
+            risk = 20
+        relevance = max(0, min(100, relevance))
+        risk = max(0, min(100, risk))
+        if relevance < 70 or risk > 65:
+            continue
+        raw_keywords = item.get('keywords')
+        if isinstance(raw_keywords, str):
+            raw_keywords = [raw_keywords]
+        elif not isinstance(raw_keywords, list):
+            raw_keywords = []
+        keywords: list[str] = []
+        for kw in raw_keywords:
+            kw_text = str(kw or '').strip()[:30]
+            if kw_text and kw_text not in keywords:
+                keywords.append(kw_text)
+            if len(keywords) >= 6:
+                break
+        # No search_query: the small candidate model identifies the topic and
+        # its keywords; constructing the actual online query is left to the
+        # downstream pipeline (background pre-fetch joins keywords; the Phase-2
+        # model derives a deeper query at delivery time).
+        material = {
+            'interest': interest[:90],
+            'keywords': keywords,
+            'relevance': relevance,
+            'risk': risk,
+        }
+        cleaned.append(material)
+        if len(cleaned) >= 2:
+            break
     return cleaned
 
 
@@ -252,48 +455,143 @@ async def _invoke_emotion_tier(prompt: str, *, timeout: float, label: str) -> st
     full LLM stack — useful for tests that exercise prompt formatting
     without a live model.
     """
-    from langchain_core.messages import HumanMessage
     from utils.config_manager import get_config_manager
-    from utils.llm_client import create_chat_llm
+    from utils.llm_client import HumanMessage, create_chat_llm_async
     from utils.token_tracker import set_call_type
 
     try:
         cfg_mgr = get_config_manager()
-        cfg = cfg_mgr.get_model_api_config('emotion')
+        cfg = await cfg_mgr.aget_model_api_config('emotion')
     except Exception as e:
-        logger.debug('emotion config fetch failed: %s', e)
+        _report_failure(label, 'emotion_config_unavailable', _failure_detail(e))
         return None
     model = cfg.get('model')
     api_key = cfg.get('api_key')
     base_url = cfg.get('base_url')
     if not model or not api_key:
-        logger.debug('emotion tier model/api_key missing — enrichment disabled')
+        _report_failure(label, 'emotion_model_or_api_key_missing')
         return None
 
     set_call_type('activity_enrichment')
     try:
-        llm = create_chat_llm(
+        llm = await create_chat_llm_async(
             model, base_url, api_key,
             temperature=0.4,
             max_completion_tokens=512,
+            timeout=timeout,  # same budget the asyncio.wait_for below enforces
+            provider_type=cfg.get('provider_type'),
         )
     except Exception as e:
-        logger.debug('emotion-tier llm init failed: %s', e)
+        _report_failure(label, 'emotion_llm_init_failed', _failure_detail(e))
         return None
 
     try:
         async with llm:
             resp = await asyncio.wait_for(
-                llm.ainvoke([HumanMessage(content=prompt)]),
+                llm.ainvoke([HumanMessage(content=prompt)]),  # noqa: LLM_INPUT_BUDGET  # enrichment prompt built from a bounded activity-window summary; not user free-text.
                 timeout=timeout,
             )
         return getattr(resp, 'content', '') or ''
     except asyncio.TimeoutError:
-        logger.debug('emotion-tier %s call timed out (%ss)', label, timeout)
+        _report_failure(label, 'emotion_call_timed_out', f'{timeout}s')
         return None
     except Exception as e:
-        logger.debug('emotion-tier %s call failed: %s', label, e)
+        _report_failure(label, 'emotion_call_failed', _failure_detail(e))
         return None
+
+
+async def _invoke_capable_tier(prompt: str, *, timeout: float, label: str) -> str | None:
+    """Single-shot capable-tier (``summary``) call for delivery-time deep work.
+
+    Deep-search query derivation is a step up from the emotion-tier candidate
+    pass: it runs once, at open time, off the user hot path, so it uses the
+    heavier ``summary`` tier (the same tier the window search summarizer uses).
+    Returns raw response text or None on any failure.
+    """
+    from utils.config_manager import get_config_manager
+    from utils.llm_client import HumanMessage, create_chat_llm_async
+    from utils.token_tracker import set_call_type
+
+    try:
+        cfg_mgr = get_config_manager()
+        cfg = await cfg_mgr.aget_model_api_config('summary')
+    except Exception as e:
+        _report_failure(label, 'summary_config_unavailable', _failure_detail(e))
+        return None
+    model = cfg.get('model')
+    api_key = cfg.get('api_key')
+    base_url = cfg.get('base_url')
+    if not model or not api_key:
+        _report_failure(label, 'summary_model_or_api_key_missing')
+        return None
+
+    set_call_type('topic_deep_search')
+    try:
+        llm = await create_chat_llm_async(
+            model, base_url, api_key,
+            temperature=0.3,
+            max_completion_tokens=128,
+            timeout=timeout,  # same budget the asyncio.wait_for below enforces
+            provider_type=cfg.get('provider_type'),
+        )
+    except Exception as e:
+        _report_failure(label, 'summary_llm_init_failed', _failure_detail(e))
+        return None
+
+    try:
+        async with llm:
+            resp = await asyncio.wait_for(
+                llm.ainvoke([HumanMessage(content=prompt)]),  # noqa: LLM_INPUT_BUDGET  # enrichment prompt built from a bounded activity-window summary; not user free-text.
+                timeout=timeout,
+            )
+        return getattr(resp, 'content', '') or ''
+    except asyncio.TimeoutError:
+        _report_failure(label, 'summary_call_timed_out', f'{timeout}s')
+        return None
+    except Exception as e:
+        _report_failure(label, 'summary_call_failed', _failure_detail(e))
+        return None
+
+
+async def derive_deep_search_query(
+    *,
+    interest: str,
+    keywords: list[str],
+    floor_angle: str = "",
+    lang: str,
+    timeout: float = 8.0,
+) -> str | None:
+    """Derive one focused online query for a delivery-time deep search.
+
+    Unlike the small candidate model (which only identifies the topic), this is
+    the capable-tier "big model" step the deep-search design calls for: it turns
+    interest + keywords (+ the cheap floor angle) into a single retrieval query.
+    Returns None when nothing usable comes back, so callers fall back to the
+    keyword-joined floor query.
+    """
+    interest = (interest or "").strip()
+    if not interest:
+        return None
+    lang_key = _normalize_lang(lang)
+    template = _select_lang_template(DEEP_SEARCH_QUERY_PROMPTS, lang_key)
+    prompt = template.format(
+        interest=interest[:120],
+        keywords=", ".join(k for k in (keywords or []) if k)[:120] or "(none)",
+        floor_angle=(floor_angle or "").strip()[:200] or "(none)",
+    )
+    raw = await _invoke_capable_tier(prompt, timeout=timeout, label='topic_deep_query')
+    if raw is None:
+        return None
+    parsed = _safe_parse_json(raw)
+    query = ""
+    if isinstance(parsed, dict):
+        query = str(parsed.get('query') or '').strip()
+    if not query:
+        # Tolerate a bare single-line answer if the model ignored the JSON shape.
+        stripped = " ".join(raw.split())
+        if stripped and len(stripped) < 120 and "{" not in stripped:
+            query = stripped
+    return query.strip().strip('"').strip()[:80] or None
 
 
 def _safe_parse_json(raw: str) -> Any:

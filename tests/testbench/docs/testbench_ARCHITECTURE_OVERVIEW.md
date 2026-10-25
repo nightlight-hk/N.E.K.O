@@ -349,10 +349,11 @@ server.py::create_app()             # FastAPI 工厂 (模块级 app = create_app
 | `autosave.py` | 滚动 3 份自动保存 | `AutosaveScheduler` | 5s debounce + 60s force. |
 | `persistence.py` | 人工保存 / 加载 (单个 .json + memory.tar.gz) | `save_session_to_file(...)` / `load_session_from_file(...)` | 也做 import roundtrip. |
 | `session_export.py` | 导出报告 (4 scope × 3 format = 11 组合) | `export_session(scope, format, ...)` | api_key 自动脱敏. |
+| `memory_export.py` | 记忆分析一键脱敏导出 (ZIP: `raw_data/` + `analysis/`) | `export_memory_analysis(...)` / `build_export_bundle(...)` / `pack_export_zip(...)` | P30. 纯读聚合原始记忆 + 非 LLM 分析结论, 末步统一走 `redact.redact_export_bundle`. 无会话锁、不触 LLM. |
 | `reset_runner.py` | Diagnostics → Reset 页的硬重置 | `reset_runtime_state(...)` | 清沙盒 + 清持久化 + 清日志. |
 | `boot_cleanup.py` | 启动时清临时文件 (`.tmp`, `.locked_*`, 孤儿 SQLite 旁车) | `run_boot_cleanup()` | P-B 延期加固. |
 | `boot_self_check.py` | 启动时扫孤儿沙盒 | `scan_orphan_sandboxes()` | P-A 延期加固. 只扫不删. |
-| `redact.py` | 脱敏工具 (api_key / 长文) | `redact_dict(...)` | export 路径 + diagnostics 展示都用. |
+| `redact.py` | 脱敏工具 (api_key / 长文) + 记忆导出三档脱敏 chokepoint | `redact_dict(...)` / `redact_export_bundle(bundle, tier, identity_names)` / `build_identity_map(...)` + `apply_identity_map(...)` | export 路径 + diagnostics 展示都用. P30 加 minimal/standard/strict 三档: minimal 去凭据; standard 一致假名化身份 (对 dict **键与值**都替换, 覆盖 persona.json 以名作键的结构); strict 额外整层撤原始转录. |
 | `request_helpers.py` | FastAPI 请求处理共享 | 当前 session id 等 | |
 | `sse_events.py` | SSE 帧格式 helper | `sse_error_frame(...)` | 顶层必须先 yield 一条 error 帧再 raise. |
 
@@ -360,6 +361,30 @@ server.py::create_app()             # FastAPI 工厂 (模块级 app = create_app
 接收 session 作显式参数 (而非从全局拿), 方便 smoke 套件 mock. 这是 P21
 `session_export` / P22 `autosave` / P23 导出 session-agnostic 化的关键
 教训.
+
+#### §2.4.1 上游记忆子系统 · 语义合约 adapter 家族 (2026-06 上游同步)
+
+跟随 2026-06 与主程序 `main` 对齐, 上游引入了一批记忆增强模块 (evidence-RFC
+证据数学 / hybrid_recall 混合召回 / refine 聚类精炼 / anti_repeat 反重复 /
+deep-topic 深话题). 这些模块同时包含**语义合约** (可 import 的纯函数: 打分 /
+衰减 / BM25 / RRF / 簿记 / 就绪度阈值) 与**运行时机制** (embedding 模型 /
+LLM / sqlite / 磁盘 / 锁 / aiohttp / TTS-WS)。testbench 遵循
+`semantic-contract-vs-runtime-mechanism` 原则, **只覆盖语义合约层**, 为此新增
+一组薄 adapter (直接 import 上游纯函数 — 这是"想要的耦合": 上游改公式时配对
+smoke 应当 break)。运行时机制层一律 out-of-scope, 由主程序自己的单测负责。
+
+| Adapter | 复用的上游纯函数 (语义合约) | 配对 smoke | OOS (运行时机制) |
+|---|---|---|---|
+| `evidence_sim.py` | `memory.evidence` 证据分数 / 半衰期衰减 / 状态阈值 / importance→seed / sub_zero | `p27_evidence_math_smoke.py` (9) | event_log / outbox / embedding_worker / sqlite timeindex |
+| `recall_fusion.py` | `hybrid_recall._tokenize/_bm25_rank/_rrf_fuse/_overlaps_window` + `recall._hard_filter` + `temporal.parse_time_window` | `p28_recall_fusion_smoke.py` (8) | 余弦路径 (ONNX EmbeddingService) / recall_memory 工具 HTTP+TTS 管线 |
+| `refine_sim.py` | `refine` 聚类簿记 (`_cluster_hash/_all_stamped_fresh/_cluster_starvation_key/_render_cluster` + annotate/strip) | `p29_refine_cluster_smoke.py` (6) | cosine 聚类 (embedding) / LLM resolve |
+| `anti_repeat_sim.py` | `anti_repeat.bm25_score` (重复检测 BM25: IDF 走背景窗 / TF 走前景窗) + `_ngrams` | `p30_anti_repeat_smoke.py` (5) | `AntiRepeatCorpus` 磁盘 JSON / 锁 / 滚动窗 |
+| `topic_sim.py` | `topic.common.topic_units` + `signals._is_meaningful_turn/_label_key_for_lang` + 内存 `TopicSignalStore` 就绪度 | `p31_topic_readiness_smoke.py` (5) | 在线 enrichment (aiohttp) / delivery (TTS-WS) / pipeline LLM |
+
+**L30 import 判定**: `memory.*` 与 `main_logic.topic.*` 实测 import 无副作用
+(后者 0.31s) → 走**直接 import**; 与 `avatar_dedupe.py` 走 copy+drift (因
+`main_logic.cross_server` 带 ssl/aiohttp import-time 副作用) **不同**。完整设计
+关卡记录见 [`UPSTREAM_SYNC_2026-06.md`](./UPSTREAM_SYNC_2026-06.md) Phase 3.0。
 
 ### §2.5 Router 层 (`routers/`)
 
@@ -370,8 +395,8 @@ HTTP 端点按**业务域**分, 13 个 router:
 | `health_router` | `/health`, `/version`, `/docs/{name}` (P26 新增) | 健康检查 + 版本元数据 + 公共 markdown 文档渲染 |
 | `session_router` | `/api/session/*` | New / Switch / Load / Save / Export / List |
 | `config_router` | `/api/config/*` | 模型配置 / provider / api_key |
-| `persona_router` | `/api/persona/*` | Persona CRUD + 导入 (真实角色 / 内置 preset) |
-| `memory_router` | `/api/memory/*` | 三层 memory 的 CRUD + 5 op preview/commit + `/api/memory/recent/import_from_session` (P25 polish r6) + `/api/memory/prompt_preview/{op}` (P25 polish r7 pure preview) |
+| `persona_router` | `/api/persona/*` | Persona CRUD + 导入 (真实角色 / 内置 preset / zip 档案) + `/export_real/{name}` (P31 角色忠实全量导出为 `<角色名>.zip`, 纯读) |
+| `memory_router` | `/api/memory/*` | 三层 memory 的 CRUD + 5 op preview/commit + `/api/memory/recent/import_from_session` (P25 polish r6) + `/api/memory/prompt_preview/{op}` (P25 polish r7 pure preview) + **记忆系统分析只读聚合**: `/lineage` (P27) · `/embedding/*` (P28) · `/overview` (P29) · `/export` (P30) · **`/code_leads` (P32 代码线索, 纯读 to_thread, 由 `pipeline/memory_code_leads.py::build_code_leads` 反推机械不变量类线索)** |
 | `chat_router` | `/api/chat/*` | 四模式 chat (send / auto_dialog / script playback / dual_ai) + SSE |
 | `judge_router` | `/api/judge/*` | Evaluation Run + SSE + 结果查询 + Aggregate + `/api/judge/run_prompt_preview` (P25 polish r7 pure preview) |
 | `stage_router` | `/api/stage/*` | Stage Coach suggest / advance |
@@ -889,6 +914,8 @@ p26_docs_endpoint_smoke.py            # /docs/{name} 公开白名单 + heading i
 | **本文 `ARCHITECTURE_OVERVIEW.md`** | 长期 | 二次开发者 / 接手 agent | 架构 / 模块拓扑 / 上手 |
 | `testbench_USER_MANUAL.md` | 版本 | 测试员 | 操作流程 |
 | `external_events_guide.md` | P25+ | 测试员 | 外部事件具体用法 |
+| `memory_export_guide.md` | P30+ | 测试员 | 记忆分析一键脱敏导出用法 |
+| `code_leads_guide.md` | P32+ | 代码相关人员 | 代码线索子页怎么读 / 局限 (面向使用者的干净说明; 内部裁决文档 `MEMORY_CODE_INFERENCE_FEASIBILITY.md` 不公开) |
 | `CHANGELOG.md` | 版本 | 用户 | 版本更新 |
 | `P24_BLUEPRINT.md` / `P25_BLUEPRINT.md` | 历史档 | 项目开发 | 阶段蓝图 |
 | `PROGRESS.md` | 历史档 | 项目开发 | 阶段交付日志 |

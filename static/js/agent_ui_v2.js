@@ -4,7 +4,7 @@
  * 包含状态快照、变更通知、繁忙状态等
  */
 (function () {
-    const FLAG_KEYS = ['computer_use_enabled', 'browser_use_enabled', 'user_plugin_enabled', 'openclaw_enabled', 'openfang_enabled'];
+    const FLAG_KEYS = ['computer_use_enabled', 'browser_use_enabled', 'user_plugin_enabled', 'openclaw_enabled'];
 
     const state = {
         snapshot: null,
@@ -30,13 +30,12 @@
     const byId = (id) => document.getElementById(id);
     const getEls = (...ids) => ids.map(id => byId(id)).filter(Boolean);
     const el = () => ({
-        master: getEls('live2d-agent-master', 'vrm-agent-master', 'mmd-agent-master'),
-        keyboard: getEls('live2d-agent-keyboard', 'vrm-agent-keyboard', 'mmd-agent-keyboard'),
-        browser: getEls('live2d-agent-browser', 'vrm-agent-browser', 'mmd-agent-browser'),
-        userPlugin: getEls('live2d-agent-user-plugin', 'vrm-agent-user-plugin', 'mmd-agent-user-plugin'),
-        openfang: getEls('live2d-agent-openfang', 'vrm-agent-openfang', 'mmd-agent-openfang'),
-        openclaw: getEls('live2d-agent-openclaw', 'vrm-agent-openclaw', 'mmd-agent-openclaw'),
-        status: getEls('live2d-agent-status', 'vrm-agent-status', 'mmd-agent-status'),
+        master: getEls('live2d-agent-master', 'vrm-agent-master', 'mmd-agent-master', 'pngtuber-agent-master'),
+        keyboard: getEls('live2d-agent-keyboard', 'vrm-agent-keyboard', 'mmd-agent-keyboard', 'pngtuber-agent-keyboard'),
+        browser: getEls('live2d-agent-browser', 'vrm-agent-browser', 'mmd-agent-browser', 'pngtuber-agent-browser'),
+        userPlugin: getEls('live2d-agent-user-plugin', 'vrm-agent-user-plugin', 'mmd-agent-user-plugin', 'pngtuber-agent-user-plugin'),
+        openclaw: getEls('live2d-agent-openclaw', 'vrm-agent-openclaw', 'mmd-agent-openclaw', 'pngtuber-agent-openclaw'),
+        status: getEls('live2d-agent-status', 'vrm-agent-status', 'mmd-agent-status', 'pngtuber-agent-status'),
     });
     const sync = (cbs) => {
         if (!cbs) return;
@@ -50,13 +49,35 @@
             browser_use_enabled: window.t ? window.t('settings.toggles.browserUse') : 'Browser Control',
             user_plugin_enabled: window.t ? window.t('settings.toggles.userPlugin') : '用户插件',
             openclaw_enabled: window.t ? window.t('settings.toggles.openclawConnect') : 'OpenClaw',
-            openfang_enabled: window.t ? window.t('settings.toggles.openfang') : '虚拟机',
         };
         return map[key] || key;
     };
-    const setStatus = (msg) => {
+    const isTutorialAgentStatusLocked = () => {
+        if (window.isInTutorial !== true) return false;
+        if (window.isNekoHomeTutorialPending === true) return true;
+        if (window.universalTutorialManager && window.universalTutorialManager.isTutorialRunning === true) return true;
+        if (typeof window.isNekoHomeTutorialInteractionLocked === 'function') {
+            try {
+                if (window.isNekoHomeTutorialInteractionLocked() === true) return true;
+            } catch (_) {}
+        }
+        if (
+            window.NekoHomeTutorialFeatureController
+            && typeof window.NekoHomeTutorialFeatureController.isActive === 'function'
+        ) {
+            try {
+                if (window.NekoHomeTutorialFeatureController.isActive() === true) return true;
+            } catch (_) {}
+        }
+        return false;
+    };
+    const setStatus = (msg, options) => {
         const { status } = el();
-        status.forEach(s => { if (s) s.textContent = msg || ''; });
+        const shouldStabilizeTutorialText = options
+            && options.stabilizeTutorialText === true
+            && isTutorialAgentStatusLocked();
+        const text = shouldStabilizeTutorialText ? 'NekoClaw server ready' : (msg || '');
+        status.forEach(s => { if (s) s.textContent = text; });
     };
     const currentLanlanName = () => {
         const fromConfig = window.lanlan_config && typeof window.lanlan_config.lanlan_name === 'string'
@@ -105,7 +126,6 @@
             browser_use_enabled: 'browser_use',
             user_plugin_enabled: 'user_plugin',
             openclaw_enabled: 'openclaw',
-            openfang_enabled: 'openfang',
         };
         const cap = caps[map[key]];
         if (!cap) return true;
@@ -118,7 +138,6 @@
             browser_use_enabled: 'browser_use',
             user_plugin_enabled: 'user_plugin',
             openclaw_enabled: 'openclaw',
-            openfang_enabled: 'openfang',
         };
         const cap = caps[map[key]];
         return (cap && cap.reason) || '';
@@ -223,7 +242,6 @@
                 browser_use_enabled: false,
                 user_plugin_enabled: false,
                 openclaw_enabled: false,
-                openfang_enabled: false,
             },
             active_tasks: [],
             notification: null,
@@ -252,7 +270,7 @@
 
         // Detect precheck failure transitions: PENDING → specific failure reason.
         // Only fire the toast when the user actually opted into that capability —
-        // otherwise background daemons (OpenFang / browser-use install / startup
+        // otherwise background daemons (browser-use install / startup
         // LLM probe) flipping their own seeded PENDING → *_UNREACHABLE produce
         // bogus "猫爪预检失败" popups even when the agent is working fine.
         const CAP_TO_FLAG = {
@@ -260,7 +278,6 @@
             browser_use: 'browser_use_enabled',
             user_plugin: 'user_plugin_enabled',
             openclaw: 'openclaw_enabled',
-            openfang: 'openfang_enabled',
         };
         const prevCaps = (state.snapshot && state.snapshot.capabilities) || {};
         const prevFlags = (state.snapshot && state.snapshot.flags) || {};
@@ -305,7 +322,7 @@
     }
 
     function render(source = 'render') {
-        const { master, keyboard, browser, userPlugin, openfang, openclaw } = el();
+        const { master, keyboard, browser, userPlugin, openclaw } = el();
         if (!master.length) return;
         const snap = state.snapshot;
         if (!snap) {
@@ -314,14 +331,16 @@
                 m.checked = false;
             });
             sync(master);
-            [keyboard, browser, userPlugin, openfang, openclaw].forEach(list => {
+            [keyboard, browser, userPlugin, openclaw].forEach(list => {
                 list.forEach(cb => {
                     cb.disabled = true;
                     cb.checked = false;
                 });
                 sync(list);
             });
-            setStatus(window.t ? window.t('agent.status.connecting') : 'Agent状态同步中...');
+            setStatus(window.t ? window.t('agent.status.connecting') : 'Agent状态同步中...', {
+                stabilizeTutorialText: true
+            });
             return;
         }
 
@@ -341,7 +360,7 @@
                 m.title = window.t ? window.t('settings.toggles.serverOffline') : 'Agent服务器未启动';
             });
             sync(master);
-            [keyboard, browser, userPlugin, openfang, openclaw].forEach(list => {
+            [keyboard, browser, userPlugin, openclaw].forEach(list => {
                 list.forEach(cb => {
                     cb.checked = false;
                     cb.disabled = true;
@@ -365,7 +384,6 @@
                 computer_use_enabled: keyboard,
                 browser_use_enabled: browser,
                 user_plugin_enabled: userPlugin,
-                openfang_enabled: openfang,
             };
             const list = flagElMap[k] || [];
             if (!list.length) return;
@@ -430,13 +448,21 @@
             c => c && typeof c.reason === 'string' && c.reason.includes('PENDING')
         );
         if (state.globalBusy) {
-            setStatus(window.t ? window.t('settings.toggles.checking') : '已接受操作，切换中...');
+            setStatus(window.t ? window.t('settings.toggles.checking') : '已接受操作，切换中...', {
+                stabilizeTutorialText: true
+            });
         } else if (anyPending) {
-            setStatus(window.t ? window.t('agent.status.connectivityCheck') : 'Agent LLM 连接检查中...');
+            setStatus(window.t ? window.t('agent.status.connectivityCheck') : 'Agent LLM 连接检查中...', {
+                stabilizeTutorialText: true
+            });
         } else if (!analyzerEnabled) {
-            setStatus(window.t ? window.t('agent.status.ready') : 'Agent服务器就绪');
+            setStatus(window.t ? window.t('agent.status.ready') : 'Agent服务器就绪', {
+                stabilizeTutorialText: true
+            });
         } else {
-            setStatus(window.t ? window.t('agent.status.enabled') : 'Agent模式已开启');
+            setStatus(window.t ? window.t('agent.status.enabled') : 'Agent模式已开启', {
+                stabilizeTutorialText: true
+            });
         }
         state.suppressChange = false;
 
@@ -448,7 +474,7 @@
     }
 
     function bindEvents() {
-        const { master, keyboard, browser, userPlugin, openfang, openclaw } = el();
+        const { master, keyboard, browser, userPlugin, openclaw } = el();
         if (!master.length) return;
         const bindChangeOnce = (cb, key, handler) => {
             if (!cb) return;
@@ -542,12 +568,46 @@
                         return;
                     }
                     const value = !!e.target.checked;
+                    // Start getDisplayMedia in this user gesture. Its result is
+                    // checked before the Agent flag is enabled on Wayland.
+                    const capturePreparation = key === 'computer_use_enabled' && value
+                        && typeof window.prepareComputerUseCapture === 'function'
+                        ? window.prepareComputerUseCapture() : null;
+                    if (key === 'computer_use_enabled' && !value
+                        && typeof window.releaseComputerUseCapture === 'function') {
+                        window.releaseComputerUseCapture();
+                    }
                     const opToken = makeSnapshotToken();
                     state.pending.add(key);
                     state.optimistic[key] = value;
                     setGlobalBusy(true, window.t ? window.t('settings.toggles.checking') : '已接受操作，切换中...');
                     render('command');
                     try {
+                        if (key === 'computer_use_enabled' && value
+                            && typeof window.computerUseNeedsCaptureStream === 'function'
+                            && window.computerUseNeedsCaptureStream()) {
+                            const ready = capturePreparation && await capturePreparation;
+                            const nativeReady = !ready
+                                && typeof window.computerUseNativeCaptureAvailable === 'function'
+                                && await window.computerUseNativeCaptureAvailable();
+                            if (!ready && !nativeReady) {
+                                const captureFailure = typeof window.getComputerUseCaptureFailure === 'function'
+                                    ? window.getComputerUseCaptureFailure() : '';
+                                const portalPending = captureFailure === 'display_media_pending'
+                                    || captureFailure === 'display_media_timeout';
+                                throw new Error(window.t
+                                    ? window.t(portalPending
+                                        ? 'agent.status.screenSharePendingReload'
+                                        : 'agent.status.screenShareRequired')
+                                    : portalPending
+                                        ? 'Screen capture is still pending. Reload the page and try again.'
+                                        : 'Share the entire screen before enabling keyboard control');
+                            }
+                        }
+                        // A character switch can complete while capture permission
+                        // is pending. The switch owns the new UI state and capture
+                        // lifecycle, so the stale operation must not send or release.
+                        if (!isSnapshotTokenCurrent(opToken)) return;
                         await sendCommand('set_flag', { key, value });
                         if (!isSnapshotTokenCurrent(opToken)) return;
                         const ts = performance.now();
@@ -555,6 +615,10 @@
                         console.log('[AgentUIv2Timing]', { phase: 'fetch_snapshot_after_flag', key, ms: Number((performance.now() - ts).toFixed(2)) });
                     } catch (err) {
                         if (!isSnapshotTokenCurrent(opToken)) return;
+                        if (key === 'computer_use_enabled' && value
+                            && typeof window.releaseComputerUseCapture === 'function') {
+                            window.releaseComputerUseCapture();
+                        }
                         state.pending.delete(key);
                         state.optimistic = {};
                         setGlobalBusy(false);
@@ -578,7 +642,6 @@
         bindFlag(keyboard, 'computer_use_enabled');
         bindFlag(browser, 'browser_use_enabled');
         bindFlag(userPlugin, 'user_plugin_enabled');
-        bindFlag(openfang, 'openfang_enabled');
 
         openclaw.forEach(cb => {
             bindChangeOnce(cb, 'flag:openclaw_enabled', async (e) => {
@@ -621,7 +684,15 @@
         window.addEventListener('neko-popup-opening', async () => {
             state.popupOpen = true;
             render('popup');
-            refreshOpenClawAvailability().catch(() => {});
+            refreshOpenClawAvailability()
+                .catch(() => {})
+                .finally(() => {
+                    // The initial state request can beat the availability probe
+                    // and preserve its startup PENDING value.  Fetch the terminal
+                    // snapshot once the probe settles instead of requiring the
+                    // user to close and reopen the popup.
+                    if (state.popupOpen) fetchSnapshot().catch(() => {});
+                });
             if (!state.snapshot) {
                 await fetchSnapshot().catch(() => render('popup'));
                 return;
@@ -644,6 +715,9 @@
         state.snapshotGeneration += 1;
         state.expectedCharacter = currentLanlanName();
         const resetToken = makeSnapshotToken();
+        if (typeof window.releaseComputerUseCapture === 'function') {
+            window.releaseComputerUseCapture();
+        }
         applyLocalAgentOff('character-switch-local');
         try {
             const snapshot = await fetchSnapshotRaw();

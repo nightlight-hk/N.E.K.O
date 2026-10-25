@@ -46,7 +46,10 @@ if isinstance(sys.stdout, io.TextIOWrapper):
 
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
-_CONFIG_MANAGER_PATH = _PROJECT_ROOT / "utils" / "config_manager.py"
+# utils/config_manager is a package (formerly a single module); the class is
+# assembled in __init__.py from per-domain *Mixin classes, so the scan reads
+# the concatenated package source and matches ConfigManager + its mixins.
+_CONFIG_MANAGER_PKG_DIR = _PROJECT_ROOT / "utils" / "config_manager"
 _SANDBOX_PATH = _PROJECT_ROOT / "tests" / "testbench" / "sandbox.py"
 
 
@@ -96,10 +99,16 @@ _SELF_ASSIGN_RE = re.compile(
 # ── AST-based introspection ─────────────────────────────────────────
 
 def _parse_tree() -> ast.Module:
-    return ast.parse(
-        _CONFIG_MANAGER_PATH.read_text(encoding="utf-8"),
-        filename=str(_CONFIG_MANAGER_PATH),
+    source = "\n".join(
+        p.read_text(encoding="utf-8")
+        for p in sorted(_CONFIG_MANAGER_PKG_DIR.glob("*.py"))
     )
+    return ast.parse(source, filename=str(_CONFIG_MANAGER_PKG_DIR))
+
+
+def _is_config_manager_class(node: ast.ClassDef) -> bool:
+    """The assembled class in __init__.py plus its per-domain mixins."""
+    return node.name == "ConfigManager" or node.name.endswith("Mixin")
 
 
 def collect_direct_assignments(tree: ast.Module) -> set[str]:
@@ -113,7 +122,7 @@ def collect_direct_assignments(tree: ast.Module) -> set[str]:
     for node in ast.walk(tree):
         if not isinstance(node, ast.ClassDef):
             continue
-        if node.name != "ConfigManager":
+        if not _is_config_manager_class(node):
             continue
         for stmt in ast.walk(node):
             if not isinstance(stmt, ast.Assign):
@@ -130,7 +139,6 @@ def collect_direct_assignments(tree: ast.Module) -> set[str]:
                 if name.startswith("_"):
                     continue
                 names.add(name)
-        break
     return names
 
 
@@ -139,7 +147,7 @@ def collect_property_names(tree: ast.Module) -> set[str]:
     method whose name ends in ``_dir`` or ``_path``."""
     names: set[str] = set()
     for node in ast.walk(tree):
-        if not isinstance(node, ast.ClassDef) or node.name != "ConfigManager":
+        if not isinstance(node, ast.ClassDef) or not _is_config_manager_class(node):
             continue
         for stmt in node.body:
             if not isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -153,7 +161,6 @@ def collect_property_names(tree: ast.Module) -> set[str]:
             )
             if decorated_as_property:
                 names.add(stmt.name)
-        break
     return names
 
 
@@ -198,14 +205,60 @@ def collect_patched_attrs() -> set[str]:
     )
 
 
+def collect_patched_root_attrs() -> set[str]:
+    """Parse the ``_PATCHED_ROOT_ATTRS`` tuple out of sandbox.py.
+
+    These are non-suffix root attrs (e.g. ``anchor_root``) that the sandbox
+    also redirects but which don't end in ``_dir`` / ``_path`` — so they
+    live in a separate tuple and are used only as grounding bases for the
+    @property whitelist check below. Returns an empty set if the tuple is
+    absent (older sandbox.py), keeping the check backward-tolerant.
+    """
+    source = _SANDBOX_PATH.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(_SANDBOX_PATH))
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            if not any(
+                isinstance(t, ast.Name) and t.id == "_PATCHED_ROOT_ATTRS"
+                for t in node.targets
+            ):
+                continue
+            value = node.value
+        elif isinstance(node, ast.AnnAssign):
+            if not (isinstance(node.target, ast.Name)
+                    and node.target.id == "_PATCHED_ROOT_ATTRS"):
+                continue
+            value = node.value
+        else:
+            continue
+
+        if not isinstance(value, ast.Tuple):
+            continue
+        names: set[str] = set()
+        for elt in value.elts:
+            if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                names.add(elt.value)
+        return names
+
+    return set()
+
+
 # ── Sanity check: @property whitelist entries are grounded in an
 # already-patched attribute ─────────────────────────────────────────
 
 def check_property_whitelist_grounding(tree: ast.Module,
-                                        patched: set[str]) -> list[str]:
+                                        patched: set[str],
+                                        root_patched: set[str]) -> list[str]:
     """For each entry in ``_DYNAMIC_PROPERTY_WHITELIST``, assert its
-    body references ``self.<some_patched_or_whitelisted_attr>`` so
-    the property does actually follow the sandbox on redirection.
+    body references a sandbox-redirected attribute so the property does
+    actually follow the sandbox on redirection.
+
+    A "sandbox-redirected attribute" is either a ``*_dir`` / ``*_path``
+    entry in ``_PATCHED_ATTRS`` (direct), a previously-verified whitelist
+    property (transitive), or a non-suffix root attr in
+    ``_PATCHED_ROOT_ATTRS`` (e.g. ``anchor_root``, the base of the
+    cloud-save hierarchy).
 
     Without this, someone could mark a new property as "whitelisted"
     here while its body reads a non-sandboxed path, defeating the
@@ -213,13 +266,15 @@ def check_property_whitelist_grounding(tree: ast.Module,
     """
     errors: list[str] = []
     # Set of names whose redirection chain is considered "safe":
-    # patched attributes (direct) + previously-verified whitelist props
-    # (transitive) + "app_name" (string, not a path, so references to
-    # it aren't a leak risk).
-    chain_safe = patched | _DYNAMIC_PROPERTY_WHITELIST | {"app_name"}
+    # patched *_dir/*_path attrs (direct) + sandboxed root attrs
+    # (anchor_root) + previously-verified whitelist props (transitive) +
+    # "app_name" (string, not a path, so references to it aren't a leak risk).
+    chain_safe = (
+        patched | root_patched | _DYNAMIC_PROPERTY_WHITELIST | {"app_name"}
+    )
 
     for node in ast.walk(tree):
-        if not isinstance(node, ast.ClassDef) or node.name != "ConfigManager":
+        if not isinstance(node, ast.ClassDef) or not _is_config_manager_class(node):
             continue
         for stmt in node.body:
             if not isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -227,7 +282,7 @@ def check_property_whitelist_grounding(tree: ast.Module,
             if stmt.name not in _DYNAMIC_PROPERTY_WHITELIST:
                 continue
             # Scan body for `self.<x>` accesses where x is a path-ish
-            # attribute (ends in _dir / _path).
+            # attribute (ends in _dir / _path) or a sandboxed root attr.
             refs: set[str] = set()
             for expr in ast.walk(stmt):
                 if not isinstance(expr, ast.Attribute):
@@ -235,7 +290,9 @@ def check_property_whitelist_grounding(tree: ast.Module,
                 if not (isinstance(expr.value, ast.Name)
                         and expr.value.id == "self"):
                     continue
-                if expr.attr.endswith("_dir") or expr.attr.endswith("_path"):
+                if (expr.attr.endswith("_dir")
+                        or expr.attr.endswith("_path")
+                        or expr.attr in root_patched):
                     refs.add(expr.attr)
             if not refs:
                 errors.append(
@@ -252,7 +309,6 @@ def check_property_whitelist_grounding(tree: ast.Module,
                     f"either add to _PATCHED_ATTRS or whitelist in "
                     f"p24_sandbox_attrs_sync_smoke.py"
                 )
-        break
     return errors
 
 
@@ -280,6 +336,7 @@ def main() -> int:
     direct_attrs = collect_direct_assignments(tree)
     property_attrs = collect_property_names(tree)
     patched = collect_patched_attrs()
+    root_patched = collect_patched_root_attrs()
 
     total = 0
 
@@ -352,7 +409,7 @@ def main() -> int:
 
     # Check 4: whitelist entries actually reference a patched attribute
     # transitively.
-    errs4 = check_property_whitelist_grounding(tree, patched)
+    errs4 = check_property_whitelist_grounding(tree, patched, root_patched)
     total += _report(
         f"4 | @property whitelist entries "
         f"({len(_DYNAMIC_PROPERTY_WHITELIST)}) actually ground in a "

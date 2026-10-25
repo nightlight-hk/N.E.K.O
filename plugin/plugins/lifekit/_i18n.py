@@ -1,4 +1,4 @@
-"""轻量 i18n 模块：从 locales/*.json 加载翻译。"""
+"""Lightweight i18n module: load translations from locales/*.json."""
 
 from __future__ import annotations
 
@@ -9,12 +9,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 _DEFAULT_LOCALE = "zh-CN"
-_SUPPORTED_LOCALES = ("zh-CN", "zh-TW", "en")
+SUPPORTED_LOCALES = ("zh-CN", "zh-TW", "en", "ja", "ko", "ru", "es", "pt")
 _CACHE_MAX_ENTRIES = 32
 
 
 class LRUCache:
-    """简易 LRU 缓存，带 TTL 和容量上限。"""
+    """Simple LRU cache with TTL and capacity limits."""
 
     def __init__(self, max_size: int = _CACHE_MAX_ENTRIES):
         self._store: OrderedDict[str, Tuple[Any, float]] = OrderedDict()
@@ -39,13 +39,13 @@ class LRUCache:
 
 
 class I18n:
-    """从 locales/*.json 加载翻译，支持 dot-path 取值和 {key} 模板插值。"""
+    """Load locales/*.json translations with dot-path lookup and {key} template interpolation."""
 
     def __init__(self, locales_dir: Path, default: str = _DEFAULT_LOCALE):
         self._bundles: Dict[str, Dict[str, Any]] = {}
         self._default = default
         self._locale = default
-        for code in _SUPPORTED_LOCALES:
+        for code in SUPPORTED_LOCALES:
             fp = locales_dir / f"{code}.json"
             if fp.exists():
                 with open(fp, "r", encoding="utf-8") as f:
@@ -76,27 +76,40 @@ class I18n:
                 return key
         return self._default
 
-    def t(self, path: str, locale: Optional[str] = None, **kwargs: Any) -> str:
+    def t(
+        self,
+        path: str,
+        locale: Optional[str] = None,
+        fallback: str | None = None,
+        **kwargs: Any,
+    ) -> str:
+        val = self.value(path, locale=locale)
+        if val is None:
+            return fallback if fallback is not None else path
+        text = str(val)
+        if kwargs:
+            try:
+                text = text.format(**kwargs)
+            except (KeyError, IndexError):
+                pass
+        return text
+
+    def value(self, path: str, locale: Optional[str] = None) -> Any:
+        """Return a raw localized value, preserving lists and mappings."""
         for code in self._resolve_chain(locale):
             bundle = self._bundles.get(code)
             if bundle is None:
                 continue
             val = self._get_nested(bundle, path)
             if val is not None:
-                text = str(val)
-                if kwargs:
-                    try:
-                        text = text.format(**kwargs)
-                    except (KeyError, IndexError):
-                        pass
-                return text
-        return path
+                return val
+        return None
 
     def _resolve_chain(self, locale: Optional[str]) -> List[str]:
-        chain: List[str] = []
-        if locale:
-            n = self._normalize(locale)
-            chain.append(n)
+        active = self._normalize(locale) if locale else self._locale
+        chain = [active]
+        if not active.lower().startswith("zh") and "en" not in chain:
+            chain.append("en")
         if self._locale not in chain:
             chain.append(self._locale)
         if self._default not in chain:
@@ -105,6 +118,8 @@ class I18n:
 
     @staticmethod
     def _get_nested(d: Dict[str, Any], path: str) -> Any:
+        if path in d:
+            return d[path]
         cur: Any = d
         for p in path.split("."):
             if isinstance(cur, dict):

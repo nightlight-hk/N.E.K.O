@@ -26,6 +26,7 @@ def _mock_cm(tmpdir: str):
     cm.get_model_api_config = MagicMock(return_value={
         "model": "fake", "base_url": "http://fake", "api_key": "sk-fake",
     })
+    cm.aget_model_api_config = AsyncMock(side_effect=lambda mt, **_: cm.get_model_api_config(mt))
     return cm
 
 
@@ -38,8 +39,8 @@ def _install(tmpdir: str):
     cm = _mock_cm(tmpdir)
     with patch("memory.event_log.get_config_manager", return_value=cm), \
          patch("memory.facts.get_config_manager", return_value=cm), \
-         patch("memory.persona.get_config_manager", return_value=cm), \
-         patch("memory.reflection.get_config_manager", return_value=cm):
+         patch("memory.persona.manager.get_config_manager", return_value=cm), \
+         patch("memory.reflection.manager.get_config_manager", return_value=cm):
         event_log = EventLog()
         event_log._config_manager = cm
         fs = FactStore()
@@ -89,7 +90,7 @@ def test_validate_accepts_matching_entity_and_type():
 
 
 def test_validate_rejects_cross_entity_relation():
-    """master 不能用 dynamic（属于 relationship）。"""
+    """master cannot use dynamic (which belongs to relationship)."""
     from memory.reflection import _validate_reflection_ontology
     ok, reason = _validate_reflection_ontology("master", "dynamic", "current", "x")
     assert ok is False
@@ -144,6 +145,24 @@ def test_entity_kind_resolves_canonical_entities():
     assert _entity_kind("master") == "user"
     assert _entity_kind("neko") == "character"
     assert _entity_kind("relationship") == "relationship"
+
+
+def test_reflection_facade_preserves_ontology_and_archive_exports():
+    """The internal split must not remove or copy legacy facade symbols."""
+    from memory import reflection as facade
+    from memory._reflection import ontology, schema
+
+    assert facade.RELATION_TYPES is ontology.RELATION_TYPES
+    assert facade.ENTITY_KINDS is ontology.ENTITY_KINDS
+    assert facade.KIND_RELATION_MAP is ontology.KIND_RELATION_MAP
+    assert facade.TEMPORAL_SCOPES is ontology.TEMPORAL_SCOPES
+    assert (
+        facade.MAX_REFLECTION_TEXT_TOKENS
+        is ontology.MAX_REFLECTION_TEXT_TOKENS
+    )
+    assert facade._entity_kind is ontology.entity_kind
+    assert facade._allowed_relation_types is ontology.allowed_relation_types
+    assert facade._REFLECTION_ARCHIVE_DAYS == schema.REFLECTION_ARCHIVE_DAYS
 
 
 def test_unknown_entity_defaults_to_user_kind():
@@ -207,7 +226,7 @@ async def test_synthesize_persists_valid_ontology_fields(tmp_path):
 
 @pytest.mark.asyncio
 async def test_synthesize_degrades_invalid_relation_type_to_null(tmp_path):
-    """LLM 返回了非法的 entity→relation_type 映射时，反思应保留但字段置空。"""
+    """If the LLM returns an invalid entity-to-relation_type mapping, retain the reflection but clear those fields."""
     fs, re = _install(str(tmp_path))
     results = await _run_synth(fs, re, {
         "reflection": "观察到的某个模式",
@@ -247,7 +266,7 @@ async def test_synthesize_demotes_subject_alongside_other_ontology(tmp_path):
 
 @pytest.mark.asyncio
 async def test_synthesize_handles_legacy_prompt_missing_ontology(tmp_path):
-    """旧 prompt / 旧 model 不返回 ontology 字段时应当静默通过。"""
+    """Old prompts / models omitting ontology fields must pass silently."""
     fs, re = _install(str(tmp_path))
     results = await _run_synth(fs, re, {
         "reflection": "legacy-style reflection",

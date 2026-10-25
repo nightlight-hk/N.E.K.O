@@ -102,7 +102,19 @@ class TopicStore:
                 record_id = v
                 break
 
-        # 从 metadata 中提取 conversation_id（用于对话上下文关联）
+        # ``generation`` is projected because a light=True read gets ONLY the
+        # index back. The frames contract (plugin/core/bus/frames.py) tells a
+        # puller to dedupe on generation/id; id was already here, so leaving
+        # generation in the payload alone made a light read silently report
+        # generation=None for a frame that has one. None means "this record
+        # carries no generation" -- the projection never invents a value.
+        generation_raw = payload.get("generation")
+        if isinstance(generation_raw, bool) or not isinstance(generation_raw, (int, float)):
+            generation = None
+        else:
+            generation = int(generation_raw)
+
+        # Extract conversation_id from metadata (for conversation-context association).
         conversation_id = None
         metadata = payload.get("metadata")
         if isinstance(metadata, dict):
@@ -118,6 +130,7 @@ class TopicStore:
             "type": type_,
             "timestamp": ts,
             "id": record_id,
+            "generation": generation,
             "conversation_id": conversation_id,
         }
 
@@ -155,43 +168,6 @@ class TopicStore:
             start_idx = dq_len - limit_i
             return [dq[i] for i in range(start_idx, dq_len)]
 
-    def get_since(self, *, topic: Optional[str], after_seq: int, limit: int) -> list[Dict[str, Any]]:
-        nn = int(limit)
-        if nn <= 0:
-            return []
-        try:
-            after = int(after_seq)
-        except Exception:
-            after = 0
-
-        topic_q = None if topic is None else str(topic)
-        out: list[Dict[str, Any]] = []
-        
-        with self._lock:
-            if topic_q is None or topic_q.strip() in ("", "*"):
-                topics = list(self.items.keys())
-            else:
-                topics = [topic_q]
-            
-            # Filter while iterating, avoid copying entire deque
-            for t in topics:
-                dq = self.items.get(t)
-                if not dq:
-                    continue
-                
-                for ev in dq:
-                    try:
-                        if int(ev.get("seq", 0)) > after:
-                            out.append(ev)
-                    except Exception:
-                        logger.debug("skip event due to invalid seq: {}", ev)
-                        continue
-
-        out.sort(key=lambda e: int(e.get("seq") or 0))
-        if nn >= len(out):
-            return out
-        return out[:nn]
-
     def query(
         self,
         *,
@@ -200,6 +176,7 @@ class TopicStore:
         source: Optional[str] = None,
         kind: Optional[str] = None,
         type_: Optional[str] = None,
+        conversation_id: Optional[str] = None,
         priority_min: Optional[int] = None,
         since_ts: Optional[float] = None,
         until_ts: Optional[float] = None,
@@ -216,6 +193,10 @@ class TopicStore:
         src = str(source) if isinstance(source, str) and source else None
         kd = str(kind) if isinstance(kind, str) and kind else None
         tp = str(type_) if isinstance(type_, str) and type_ else None
+        # Matched against ``index``, not the payload: the writer files
+        # conversation_id inside ``metadata`` and _extract_index is what lifts
+        # it to a comparable place. A top-level payload lookup matches nothing.
+        cid = str(conversation_id) if isinstance(conversation_id, str) and conversation_id else None
         try:
             pmin = int(priority_min) if priority_min is not None else None
         except (ValueError, TypeError):
@@ -255,6 +236,11 @@ class TopicStore:
                     if kd is not None and idx.get("kind") != kd:
                         continue
                     if tp is not None and idx.get("type") != tp:
+                        continue
+                    # Exact match only. A record with no conversation_id has
+                    # ``None`` here and is excluded, and an unknown id simply
+                    # matches nothing -- an empty result, never an error.
+                    if cid is not None and idx.get("conversation_id") != cid:
                         continue
                     if pmin is not None:
                         try:
@@ -318,3 +304,84 @@ class StoreRegistry:
 
     def list_store_names(self) -> list[str]:
         return sorted(self._stores.keys())
+
+
+# ── Canonical store layout ─────────────────────────────────────────────
+#
+# This list used to be duplicated in three places (main.py / runner.py / rpc_server.py),
+# and all three had to be kept in sync. The failure from changing only one was silent: ingest would only
+# call _record_drop("store_unresolved") for an unregistered store,
+# without reporting it to the publisher, so standalone mode would silently drop all records. A single constructor makes
+
+# missed registrations impossible.
+# The conversation turns the host copies to the plugin (the instruction + the line she actually says). Define the name once as a constant instead of having
+# Each had its own "conversations"; adding another would create a third entry point where missed updates silently drop records.
+CONVERSATIONS_STORE_NAME = "conversations"
+
+# conversations also uses topic "all", hardcoded in BusRpcClientBase.
+CONVERSATIONS_TOPIC = "all"
+
+
+# Plugin-pushed messages. Like conversations, use a separate constant: readers subscribing in proactive_bridge
+# to "messages.", registry code, and host writers otherwise repeat the literal, each repetition adding another
+# risk of silent message loss after incomplete updates. This chain once broke, making push_message return
+# submitted=True while the character said nothing.
+MESSAGES_STORE_NAME = "messages"
+
+# Like conversations / frames, the topic is hardcoded as "all".
+MESSAGES_TOPIC = "all"
+
+
+# Generic stores all use MESSAGE_PLANE_STORE_MAXLEN.
+DEFAULT_STORE_NAMES: tuple[str, ...] = (
+    MESSAGES_STORE_NAME,
+    "events",
+    "lifecycle",
+    "runs",
+    "export",
+    "memory",
+    # conversations is a separate store for conversation context, distinct from messages.
+    CONVERSATIONS_STORE_NAME,
+)
+
+# Frames actually sent to the model by the host. Use a separate store rather than existing ones:
+# - Not "messages": proactive_bridge subscribes to "messages." and would json.loads every frame
+#   on the proactive-chat delivery thread.
+# - Not a new events topic: BusRpcClientBase._build_query_args hardcodes
+#   {"topic": "all"}, making new topics invisible to ctx.bus.events.get().
+# - Give it its own MESSAGE_PLANE_FRAMES_STORE_MAXLEN instead of the default 20000 capacity.
+FRAMES_STORE_NAME = "frames"
+
+# frames also uses topic "all" because its pull path reuses BusRpcClientBase's hardcoded topic.
+FRAMES_TOPIC = "all"
+
+
+# Host-only stores. All writers use the authenticated ingest socket, where
+# _route_message overwrites plugin_id. rpc_server's bus.publish is an unauthenticated loopback
+# operation available to any connecting client. These three stores reach users directly or impersonate the host:
+# messages delivers proactive chat through ProactiveBridge's "messages." subscription;
+# frames represents model-visible images, and conversations contains context. Reject bus.publish for
+# all three; no in-tree caller uses that path anyway (SDK publish() uses
+# ctx.push_message; the host uses ingest).
+HOST_OWNED_STORE_NAMES: frozenset[str] = frozenset(
+    {MESSAGES_STORE_NAME, FRAMES_STORE_NAME, CONVERSATIONS_STORE_NAME}
+)
+
+
+def build_default_store_registry(
+    *,
+    maxlen: int,
+    frames_maxlen: int,
+    default_store: str = "messages",
+) -> StoreRegistry:
+    """Build the registry every message-plane entry point shares.
+
+    ``frames_maxlen`` is separate on purpose: a frame is three orders of
+    magnitude larger than an ordinary record, so it cannot share the generic
+    per-topic deque length.
+    """
+    registry = StoreRegistry(default_store=default_store)
+    for name in DEFAULT_STORE_NAMES:
+        registry.register(TopicStore(name=name, maxlen=maxlen))
+    registry.register(TopicStore(name=FRAMES_STORE_NAME, maxlen=frames_maxlen))
+    return registry

@@ -1,3 +1,17 @@
+# Copyright 2025-2026 Project N.E.K.O. Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """User-activity keyword library.
 
 Single source of truth for activity classification used by
@@ -63,7 +77,7 @@ Editorial rules: process executable names are only included when
 verified from official or well-known sources. Skipped if unsure —
 title-only is fine, fabricated process names are worse than nothing.
 No adult / NSFW entries.
-"""
+"""  # noqa: DOCSTRING_CJK
 
 from __future__ import annotations
 
@@ -300,13 +314,13 @@ OWN_APP_PROCESS_NAMES: list[str] = [
 #
 #   competitive            → propensity=restricted_screen_only, skip 0.0,
 #                            tone=terse  (LoL team fight, CS round, etc.)
-#                            screen-only 的安静感由 /proactive_chat 的
-#                            前端固定 base_interval + 后端 uniform(0, 0.5*base)
-#                            抖动承担（实际间隔 [base, 1.5*base]，0.5*base 上限
-#                            兜底 60s）；skip 不再叠加。
+#                            Screen-only quietness comes from /proactive_chat's
+#                            fixed frontend base_interval plus backend uniform(0, 0.5*base)
+#                            jitter, giving [base, 1.5*base] intervals with the 0.5*base upper bound
+#                            capped at 60s; skip no longer adds another delay.
 #   immersive horror       → propensity=restricted_screen_only, skip 0.3,
 #                            tone=hushed (silent hill, RE2, etc.) —
-#                            氛围比信息密度更怕打扰，保留整轮 skip
+#                            Ambience is more interruption-sensitive than information density; retain whole-round skip.
 #   immersive (other)      → propensity=restricted_screen_only, skip 0.0,
 #                            tone=mellow (RPG, story-driven)
 #   casual                 → propensity=open, skip 0.0, tone=playful
@@ -368,7 +382,7 @@ GAME_TITLE_KEYWORDS: list = [
     ('Love and Deepspace', ['Love and Deepspace', '恋与深空', '戀與深空'], 'casual', 'rpg'),
 
     # ============================================================
-    # Xishanju / 西山居
+    # Xishanju.
     # ============================================================
     ('JX3 / Jian Wang 3', ['JX3', 'Jian Wang 3', 'JianXia', '剑网3', '劍網3', '劍俠情緣網絡版叁']),
     ('JX3 Online HD', ['剑网3 缘起', '剑网3缘起']),
@@ -2029,10 +2043,10 @@ ENTERTAINMENT_PROCESS_NAMES: list[tuple[str, str]] = [
     ('spotify.exe', 'music'),
     ('applemusic.exe', 'music'),
     ('itunes.exe', 'music'),
-    ('cloudmusic.exe', 'music'),            # 网易云音乐
+    ('cloudmusic.exe', 'music'),            # NetEase Cloud Music.
     ('qqmusic.exe', 'music'),
     ('kugou.exe', 'music'),
-    ('kwmusic.exe', 'music'),               # 酷我音乐
+    ('kwmusic.exe', 'music'),               # Kuwo Music.
     ('foobar2000.exe', 'music'),
     ('aimp.exe', 'music'),
     ('musicbee.exe', 'music'),
@@ -2061,7 +2075,7 @@ ENTERTAINMENT_PROCESS_NAMES: list[tuple[str, str]] = [
     ('kodi.exe', 'video'),
     ('iqiyi.exe', 'video'),
     ('youku.exe', 'video'),
-    ('qqlive.exe', 'video'),                # 腾讯视频
+    ('qqlive.exe', 'video'),                # Tencent Video.
     ('bilibili.exe', 'video'),
     ('哔哩哔哩.exe', 'video'),
     ('douyin.exe', 'video'),
@@ -2074,7 +2088,7 @@ ENTERTAINMENT_PROCESS_NAMES: list[tuple[str, str]] = [
     ('kindle.exe', 'ebook'),
     ('calibre.exe', 'ebook'),
     ('calibre-ebook-viewer.exe', 'ebook'),
-    ('weread.exe', 'ebook'),                # 微信读书
+    ('weread.exe', 'ebook'),                # WeChat Reading.
     ('digitaleditions.exe', 'ebook'),
     ('kobo.exe', 'ebook'),
     ('hamster ebook converter.exe', 'ebook'),
@@ -2254,8 +2268,8 @@ ENTERTAINMENT_DOMAIN_KEYWORDS: list[tuple[str, str]] = [
     ('audius.co', 'music'),
     ('jamendo.com', 'music'),
     # Regional music
-    ('music.163.com', 'music'),             # 网易云
-    ('y.qq.com', 'music'),                  # QQ 音乐
+    ('music.163.com', 'music'),             # NetEase Cloud Music.
+    ('y.qq.com', 'music'),                  # QQ Music.
     ('kugou.com', 'music'),
     ('kuwo.cn', 'music'),
     ('music.migu.cn', 'music'),
@@ -2274,7 +2288,7 @@ ENTERTAINMENT_DOMAIN_KEYWORDS: list[tuple[str, str]] = [
     ('gaana.com', 'music'),
     ('music.yandex.ru', 'music'),
     # Podcasts
-    ('xiaoyuzhoufm.com', 'music'),          # 小宇宙
+    ('xiaoyuzhoufm.com', 'music'),          # Xiaoyuzhou.
     ('podcasts.apple.com', 'music'),
     ('pca.st', 'music'),                    # Pocket Casts
     ('overcast.fm', 'music'),
@@ -2290,8 +2304,8 @@ ENTERTAINMENT_DOMAIN_KEYWORDS: list[tuple[str, str]] = [
     ('tapas.io', 'comic'),
     ('tappytoon.com', 'comic'),
     ('kuaikanmanhua.com', 'comic'),
-    ('ac.qq.com', 'comic'),                 # 腾讯动漫
-    ('u17.com', 'comic'),                   # 有妖气
+    ('ac.qq.com', 'comic'),                 # Tencent Comics.
+    ('u17.com', 'comic'),                   # U17 Comics.
     ('comic-walker.com', 'comic'),
     ('shonenjumpplus.com', 'comic'),
     ('pocket.shonenmagazine.com', 'comic'),
@@ -2327,7 +2341,7 @@ ENTERTAINMENT_DOMAIN_KEYWORDS: list[tuple[str, str]] = [
     ('cracked.com', 'news'),
     ('mashable.com', 'news'),
     ('news.ycombinator.com', 'news'),
-    ('s.weibo.com', 'news'),                # 微博热搜
+    ('s.weibo.com', 'news'),                # Weibo trending searches.
     ('4chan.org', 'forum'),
     ('boards.4chan.org', 'forum'),
     ('news.nicovideo.jp', 'news'),
@@ -2593,7 +2607,7 @@ COMMUNICATION_PROCESS_NAMES: list[tuple[str, str]] = [
     ('thebat.exe', 'email'),
     ('thebat64.exe', 'email'),
     ('Spark.exe', 'email'),
-    ('MailMaster.exe', 'email'),  # NetEase 邮箱大师
+    ('MailMaster.exe', 'email'),  # NetEase Mail Master.
     ('HxOutlook.exe', 'email'),   # Windows 10/11 built-in Mail
     ('HxMail.exe', 'email'),
     ('hxtsr.exe', 'email'),
@@ -2791,8 +2805,67 @@ COMMUNICATION_DOMAIN_KEYWORDS: list[tuple[str, str]] = [
 Needle = Union[str, re.Pattern]
 
 
+# ── Traditional-Chinese window titles ───────────────────────────────
+# A Traditional-locale Windows install reports Traditional window
+# titles. Some are script-neutral ("原神" either way), many are not
+# ("極限競速：地平線5", "遊戲"). The alias tables below are written in
+# Simplified, so those titles matched nothing and the activity tracker
+# silently classified the window as ``unknown``.
+#
+# Backfilling every alias with a Traditional twin would mean ~490
+# hand-transliterated entries to keep in sync forever. Folding both
+# sides to Simplified at match time is one code path, covers all four
+# tables, and keeps working for aliases added later.
+#
+# The fold direction matters: Traditional -> Simplified is very nearly
+# a function, while the reverse is not (Simplified 发 splits into
+# 發/髮, 干 into 乾/幹/干). Generating Traditional variants would have
+# to guess; folding does not.
+#
+# The map is a **closed set** -- it holds only characters whose
+# Simplified form already appears in these tables, so folding can
+# never pull unrelated text toward a keyword it could not otherwise
+# reach. ``test_activity_keywords_script_fold`` regenerates it and
+# fails if a newly added alias needs a character the map lacks.
+_TRAD_FOLD_SOURCE = (
+    '亞佈來係俠們倖備傢傳優剋創劃劍動區卽叄啓啟喚嗶噁囌國圍園塵壘壞夢奧婭學寶對屍島師廚廠彌彔後恆惡愛'
+    '戀戰戲捲撲擊擱敎昇時晉曉書會條棊業極榮樂機橫權歐歸殭殺毀氣決淺滅滾潛瀰為無煉熱燬爐爭爲爾獄獵獸環'
+    '產産甦畫異畵癥盃盜盧碼祕穀競紀約紅細終組絆結絕絲絶綠綫維網綵緋緑線緣緻縱繫羅羈羣翫聞聯聲腦臥與舊'
+    '莊華萊蒐蒼藍藝蘇號蝕衚裏裝裡製覈視計訊話誌語說説諸諾謊譭議讀變貓費貼賊賽跡蹟車軌軍軸轉迴連進遊運'
+    '達遺還郵醜醣釘鋒鋼錄錘録錶鍊鎚鏇鏢鐵門閃間閤閱閲闇陞陰陸陽隕際險隻雙離雲電靈頂領頭頻風飛飢饑馬騎'
+    '騰鬍鬥鬧魚魯鳳鳴麪麫麯麴麵黃點齣龍'
+)
+_SIMP_FOLD_TARGET = (
+    '亚布来系侠们幸备家传优克创划剑动区即叁启启唤哔恶苏国围园尘垒坏梦奥娅学宝对尸岛师厨厂弥录后恒恶爱'
+    '恋战戏卷扑击搁教升时晋晓书会条棋业极荣乐机横权欧归僵杀毁气决浅灭滚潜弥为无炼热毁炉争为尔狱猎兽环'
+    '产产苏画异画症杯盗卢码秘谷竞纪约红细终组绊结绝丝绝绿线维网彩绯绿线缘致纵系罗羁群玩闻联声脑卧与旧'
+    '庄华莱搜苍蓝艺苏号蚀胡里装里制核视计讯话志语说说诸诺谎毁议读变猫费贴贼赛迹迹车轨军轴转回连进游运'
+    '达遗还邮丑糖钉锋钢录锤录表炼锤旋镖铁门闪间合阅阅暗升阴陆阳陨际险只双离云电灵顶领头频风飞饥饥马骑'
+    '腾胡斗闹鱼鲁凤鸣面面曲曲面黄点出龙'
+)
+_SCRIPT_FOLD = str.maketrans(_TRAD_FOLD_SOURCE, _SIMP_FOLD_TARGET)
+
+# Fingerprint of the CJK characters the alias tables actually use.
+# ``scripts/gen_activity_fold_map.py`` stamps it; the guard test fails
+# when a newly added alias brings in a character the map never saw, which
+# is the one way the closed set can silently go stale.
+_FOLD_ALIAS_CHAR_DIGEST = '045415e3eb80828e'
+
+
+def fold_script(text: str) -> str:
+    """Fold Traditional characters onto their Simplified form.
+
+    Applied to both sides of the match: to aliases when the tables are
+    built, and to the incoming title / process name. A no-op on
+    Simplified or non-CJK text.
+    """
+    return text.translate(_SCRIPT_FOLD)
+
+
+
+
 def _make_needle(alias: str) -> Needle:
-    low = alias.lower()
+    low = fold_script(alias.lower())
     if not low:
         return low
     has_ascii_alnum = any(c.isascii() and c.isalnum() for c in low)
@@ -3017,7 +3090,7 @@ def classify_window_title(title: str | None) -> ClassifyResult:
     """
     if not title:
         return _UNKNOWN
-    low = title.lower()
+    low = fold_script(title.lower())
     for needle, result in _TITLE_TABLE:
         if _match(needle, low):
             return result
@@ -3033,7 +3106,7 @@ def classify_process_name(proc: str | None) -> ClassifyResult:
     """
     if not proc:
         return _UNKNOWN
-    low = proc.lower()
+    low = fold_script(proc.lower())
     for needle, result in _PROCESS_TABLE:
         if _match(needle, low):
             return result
@@ -3051,7 +3124,7 @@ def classify_browser_title(title: str | None) -> ClassifyResult:
     """
     if not title:
         return _UNKNOWN
-    low = title.lower()
+    low = fold_script(title.lower())
     for needle, result in _DOMAIN_TABLE:
         if _match(needle, low):
             return result

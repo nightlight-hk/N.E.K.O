@@ -38,6 +38,9 @@ PROVIDER_TO_KEY_FIELD: dict[str, str] = {
     "silicon": "assistApiKeySilicon",
     "gemini": "assistApiKeyGemini",
     "kimi": "assistApiKeyKimi",
+    "kimi_code": "assistApiKeyKimiCode",
+    "mimo": "assistApiKeyMimo",
+    "mimo_token_plan": "assistApiKeyMimoTokenPlan",
 }
 
 # Canonical set of key fields the UI surfaces — any field in api_keys.json that
@@ -217,7 +220,7 @@ def preset_has_bundled_api_key(provider_key: str) -> bool:
     """Cheap boolean view for UI — does this preset ship its own api_key?
 
     Used by ``GET /api/config/providers`` so the UI can render
-    "此预设内置 API Key, 无需填写" instead of the default "未配置" status.
+    the built-in-key/no-input-needed status instead of the default unconfigured status.
     """
     return bool(get_preset_bundled_api_key(provider_key))
 

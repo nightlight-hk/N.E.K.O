@@ -1,6 +1,8 @@
 import clsx from 'clsx';
 import { i18n } from './i18n';
 import MessageBlockView, { isGuideMessage } from './MessageBlockView';
+import MessageReactions from './MessageReactions';
+import TopicHintBubble, { isTopicHintMessage } from './TopicHintBubble';
 import {
   type ChatMessage,
   type MessageAction,
@@ -55,6 +57,10 @@ export default function MessageBubble({
   const showMeta = message.role !== 'system' && !isGroupedWithPrevious;
   const showFailed = message.role !== 'system' && message.status === 'failed';
 
+  if (isTopicHintMessage(message)) {
+    return <TopicHintBubble message={message} />;
+  }
+
   if (message.role === 'system') {
     return (
       <article
@@ -64,8 +70,15 @@ export default function MessageBubble({
         data-guide-message={isGuideMessage(message) ? 'true' : undefined}
         data-message-sort-key={message.sortKey ?? ''}
       >
-        <div className="system-chip">
+        <div className={clsx("system-chip", { "system-chip-card": message.blocks.some(block => block.type === "html_card") })}>
           <span className="system-chip-time">{message.time}</span>
+          {message.author ? (
+            // Where this came from. A plugin may phrase its text in the
+            // character's voice, so without a source the reader cannot tell it
+            // apart from something she actually said — and for blind pushes she
+            // has no memory of it at all.
+            <span className="system-chip-source">{message.author}</span>
+          ) : null}
           <div className="system-chip-content">
             {message.blocks.map((block, index) => (
               <MessageBlockView
@@ -121,6 +134,7 @@ export default function MessageBubble({
             />
           ))}
         </div>
+        <MessageReactions message={message} />
         {message.actions && message.actions.length > 0 ? (
           <div className="message-inline-actions">
             {message.actions.map((action) => (

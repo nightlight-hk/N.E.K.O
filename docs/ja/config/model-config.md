@@ -1,70 +1,15 @@
 # モデル設定
 
-N.E.K.O. はタスクごとに異なる AI モデルを使用します。それぞれ個別に設定できます。
+N.E.K.O. は単一の global model ではなく **role** 単位で解決します。選択 Provider profile が defaults を提供し、`core_config.json` の対応値が個別 role を上書きできます。
 
-## モデルの役割
+主な fields は `CORE_MODEL`、`CONVERSATION_MODEL`、`SUMMARY_MODEL`、`CORRECTION_MODEL`、`EMOTION_MODEL`、`VISION_MODEL`、`AGENT_MODEL`、`REALTIME_MODEL`、`TTS_MODEL` です。
 
-| 役割 | デフォルト | 環境変数 | 用途 |
-|------|------------|----------|------|
-| 会話 | `qwen-max` | - | キャラクターチャット（オフラインモード） |
-| 要約 | `qwen-plus` | `NEKO_SUMMARY_MODEL` | 会話の要約 |
-| 校正 | `qwen-max` | `NEKO_CORRECTION_MODEL` | テキスト校正 |
-| 感情 | `qwen-flash` | `NEKO_EMOTION_MODEL` | 表情用の感情分析 |
-| ビジョン | `qwen3-vl-plus-2025-09-23` | `NEKO_VISION_MODEL` | 画像/スクリーンショットの理解 |
-| エージェント | `qwen3.5-plus` | `NEKO_AGENT_MODEL` | エージェントタスクの実行 |
+Web UI で Core/Assist Provider と credential を設定し、connectivity check 後に必要な supported role の model/URL/key を設定します。保存済み endpoint は current profile candidates に含まれる間だけ再利用されます。
 
-## カスタムモデルエンドポイント
+カスタム API で role の model ID を空欄にすると、その role が実際に指す Provider の同じ tier の default を使います。「Assist に追従」は Assist Provider、「Core に追従」は Core Provider、指定 Provider はその Provider 自身の default です。無料版と固定モデルの Provider（Kimi Code など）は保存済み model ID を無視し、常に自身のモデルを使います。「カスタム」endpoint には Provider default がないため、空欄だと Assist API の現在のモデル名がそのまま使われます。明示的に入力してください。
 
-各モデルの役割にはカスタム API エンドポイントを使用できます。`core_config.json` または Web UI で設定します：
+Web UI の各 model ID 欄には「モデルを取得」ボタンがあり、upstream endpoint が提供する model を一覧し、入力内容で絞り込めます（`POST /api/config/list_models`）。空欄のときは現在使われている model が灰色の placeholder で表示されます。入力しても使われない場所ではボタンが無効です：無料版と固定モデルの Provider、会話/要約を追従するミニゲーム slot、realtime・TTS・ミニゲーム slot の追従モード。
 
-```json
-{
-  "conversationModel": "custom-model-name",
-  "conversationModelUrl": "https://custom-api.example.com/v1",
-  "conversationModelApiKey": "sk-xxxxx"
-}
-```
+Model IDs、endpoints、thinking controls、token limits、voice catalog は変化します。running revision と同じ `config/api_providers.json` と Web UI を確認し、文書例を compatibility promise にしないでください。
 
-カスタム URL/キーが設定されている場合、その特定の役割についてグローバルな Assist API プロバイダーをオーバーライドします。
-
-## Computer Use モデル
-
-Computer Use には2つのビジョンモデルが必要です：
-
-| 役割 | デフォルト | 用途 |
-|------|------------|------|
-| プランニングモデル | `qwen3-vl-plus-2025-09-23` | スクリーンショットを分析しアクションを計画 |
-| グラウンディングモデル | `qwen3-vl-plus-2025-09-23` | クリック対象の UI 要素を特定 |
-
-`core_config.json` で設定します：
-
-```json
-{
-  "computerUseModel": "qwen3-vl-plus-2025-09-23",
-  "computerUseModelUrl": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-  "computerUseModelApiKey": "sk-xxxxx",
-  "computerUseGroundModel": "qwen3-vl-plus-2025-09-23",
-  "computerUseGroundUrl": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-  "computerUseGroundApiKey": "sk-xxxxx"
-}
-```
-
-## 思考モードの設定
-
-一部のモデルは「思考」または「拡張推論」モードをサポートしています。N.E.K.O. はより高速なレスポンスのためにデフォルトでこれらを無効にしています。無効化のフォーマットはプロバイダーによって異なります：
-
-| プロバイダー | 無効化フォーマット |
-|-------------|-------------------|
-| Qwen, Step, DeepSeek | `{"enable_thinking": false}` |
-| GLM | `{"thinking": {"type": "disabled"}}` |
-| Gemini 2.x | `{"thinking_config": {"thinking_budget": 0}}` |
-| Gemini 3.x | `{"thinking_config": {"thinking_level": "low"}}` |
-
-これは `config/__init__.py` でモデル名に基づいて自動的に処理されます。
-
-## 画像レート制限
-
-| 設定 | デフォルト | 説明 |
-|------|------------|------|
-| `NATIVE_IMAGE_MIN_INTERVAL` | 1.5 秒 | 画面キャプチャの最小間隔 |
-| `IMAGE_IDLE_RATE_MULTIPLIER` | 5 倍 | 音声アクティビティがない場合の倍率 |
+新しい role/field は loader、config manager、router/UI、tests、8 locale を同時に更新します。

@@ -31,8 +31,8 @@ Matrix (strictly per the Day-1 subagent-C spec):
 - B1..B5         — avatar dedupe matrix (hit, rank upgrade, distinct
                    keys, reset, info shape, cap-overflow LRU +
                    AVATAR_DEDUPE_CACHE_FULL once-per-cycle).
-- C1..C4         — coerce_info surfacing (intensity, kind, language
-                   fallback + zh-TW stays native).
+- C1..C4         — strict avatar payload rejection plus coerce_info surfacing
+                   for proactive kind/language fallback; zh-TW stays native.
 - D1..D3         — mirror_to_recent applied / fallback_reason paths
                    (incl. proactive [PASS]).
 - E1..E7         — error branches (invalid_payload / empty_callbacks /
@@ -222,8 +222,8 @@ def _post_event(
 def _extract_result(body: dict[str, Any]) -> dict[str, Any]:
     """Return the SimulationResult fields from the POST response body.
 
-    Wire shape (router post-2026-04-23, per P25_BLUEPRINT §2.6 "一个响应
-    结构"): SimulationResult fields are flat at the top level alongside a
+    Wire shape (router post-2026-04-23, per P25_BLUEPRINT §2.6 'one response
+    structure'): SimulationResult fields are flat at the top level alongside a
     sibling ``kind`` discriminator — ``{kind, accepted, reason, ...}``.
     Previously the router wrapped them inside an ``{kind, result: {...}}``
     envelope, which shape-drifted against the P25 Day 2 UI (the panel's
@@ -263,8 +263,8 @@ def _avatar_payload(
     """Build a minimum-valid avatar event payload.
 
     Uses ``fist/poke`` by default because the spec line A1 tool_id='head',
-    action_id='touch' is not in the main program's allowed set
-    (_AVATAR_INTERACTION_ALLOWED_ACTIONS = {lollipop, fist, hammer}).
+    action_id='touch' is not in the authoritative
+    ``AVATAR_INTERACTION_TOOL_CONTRACT``.
     The subagent-C brief says to test the "three kind happy path" — so
     we pick a combination the normaliser actually accepts.
     """
@@ -273,11 +273,16 @@ def _avatar_payload(
         "tool_id": tool_id,
         "action_id": action_id,
         "target": "avatar",
+        "intensity": intensity if intensity is not None else "normal",
     }
-    if intensity is not None:
-        p["intensity"] = intensity
     if extra:
         p.update(extra)
+    if (
+        tool_id in {"fist", "hammer"}
+        and "touch_zone" not in p
+        and "touchZone" not in p
+    ):
+        p["touch_zone"] = "head"
     return p
 
 
@@ -320,10 +325,10 @@ def check_a_happy_paths(client, mock) -> list[str]:
                f"dedupe_info.hit={dedupe_info.get('hit')}")
 
         # A1c — wire instruction role (P25 Day 2 polish 2):
-        # 主程序 prompt_ephemeral 的语义契约是 ``messages + HumanMessage(
-        # content=instruction)`` — instruction 以 **user** 角色注入. 如果
-        # 误写成 role=system, 会让空 session 的 wire 只有 [system, system],
-        # Gemini 400 "Model input cannot be empty". 这条 check 守住契约.
+        # The main app's prompt_ephemeral contract is ``messages + HumanMessage(
+        # content=instruction)``: inject instruction with **user** role. Mistakenly using
+        # role=system leaves an empty session's wire as [system, system], causing
+        # Gemini 400 "Model input cannot be empty". This check protects the contract.
         wire = mock.last_wire or []
         _check(bool(wire), "A1c.wire_nonempty",
                f"mock.last_wire empty after avatar call: {wire!r}")
@@ -336,30 +341,22 @@ def check_a_happy_paths(client, mock) -> list[str]:
                    "A1c.wire_tail_is_instruction",
                    f"wire tail content != SimulationResult.instruction")
 
-        # A1d — "UI 扩展字段真进了 wire instruction 正文" 防回归
-        # (2026-04-23 r3 polish).
+        # A1d — direct avatar event-fact instruction contract.
         #
-        # LESSONS_LEARNED §1.6 (语义契约 vs 运行时机制): 主程序
-        # ``config.prompts.prompts_avatar_interaction._build_avatar_interaction_
-        # instruction`` 把 ``text_context`` / ``reward_drop`` / ``easter_egg``
-        # 这类"上下文可选字段"拼进 instruction body 的指定 bullet 行
-        # (见 `_AVATAR_INTERACTION_PROMPT_TEXT` 里的 ``reward_drop_line`` /
-        # ``easter_egg_line`` / ``text_context_line``). tester 反馈"这些
-        # 字段在发送给 AI 的消息里完全不会有体现" — 实际是 UI 折叠 +
-        # tester 未展开 Instruction preview 看. 加这条断言守住契约, 若
-        # 未来主程序签名漂移 / testbench pipeline 错过 normalizer 字段,
-        # smoke 立刻红.
+        # Avatar prompts send only direct event facts, without text_context, field lists, or
+        # response-format instructions. reward_drop / easter_egg remain represented through objective event facts,
+        # so guard that rewards enter event facts while drafts remain private.
         #
         # Matrix:
-        #   - fist + reward_drop + text_context → "附加结果 ... 奖励" +
-        #     "输入框草稿"
-        #   - hammer + easter_egg (+ intensity 自动归一成 easter_egg) →
-        #     "附加结果 ... 彩蛋"
-        # (persona.language 默认 zh-CN, 检 zh 文案 key.)
+        #   - fist + reward_drop + text_context → event facts contain "奖励" ('reward'),
+        #     without raw text_context or the "输入框草稿" ('input draft') field.
+        #   - hammer + easter_egg (intensity and easter-egg marker form one fact) →
+        #     event facts contain "彩蛋" ('easter egg').
+        # persona.language defaults to zh-CN; check Chinese copy keys.
         #
-        # 用 intensity=rapid 升 rank 越过 A1 留下的 fist_touch rank=1 条目
-        # (8000ms 窗口内需要 rank 更高才走接收分支); 不这样 A1 和 A1d
-        # 会彼此 dedupe_window_hit.
+        # Use intensity=rapid to increase rank beyond A1's fist_touch rank=1 entry
+        # (acceptance within the 8000ms window requires higher rank); otherwise A1 and A1d
+        # trigger dedupe_window_hit against each other.
         mock.set_reply("Mocked reply")
         status, body = _post_event(
             client, "avatar",
@@ -378,34 +375,35 @@ def check_a_happy_paths(client, mock) -> list[str]:
         _check(rd.get("accepted") is True, "A1d.accepted",
                f"reason={rd.get('reason')}")
         instruction_d = rd.get("instruction") or ""
-        _check("输入框草稿" in instruction_d, "A1d.text_context_line",
-               f"instruction missing '输入框草稿' bullet for text_context; "
-               f"main-program prompts_avatar_interaction 里 "
-               f"_AVATAR_INTERACTION_PROMPT_TEXT['zh']['text_context_line'] "
-               f"应该拼进来. 前 400 字符: {instruction_d[:400]!r}")
-        _check("主人今天看起来心情不太好" in instruction_d,
-               "A1d.text_context_body",
-               f"text_context body not interpolated into instruction; "
-               f"前 400 字符: {instruction_d[:400]!r}")
         _check("奖励" in instruction_d, "A1d.reward_drop_line",
-               f"instruction missing reward_drop bullet (zh '附加结果 ... "
-               f"掉落奖励'); 主程序 reward_drop_line 应在 fist + reward_drop=True "
-               f"时拼入. 前 400 字符: {instruction_d[:400]!r}")
-        # 并且 wire 最后一条 instruction 必须等于 SimulationResult.instruction
-        # (已由 A1c 守住 happy path, 这里对 context/reward 路径再守一次).
+               f"instruction missing reward_drop event fact; "
+               f"前 400 字符: {instruction_d[:400]!r}")
+        _check("连续" in instruction_d, "A1d.rapid_reward_keeps_intensity",
+               f"rapid+reward instruction lost repeated-touch fact; "
+               f"前 400 字符: {instruction_d[:400]!r}")
+        _check("输入框草稿" not in instruction_d, "A1d.no_text_context_label",
+               f"avatar event-fact instruction leaked text_context label: "
+               f"{instruction_d[:400]!r}")
+        _check("主人今天看起来心情不太好" not in instruction_d,
+               "A1d.no_text_context_body",
+               f"avatar event-fact instruction leaked text_context body: "
+               f"{instruction_d[:400]!r}")
+        # The wire's final instruction must also equal SimulationResult.instruction
+        # (A1c protects the happy path; recheck context/reward paths here).
         wired = (mock.last_wire or [])[-1:] or [{}]
         _check(wired[0].get("content") == instruction_d,
                "A1d.wire_tail_matches",
                "wire tail content != SimulationResult.instruction for the "
                "text_context + reward_drop case")
 
-        # A1e — hammer + easter_egg 触发彩蛋文案入 instruction.
+        # A1e — hammer + easter_egg inserts easter-egg wording into instruction.
         mock.set_reply("Mocked reply")
         status, body = _post_event(
             client, "avatar",
             _avatar_payload(
                 interaction_id="i1-easter",
                 tool_id="hammer", action_id="bonk",
+                intensity="easter_egg",
                 extra={"easter_egg": True},
             ),
         )
@@ -415,9 +413,31 @@ def check_a_happy_paths(client, mock) -> list[str]:
                f"reason={re_.get('reason')}")
         instruction_e = re_.get("instruction") or ""
         _check("彩蛋" in instruction_e, "A1e.easter_egg_line",
-               f"instruction missing '彩蛋' bullet for hammer+easter_egg; "
-               f"主程序 easter_egg_line 应在 hammer + easter_egg=True 时拼入. "
+               f"instruction missing '彩蛋' event fact for hammer+easter_egg; "
                f"前 400 字符: {instruction_e[:400]!r}")
+
+        # A1f — RPS is a strict round-fact payload. It intentionally has no
+        # action_id/intensity fields, so the full testbench delivery path must
+        # not assume the action-tool shape when recording preview/diagnostics.
+        mock.set_reply("Mocked reply")
+        status, body = _post_event(
+            client,
+            "avatar",
+            {
+                "interaction_id": "i1-rps",
+                "tool_id": "rps",
+                "target": "avatar",
+                "user_gesture": "rock",
+                "avatar_gesture": "scissors",
+                "round_result": "user_win",
+            },
+        )
+        _check(status == 200, "A1f.status", f"{status} {body}")
+        rps_result = _extract_result(body)
+        _check(rps_result.get("accepted") is True, "A1f.accepted",
+               f"reason={rps_result.get('reason')}")
+        _check(rps_result.get("assistant_reply") == "Mocked reply", "A1f.reply",
+               f"assistant_reply={rps_result.get('assistant_reply')!r}")
 
         # A2 — agent_callback.
         mock.set_reply("Mocked reply")
@@ -438,9 +458,9 @@ def check_a_happy_paths(client, mock) -> list[str]:
         instr2 = r2.get("instruction") or ""
         _check("\n" in instr2, "A2.instruction_newline",
                "instruction missing newline (expected multi-line bullet list)")
-        _check("- 任务已完成" in instr2 and "- 2 条邮件" in instr2,
+        _check("任务已完成" in instr2 and "2 条邮件" in instr2,
                "A2.instruction_bullets",
-               f"instruction lacks '- <item>' bullets: {instr2[:200]!r}")
+               f"instruction lacks callback item text: {instr2[:200]!r}")
         # A2c — wire instruction role (see A1c for rationale).
         wire2 = mock.last_wire or []
         if wire2:
@@ -728,27 +748,23 @@ def check_c_coerce(client, mock) -> list[str]:
         mock.reset()
         mock.set_reply("Mocked reply")
 
-        # C1 — illegal avatar intensity is normalised, and the diff is surfaced.
-        status, body = _post_event(
-            client, "avatar",
-            _avatar_payload(interaction_id="c1-bad-intensity",
-                            tool_id="fist", action_id="poke",
-                            intensity="crazy"),
-        )
-        r = _extract_result(body)
-        _check(r.get("accepted") is True, "C1.accepted",
-               f"reason={r.get('reason')}")
-        coerce_list = r.get("coerce_info") or []
-        intensity_entries = [c for c in coerce_list if c.get("field") == "intensity"]
-        _check(len(intensity_entries) >= 1, "C1.coerce_present",
-               f"coerce_info={coerce_list}")
-        if intensity_entries:
-            c = intensity_entries[0]
-            _check(c.get("requested") == "crazy", "C1.coerce_requested",
-                   f"requested={c.get('requested')}")
-            _check(c.get("applied") in {"normal", "rapid", "burst", "easter_egg"},
-                   "C1.coerce_applied",
-                   f"applied={c.get('applied')}")
+        # C1 — avatar contract violations reject instead of coercing facts.
+        missing_intensity = _avatar_payload(interaction_id="c1-missing-intensity")
+        missing_intensity.pop("intensity")
+        missing_touch_zone = _avatar_payload(interaction_id="c1-missing-touch-zone")
+        missing_touch_zone.pop("touch_zone")
+        invalid_payloads = [
+            ("missing-intensity", missing_intensity),
+            ("missing-touch-zone", missing_touch_zone),
+        ]
+        for label, payload in invalid_payloads:
+            status, body = _post_event(client, "avatar", payload)
+            r = _extract_result(body)
+            _check(status == 200, f"C1.{label}.status", f"{status}: {body}")
+            _check(r.get("accepted") is False, f"C1.{label}.accepted", str(r))
+            _check(r.get("reason") == "invalid_payload", f"C1.{label}.reason", str(r))
+            _check(not (r.get("coerce_info") or []), f"C1.{label}.no_coerce", str(r))
+        _check(mock.calls == 0, "C1.no_llm_call", f"calls={mock.calls}")
 
         # C2 — bogus proactive kind coerces to home.
         _reset_dedupe(client)
@@ -766,8 +782,10 @@ def check_c_coerce(client, mock) -> list[str]:
         _check(c.get("applied") == "home", "C2.applied",
                f"applied={c.get('applied')}")
 
-        # C3 — proactive language fallback surfaces.
-        r = client.patch("/api/persona", json={"language": "es-ES"})
+        # C3 — a genuinely unsupported language (fr) still falls back to en
+        # and surfaces a language coerce. (es/pt became native in the 2026-06
+        # upstream sync — covered separately in C3b.)
+        r = client.patch("/api/persona", json={"language": "fr-FR"})
         _check(r.status_code == 200, "C3.persona_patch_status",
                f"{r.status_code} {r.text}")
         status, body = _post_event(client, "proactive", {"kind": "home"})
@@ -779,10 +797,24 @@ def check_c_coerce(client, mock) -> list[str]:
         _check(len(lang_entries) == 1, "C3.coerce_language",
                f"coerce_info={coerce_list}")
         c = lang_entries[0]
-        _check(c.get("requested") == "es-ES", "C3.lang_requested",
+        _check(c.get("requested") == "fr-FR", "C3.lang_requested",
                f"requested={c.get('requested')}")
         _check(c.get("applied") == "en", "C3.lang_applied",
                f"applied={c.get('applied')}")
+
+        # C3b — es is now a native proactive language (_normalize_prompt_language
+        # maps es->es); it must NOT surface a language coerce anymore.
+        r = client.patch("/api/persona", json={"language": "es-ES"})
+        _check(r.status_code == 200, "C3b.persona_patch_status",
+               f"{r.status_code} {r.text}")
+        status, body = _post_event(client, "proactive", {"kind": "home"})
+        r3b = _extract_result(body)
+        _check(r3b.get("accepted") is True, "C3b.accepted",
+               f"reason={r3b.get('reason')}")
+        coerce_list = r3b.get("coerce_info") or []
+        lang_entries = [c for c in coerce_list if c.get("field") == "language"]
+        _check(len(lang_entries) == 0, "C3b.no_coerce_native_es",
+               f"unexpected language coerce for native es-ES: {lang_entries}")
 
         # C4 — zh-TW is a native zh prefix; must NOT surface language coerce.
         r = client.patch("/api/persona", json={"language": "zh-TW"})
@@ -1233,24 +1265,24 @@ def check_g_diagnostics(client, mock) -> list[str]:
 
 
 # ─────────────────────────────────────────────────────────────
-# Case H — persona.language={es,pt} → English silent fallback
+# Case H — persona.language={es,pt} → NATIVE dispatch (2026-06 sync)
 # ─────────────────────────────────────────────────────────────
 #
-# Upstream delta (P25 §A.8 #5 + §3 Day 3 smoke): ``prompts_sys._loc``
-# has a ``_SILENT_FALLBACK = {'es', 'pt'}`` set — for these two
-# languages, the LLM system prompt (``AGENT_CALLBACK_NOTIFICATION``)
-# silently falls back to English with no WARNING print, under the
-# assumption "LLM 能理解英文 system prompt, 输出语言由别的机制控".
-# Proactive chat's ``_normalize_prompt_language`` does the same
-# (explicit ``if startswith('es')|'pt': return 'en'``).
+# Upstream delta (2026-06 sync, see docs/UPSTREAM_SYNC_2026-06.md): es/pt
+# became *native* proactive/system languages. ``_normalize_prompt_language``
+# now maps ``es->es`` / ``pt->pt`` (no longer the old ``-> en`` fallback), and
+# both ``SYSTEM_NOTIFICATION_PASSIVE`` and ``PROACTIVE_CHAT_PROMPTS`` ship es/pt
+# keys. The previous version of this check asserted the *opposite* (silent
+# English fallback); the original author flagged that an upstream refactor
+# adding es/pt translations should flip it to "look for the es/pt text" — which
+# is exactly what this rewrite does.
 #
-# This check asserts: when ``persona.language`` = 'es' or 'pt', the
-# instruction actually pushed onto the wire contains the English
-# AGENT_CALLBACK_NOTIFICATION / proactive prompt prefix — *not* the zh
-# or ja default. If a future upstream refactor adds es/pt to the
-# localized strings, this check would FAIL, but that would be a
-# positive signal (new translations are live) rather than a
-# regression, and the check can be updated to look for the es/pt text.
+# This check now asserts: when ``persona.language`` = 'es'/'pt', the
+# instruction on the wire carries the NATIVE header (es: "Aviso del sistema",
+# pt: "Aviso do sistema") and does NOT fall back to the English
+# "[System Notice]" header — proving the testbench dispatches the same native
+# template as production. The native prefixes are derived from
+# ``SYSTEM_NOTIFICATION_PASSIVE`` at runtime so wording tweaks track upstream.
 #
 # We use the mocked ``_invoke_llm_once`` to capture ``last_wire`` and
 # inspect the final tail message's content.
@@ -1269,23 +1301,35 @@ def _set_persona_language(client, language: str) -> None:
     )
 
 
+def _native_passive_prefix(lang_key: str) -> str:
+    """Return the distinctive header token of ``SYSTEM_NOTIFICATION_PASSIVE``
+    for ``lang_key``, derived from the main program at runtime so upstream
+    wording tweaks track automatically.
+
+    e.g. es -> "Aviso del sistema", pt -> "Aviso do sistema", en -> "System Notice".
+    """
+    from config.prompts.prompts_sys import SYSTEM_NOTIFICATION_PASSIVE
+    template = str(SYSTEM_NOTIFICATION_PASSIVE.get(lang_key) or "")
+    # Header shape: "======[<prefix>] Message from {source}======". Pull the
+    # text inside the first bracket pair.
+    start = template.find("[")
+    end = template.find("]", start + 1)
+    if start >= 0 and end > start:
+        return template[start + 1:end].strip()
+    return template.strip()
+
+
 def check_h_persona_language_fallback(client, mock) -> list[str]:
-    """H — persona.language=es/pt → instruction is English (silent fallback)."""
+    """H — persona.language=es/pt → NATIVE template dispatch (no en fallback)."""
     errors: list[str] = []
 
-    # Expected English prefix substring from SYSTEM_NOTIFICATION_PASSIVE['en']
-    # — testbench renders agent_callback via the passive header now (matching
-    # the production drain path). If upstream wording changes, update here too.
-    english_callback_prefix = "System Notice"  # match passive: "[System Notice] Message from ..."
-    # Expected *absent* substrings (other languages' prefixes). We only
-    # sample a couple of non-ASCII giveaway tokens per language so tiny
-    # wording tweaks upstream don't break the test.
-    non_english_tokens = [
-        "系统通知",     # zh
-        "システム通知",  # ja
-        "시스템 알림",   # ko
-        "Системное уведомление",  # ru
-    ]
+    # Native + English passive header tokens, derived from the live main-program
+    # tables so wording tweaks upstream don't break the test.
+    english_callback_prefix = _native_passive_prefix("en")   # "System Notice"
+    native_prefix = {
+        "es": _native_passive_prefix("es"),  # "Aviso del sistema"
+        "pt": _native_passive_prefix("pt"),  # "Aviso do sistema"
+    }
 
     try:
         for lang in ("es", "pt"):
@@ -1294,7 +1338,8 @@ def check_h_persona_language_fallback(client, mock) -> list[str]:
             mock.reset()
             mock.set_reply("Mocked reply")
 
-            # H.agent_callback — agent_callback prefix must be English.
+            # H.agent_callback — header must be the NATIVE es/pt one, not the
+            # English fallback.
             _post_event(
                 client, "agent_callback",
                 {"callbacks": [f"{lang} callback test"]},
@@ -1308,24 +1353,22 @@ def check_h_persona_language_fallback(client, mock) -> list[str]:
             if wire:
                 tail_content = str(wire[-1].get("content") or "")
                 _check(
-                    english_callback_prefix in tail_content,
-                    f"H1.{lang}.callback.english_prefix",
-                    f"expected English prefix; tail_content={tail_content!r}",
+                    native_prefix[lang] in tail_content,
+                    f"H1.{lang}.callback.native_prefix",
+                    f"expected native prefix {native_prefix[lang]!r}; "
+                    f"tail_content={tail_content!r}",
                 )
-                for tok in non_english_tokens:
-                    _check(
-                        tok not in tail_content,
-                        f"H1.{lang}.callback.no_{tok[:6]}",
-                        f"non-English token {tok!r} leaked into es/pt wire",
-                    )
+                _check(
+                    english_callback_prefix not in tail_content,
+                    f"H1.{lang}.callback.no_en_fallback",
+                    f"English fallback prefix {english_callback_prefix!r} "
+                    f"leaked into native {lang} wire: {tail_content!r}",
+                )
             _delete_session(client)
 
-        # H.proactive — proactive prompt dispatch table uses the same
-        # "es/pt → en" rule. We can't inspect the exact prompt text
-        # reliably across upstream edits, but we can assert the same
-        # negative invariant: no non-English markers. A positive English
-        # assertion is harder because proactive prompts don't ship a
-        # single stable English phrase; skip that half.
+        # H.proactive — es/pt now dispatch native proactive templates. We assert
+        # the rendered wire differs from the English render of the same event
+        # (proving no silent en fallback) without depending on exact wording.
         for lang in ("es", "pt"):
             _create_session(client, f"p25_H_{lang}_pc")
             _set_persona_language(client, lang)
@@ -1334,7 +1377,7 @@ def check_h_persona_language_fallback(client, mock) -> list[str]:
 
             status, body = _post_event(
                 client, "proactive",
-                {"kind": "time_passed", "hours_since_last_interaction": 2.0},
+                {"kind": "home"},
             )
             _check(
                 status == 200,
@@ -1347,15 +1390,22 @@ def check_h_persona_language_fallback(client, mock) -> list[str]:
                 f"H2.{lang}.proactive.wire_nonempty",
                 "_invoke_llm_once not called",
             )
-            if wire:
-                tail_content = str(wire[-1].get("content") or "")
-                for tok in non_english_tokens:
-                    _check(
-                        tok not in tail_content,
-                        f"H2.{lang}.proactive.no_{tok[:6]}",
-                        f"non-English token {tok!r} leaked into es/pt "
-                        f"proactive wire",
-                    )
+            tail_native = str((wire[-1].get("content") if wire else "") or "")
+
+            # Render the same proactive event as English and assert the native
+            # es/pt render differs — proving native dispatch, not en fallback.
+            _set_persona_language(client, "en-US")
+            mock.reset()
+            mock.set_reply("Mocked reply")
+            _post_event(client, "proactive", {"kind": "home"})
+            wire_en = mock.last_wire or []
+            tail_en = str((wire_en[-1].get("content") if wire_en else "") or "")
+            _check(
+                bool(tail_native) and tail_native != tail_en,
+                f"H2.{lang}.proactive.native_differs_from_en",
+                f"native {lang} proactive render matched the English render "
+                f"(silent fallback?): {tail_native[:120]!r}",
+            )
             _delete_session(client)
 
     except AssertionFailed as exc:
@@ -1371,14 +1421,14 @@ def check_h_persona_language_fallback(client, mock) -> list[str]:
 
 
 # ─────────────────────────────────────────────────────────────
-# Case I — SimulationResult.reason 复现表 (§A.8 #5 + §4.7)
+# Case I — SimulationResult.reason reproducibility table (§A.8 #5 + §4.7)
 # ─────────────────────────────────────────────────────────────
 #
 # §4.7 defines the closed set of reasons this stack will ever emit.
-# **复现集 (语义契约层)**: invalid_payload / duplicate / busy / llm_error
+# **Reproduced set (semantic-contract layer)**: invalid_payload / duplicate / busy / llm_error
 # (+ proactive_pass / missing_fields for proactive-specific short
 # circuits, documented in §A.8 #5).
-# **不复现集 (运行时机制层, §2.1)**: cooldown / speak_cooldown /
+# **Non-reproduced set (runtime-mechanism layer, §2.1)**: cooldown / speak_cooldown /
 # voice_session_active / no_websocket / session_start_failed /
 # not_text_session.
 #
@@ -1386,7 +1436,7 @@ def check_h_persona_language_fallback(client, mock) -> list[str]:
 # avatar_interaction_simulated / agent_callback_simulated /
 # proactive_simulated entry produced by *earlier* sub-cases (A-G-H)
 # and asserts each ``detail.reason`` is either null/empty (accepted
-# path) or a member of the 复现集. Any 不复现集 value leaking in would
+# path) or a member of the reproduced set. Any non-reproduced-set value leaking in would
 # mean we accidentally started reproducing main program runtime
 # mechanics, which §2.1 forbids.
 
@@ -1401,7 +1451,7 @@ def check_h_persona_language_fallback(client, mock) -> list[str]:
 # a semantic drift would show up here + in the Literal both.
 REASON_REPRODUCED: frozenset[str] = frozenset({
     "dedupe_window_hit",   # avatar: same dedupe_key inside window (§4.7 "duplicate")
-    "invalid_payload",     # avatar: payload failed _normalize_avatar_interaction_payload
+    "invalid_payload",     # avatar: payload failed authoritative contract validation
     "empty_callbacks",     # agent_callback: no callback items
     "pass_signaled",       # proactive: LLM returned [PASS] (§4.7 "proactive_pass")
     "llm_failed",          # wire assembled but LLM call raised (§4.7 "llm_error")
@@ -1432,7 +1482,7 @@ REASON_NOT_REPRODUCED: frozenset[str] = frozenset({
 
 
 def check_i_reason_whitelist(client, mock) -> list[str]:
-    """I — every emitted SimulationResult.reason is in the 复现集."""
+    """I — every emitted SimulationResult.reason is in the reproduced set."""
     errors: list[str] = []
     try:
         _create_session(client, "p25_I_reason")
@@ -1567,7 +1617,7 @@ def main() -> int:
     total += _report("A | three kinds happy path", check_a_happy_paths(client, mock))
     total += _report("B | dedupe matrix (hit / upgrade / reset / info / cap overflow)",
                      check_b_dedupe_matrix(client, mock))
-    total += _report("C | coerce_info surfacing (intensity / kind / language)",
+    total += _report("C | strict avatar rejection + kind/language coerce_info",
                      check_c_coerce(client, mock))
     total += _report("D | mirror_to_recent applied / fallback / [PASS]",
                      check_d_mirror(client, mock))
@@ -1577,8 +1627,8 @@ def main() -> int:
                      check_f_append_invariants(client, mock))
     total += _report("G | diagnostics op records (correct type + detail fields)",
                      check_g_diagnostics(client, mock))
-    total += _report("H | persona.language=es/pt silent English fallback "
-                     "(upstream delta)",
+    total += _report("H | persona.language=es/pt native dispatch "
+                     "(2026-06 upstream delta)",
                      check_h_persona_language_fallback(client, mock))
     total += _report("I | SimulationResult.reason 复现表 "
                      "(§4.7: 语义契约层 only, no runtime 机制)",

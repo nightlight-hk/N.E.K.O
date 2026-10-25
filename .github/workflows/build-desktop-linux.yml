@@ -33,7 +33,7 @@ on:
 
 env:
   PYTHON_VERSION: '3.11'
-  NODE_VERSION: '20'
+  NODE_VERSION: '22'
   # Anonymous embedding profile id (compatibility contract — bumped only when
   # the upstream weights/tokenizer become incompatible with previously-cached
   # vectors). The repo + revision together pin the actual artifacts.
@@ -113,21 +113,25 @@ jobs:
           uv sync --group galgame
           uv pip install --python .venv nuitka ordered-set zstandard
 
+      - name: Prepare filtered built-in plugins for Nuitka
+        shell: bash
+        run: |
+          .venv/bin/python scripts/prepare_nuitka_plugins.py prepare
+
       # --- Generate runtime config files (not tracked in git) ---
       - name: Generate default config files
         shell: bash
         run: |
           python -c "
           import json, os
+          # 本地化角色种子在 config/characters/<locale>.json（已入库的目录，PR #1282），
+          # 不需在此生成；只补 git 不跟踪的运行时文件，让构建有可读的基准配置。
           configs = {
             'config/characters.json': {'主人': {'档案名': '', '性别': '', '昵称': ''}, '猫娘': {}, '当前猫娘': ''},
-            'config/characters.en.json': {'主人': {'档案名': '', '性别': '', '昵称': ''}, '猫娘': {}, '当前猫娘': ''},
-            'config/characters.ja.json': {'主人': {'档案名': '', '性别': '', '昵称': ''}, '猫娘': {}, '当前猫娘': ''},
-            'config/characters.ko.json': {'主人': {'档案名': '', '性别': '', '昵称': ''}, '猫娘': {}, '当前猫娘': ''},
-            'config/characters.ru.json': {'主人': {'档案名': '', '性别': '', '昵称': ''}, '猫娘': {}, '当前猫娘': ''},
-            'config/characters.zh-CN.json': {'主人': {'档案名': '', '性别': '', '昵称': ''}, '猫娘': {}, '当前猫娘': ''},
-            'config/characters.zh-TW.json': {'主人': {'档案名': '', '性别': '', '昵称': ''}, '猫娘': {}, '当前猫娘': ''},
-            'config/core_config.json': {},
+            # coreApi/assistApi = free 是发给新用户的出厂默认（空 {} 会让新装用户
+            # 没有默认服务商）；密钥字段一律不写，保持种子无密钥。
+            # 本 workflow 不复用 build-desktop.yml，两处种子须一起改。
+            'config/core_config.json': {'coreApi': 'free', 'assistApi': 'free'},
             'config/user_preferences.json': [],
           }
           for path, data in configs.items():
@@ -198,6 +202,26 @@ jobs:
             --output-root data/embedding_models \
             --variant both
 
+      - name: Cache voice-turn model weights
+        uses: actions/cache@v4
+        with:
+          path: main_logic/asr_client/endpointing/models/*.onnx
+          key: voice-turn-models-v2-${{ runner.os }}-${{ hashFiles('main_logic/asr_client/endpointing/models/manifest.json') }}
+
+      - name: Prepare verified voice-turn assets
+        shell: bash
+        run: uv run --no-sync python scripts/prepare_voice_turn_assets.py
+
+      - name: Cache CAM++ speaker model weight
+        uses: actions/cache@v4
+        with:
+          path: main_logic/asr_client/speaker_shadow/models/*.onnx
+          key: speaker-shadow-campplus-v1-${{ runner.os }}-${{ hashFiles('main_logic/asr_client/speaker_shadow/models/manifest.json') }}
+
+      - name: Prepare verified CAM++ speaker model
+        shell: bash
+        run: uv run --no-sync python scripts/prepare_speaker_model.py
+
       # --- Warm tiktoken o200k_base cache for offline use (PR #929) ---
       # tiktoken downloads encoding blobs (~1.5 MB each) on first use into
       # TIKTOKEN_CACHE_DIR; without warming, the bundled app would either
@@ -218,7 +242,7 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
 
-      - name: Build all frontend projects
+      - name: Build production frontend projects
         shell: bash
         run: |
           ./build_frontend.sh
@@ -236,14 +260,17 @@ jobs:
           NUITKA_OPTS="$NUITKA_OPTS --include-data-files=config/__init__.py=config/__init__.py"
           NUITKA_OPTS="$NUITKA_OPTS --include-data-files=config/api_providers.json=config/api_providers.json"
           NUITKA_OPTS="$NUITKA_OPTS --include-data-files=config/characters.json=config/characters.json"
-          NUITKA_OPTS="$NUITKA_OPTS --include-data-files=config/characters.en.json=config/characters.en.json"
-          NUITKA_OPTS="$NUITKA_OPTS --include-data-files=config/characters.ja.json=config/characters.ja.json"
-          NUITKA_OPTS="$NUITKA_OPTS --include-data-files=config/characters.ko.json=config/characters.ko.json"
-          NUITKA_OPTS="$NUITKA_OPTS --include-data-files=config/characters.ru.json=config/characters.ru.json"
-          NUITKA_OPTS="$NUITKA_OPTS --include-data-files=config/characters.zh-CN.json=config/characters.zh-CN.json"
-          NUITKA_OPTS="$NUITKA_OPTS --include-data-files=config/characters.zh-TW.json=config/characters.zh-TW.json"
+          # 本地化角色种子在 config/characters/<locale>.json（PR #1282 后），ConfigManager.
+          # _get_localized_characters_source 按 locale 读该目录；打整个目录，别再引用已不存在的
+          # 根级 config/characters.<locale>.json（旧路径，会静默丢失全部本地化种子）。
+          NUITKA_OPTS="$NUITKA_OPTS --include-data-dir=config/characters=config/characters"
           NUITKA_OPTS="$NUITKA_OPTS --include-data-files=config/core_config.json=config/core_config.json"
           NUITKA_OPTS="$NUITKA_OPTS --include-data-files=config/user_preferences.json=config/user_preferences.json"
+          # changelog/.md 与 survey/.json 是纯数据文件，--include-package=config 只编 .py
+          # 不带它们，必须显式 include-data-dir，否则打包后 /api/changelog 与 /api/survey
+          # 读不到内容（survey 是 Steam-only，正是只在打包构建里跑）。
+          NUITKA_OPTS="$NUITKA_OPTS --include-data-dir=config/changelog=config/changelog"
+          NUITKA_OPTS="$NUITKA_OPTS --include-data-dir=config/surveys=config/surveys"
 
           # Data directories
           NUITKA_OPTS="$NUITKA_OPTS --include-data-dir=assets=assets"
@@ -255,9 +282,8 @@ jobs:
           else
             echo "[WARNING] frontend/plugin-manager/dist missing; /ui will be empty in bundle."
           fi
-          if [ -d "plugin/plugins" ]; then
-            NUITKA_OPTS="$NUITKA_OPTS --include-data-dir=plugin/plugins=plugin/plugins"
-          fi
+          # Built-in plugin data is installed from the filtered stage after
+          # compilation. Nuitka intentionally refuses to treat .py as data.
           NUITKA_OPTS="$NUITKA_OPTS --include-data-dir=playwright_browsers=playwright_browsers"
           if [ -d "data/tiktoken_cache" ]; then
             NUITKA_OPTS="$NUITKA_OPTS --include-data-dir=data/tiktoken_cache=data/tiktoken_cache"
@@ -265,9 +291,22 @@ jobs:
           if [ -d "data/embedding_models" ]; then
             NUITKA_OPTS="$NUITKA_OPTS --include-data-dir=data/embedding_models=data/embedding_models"
           fi
+          NUITKA_OPTS="$NUITKA_OPTS --include-data-dir=main_logic/asr_client/endpointing/models=main_logic/asr_client/endpointing/models"
+          NUITKA_OPTS="$NUITKA_OPTS --include-data-dir=main_logic/asr_client/speaker_shadow/models=main_logic/asr_client/speaker_shadow/models"
           NUITKA_OPTS="$NUITKA_OPTS --include-data-dir=static=static"
+          # 应用内 OpenClaw 引导文档 + 图片，由 agent_router 经 /api/agent/openclaw/guide/* 提供；
+          # 是纯数据目录，--include-package 不带，漏了引导页内容/图片打包后 404。
+          NUITKA_OPTS="$NUITKA_OPTS --include-data-dir=docs/zh-CN/guide=docs/zh-CN/guide"
 
           # Packages
+          # PyAV wheel 里部分扩展模块旁带同名的 Cython 纯 Python 模式 .py 源码（含 import cython）；
+          # --include-package 会遍历目录把这些 .py 编进去盖掉 .so/.pyd，冻结后 import 失败。
+          # 改用 --include-module，子模块走正常 import 解析选扩展模块；Nuitka 对"扩展模块 vs 源码"
+          # 的默认值标为未决且版本未锁定，--no-prefer-source-code 把它显式钉住（翻成源码优先会复现同样失败）。
+          # av.video.frame.to_image() 在扩展模块内部 lazy import PIL，Nuitka 看不到，靠其他模块顶层
+          # import PIL 带进包；check_frozen_media 冒烟覆盖这条路径。契约见 tests/unit/test_pyav_packaging_contract.py。
+          NUITKA_OPTS="$NUITKA_OPTS --include-module=av"
+          NUITKA_OPTS="$NUITKA_OPTS --no-prefer-source-code"
           NUITKA_OPTS="$NUITKA_OPTS --include-package=uvicorn"
           NUITKA_OPTS="$NUITKA_OPTS --include-package=fastapi"
           NUITKA_OPTS="$NUITKA_OPTS --include-package=starlette"
@@ -275,11 +314,15 @@ jobs:
           NUITKA_OPTS="$NUITKA_OPTS --include-package=websockets"
           NUITKA_OPTS="$NUITKA_OPTS --include-package=app"
           NUITKA_OPTS="$NUITKA_OPTS --include-package=config"
+          # The generated launcher carries selective --nofollow-import-to
+          # directives derived from each plugin's [tool.neko.build] rules.
           NUITKA_OPTS="$NUITKA_OPTS --include-package=plugin"
           NUITKA_OPTS="$NUITKA_OPTS --include-package=brain"
           NUITKA_OPTS="$NUITKA_OPTS --include-package=main_logic"
           NUITKA_OPTS="$NUITKA_OPTS --include-package=main_routers"
+          NUITKA_OPTS="$NUITKA_OPTS --include-package=services"
           NUITKA_OPTS="$NUITKA_OPTS --include-package=memory"
+          NUITKA_OPTS="$NUITKA_OPTS --include-package=knowledge"
           NUITKA_OPTS="$NUITKA_OPTS --include-package=utils"
           NUITKA_OPTS="$NUITKA_OPTS --include-package=steamworks"
           NUITKA_OPTS="$NUITKA_OPTS --include-package=browser_use"
@@ -308,7 +351,6 @@ jobs:
           NUITKA_OPTS="$NUITKA_OPTS --include-package-data=bilibili_api"
 
           # Exclusions
-          NUITKA_OPTS="$NUITKA_OPTS --nofollow-import-to=plugin.plugins"
           NUITKA_OPTS="$NUITKA_OPTS --nofollow-import-to=audiolab"
           NUITKA_OPTS="$NUITKA_OPTS --nofollow-import-to=pyrnnoise"
           NUITKA_OPTS="$NUITKA_OPTS --nofollow-import-to=matplotlib"
@@ -339,15 +381,17 @@ jobs:
           echo "$NUITKA_OPTS" | tr ' ' '\n'
           echo "======================"
 
-          .venv/bin/python -m nuitka $NUITKA_OPTS launcher.py
+          .venv/bin/python -m nuitka $NUITKA_OPTS build_nuitka_launcher.py
 
       # --- Rename Nuitka output directory ---
       - name: Rename build output
         shell: bash
         run: |
-          if [ -d "dist/launcher.dist" ]; then
-            mv dist/launcher.dist dist/Xiao8
+          if [ -d "dist/build_nuitka_launcher.dist" ]; then
+            mv dist/build_nuitka_launcher.dist dist/Xiao8
           fi
+          .venv/bin/python scripts/prepare_nuitka_plugins.py install \
+            --destination-dir dist/Xiao8/plugin/plugins
           echo "=== Build output ==="
           ls -la dist/Xiao8/ || echo "dist/Xiao8 not found!"
 
@@ -384,6 +428,42 @@ jobs:
             echo "::error::data/tiktoken_cache empty in bundle (o200k_base would re-download at runtime)"
             missing=1
           fi
+          endpointing_assets="dist/Xiao8/main_logic/asr_client/endpointing/models"
+          for rel in manifest.json THIRD_PARTY_NOTICES.md silero_vad.onnx smart_turn_v3.onnx; do
+            if [ ! -s "$endpointing_assets/$rel" ]; then
+              echo "::error::missing or empty bundled endpointing asset: $rel"
+              missing=1
+            fi
+          done
+          if [ -e "dist/Xiao8/data/vad_models" ]; then
+            echo "::error::obsolete data/vad_models must not be packaged"
+            missing=1
+          fi
+          endpointing_weight_count="$(find dist/Xiao8 -type f \( -name silero_vad.onnx -o -name smart_turn_v3.onnx \) | wc -l | tr -d ' ')"
+          if [ "$endpointing_weight_count" -ne 2 ]; then
+            echo "::error::endpointing weights must be packaged exactly once"
+            missing=1
+          fi
+          uv run --no-sync python scripts/prepare_voice_turn_assets.py \
+            --asset-dir "$endpointing_assets" --offline || missing=1
+          speaker_shadow_assets="dist/Xiao8/main_logic/asr_client/speaker_shadow/models"
+          for rel in manifest.json THIRD_PARTY_NOTICES.md campplus-zh-en-advanced.onnx; do
+            if [ ! -s "$speaker_shadow_assets/$rel" ]; then
+              echo "::error::missing or empty bundled CAM++ asset: $rel"
+              missing=1
+            fi
+          done
+          if [ -e "dist/Xiao8/data/speaker_models" ]; then
+            echo "::error::obsolete data/speaker_models must not be packaged"
+            missing=1
+          fi
+          speaker_weight_count="$(find dist/Xiao8 -type f -name campplus-zh-en-advanced.onnx | wc -l | tr -d ' ')"
+          if [ "$speaker_weight_count" -ne 1 ]; then
+            echo "::error::CAM++ weight must be packaged exactly once"
+            missing=1
+          fi
+          uv run --no-sync python scripts/prepare_speaker_model.py \
+            --asset-dir "$speaker_shadow_assets" --offline || missing=1
           [ "$missing" -eq 0 ]
 
       # --- Generic dist invariant check ---
@@ -395,7 +475,17 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          .venv/bin/python scripts/check_nuitka_dist.py dist/Xiao8
+          .venv/bin/python scripts/check_nuitka_dist.py dist/Xiao8 --plugin-stage build/nuitka-plugins
+          .venv/bin/python scripts/check_frozen_media.py dist/Xiao8
+
+      # 与 build-desktop.yml 的同名步骤对偶（#2898）。这个 workflow 只有 linux x64
+      # 一条腿，期望架构写死即可。
+      - name: Verify dist CPU architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          .venv/bin/python scripts/check_dist_arch.py dist/Xiao8 \
+            --expect-arch x64 --expect-platform linux
 
       - name: Upload Python backend artifact
         uses: actions/upload-artifact@v4

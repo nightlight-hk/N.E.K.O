@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import copy
+import hashlib
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,9 +11,13 @@ from types import SimpleNamespace
 import pytest
 from fastapi import HTTPException
 
+from plugin._types.exceptions import PluginLifecycleError
 from plugin.core import registry as registry_module
 from plugin.server.application.plugins import query_service as query_module
 from plugin.server.application.plugins import lifecycle_service as module
+from plugin.server.application.plugins.metadata_scanner import IsolatedPluginMetadata
+from plugin.server.application.plugins import operation_lock as operation_lock_module
+import plugin.server.application.plugins.installation_transactions.uninstall as uninstall_module
 from plugin.server.domain.errors import ServerDomainError
 from plugin.server.infrastructure import runtime_overrides as runtime_overrides_module
 from plugin.sdk.plugin.decorators import plugin_entry
@@ -22,29 +29,20 @@ class _FakeProcessHost:
         plugin_id: str,
         entry_point: str,
         config_path: Path,
-        extension_configs: list | None = None,
     ) -> None:
         self.plugin_id = plugin_id
         self.entry_point = entry_point
         self.config_path = config_path
-        self.extension_configs = extension_configs
         self.process = SimpleNamespace(is_alive=lambda: True, exitcode=None)
         self.started = False
         self.stopped = False
 
-    async def start(self, message_target_queue: object) -> None:
+    async def start(self, message_target_queue: object, startup_timeout: float | None = None) -> None:
+        self.startup_timeout = startup_timeout
         self.started = True
 
     async def shutdown(self, timeout: float = module.PLUGIN_SHUTDOWN_TIMEOUT) -> None:
         self.stopped = True
-
-    async def send_extension_command(
-        self,
-        msg_type: str,
-        payload: dict[str, object],
-        timeout: float = 10.0,
-    ) -> object:
-        return {"ok": True, "type": msg_type, "payload": payload, "timeout": timeout}
 
     def is_alive(self) -> bool:
         return True
@@ -56,9 +54,29 @@ class _FakeAdapterPlugin:
         return {"servers": []}
 
 
+def _metadata_scan_for(plugin_cls: type):
+    def _scan(**kwargs: object) -> IsolatedPluginMetadata:
+        plugin_id = str(kwargs["plugin_id"])
+        conf = kwargs.get("conf")
+        pdata = kwargs.get("pdata")
+        return IsolatedPluginMetadata(
+            entries_preview=registry_module._extract_entries_preview(
+                plugin_id,
+                plugin_cls,
+                conf if isinstance(conf, dict) else {},
+                pdata if isinstance(pdata, dict) else {},
+            ),
+            handlers={},
+            entry_methods={},
+        )
+
+    return _scan
+
+
 class _CaptureLogger:
     def __init__(self) -> None:
         self.messages: list[str] = []
+        self.errors: list[str] = []
 
     def info(self, *_args, **_kwargs) -> None:
         return
@@ -72,8 +90,171 @@ class _CaptureLogger:
             rendered = rendered.replace("{}", str(arg), 1)
         self.messages.append(rendered)
 
-    def error(self, *_args, **_kwargs) -> None:
-        return
+    def error(self, message, *args, **_kwargs) -> None:
+        rendered = str(message)
+        for arg in args:
+            rendered = rendered.replace("{}", str(arg), 1)
+        self.errors.append(rendered)
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["start", "stop"])
+async def test_runtime_mutations_wait_for_plugin_operation_lock(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    operation: str,
+) -> None:
+    plugin_id = "serialized_plugin"
+    host = _FakeProcessHost(
+        plugin_id=plugin_id,
+        entry_point="tests.fake:Plugin",
+        config_path=tmp_path / plugin_id / "plugin.toml",
+    )
+    hosts_backup = dict(module.state.plugin_hosts)
+    second_acquire_attempted = asyncio.Event()
+    original_acquire = operation_lock_module._PROCESS_LOCK.acquire
+    acquire_calls = 0
+
+    async def _tracked_acquire(deadline: float | None = None) -> None:
+        nonlocal acquire_calls
+        acquire_calls += 1
+        if acquire_calls == 2:
+            second_acquire_attempted.set()
+        # Forward the deadline unchanged; do not swallow it in the stub.
+        await original_acquire(deadline)
+
+    async def _clear_tools(_plugin_id: str) -> None:
+        return None
+
+    monkeypatch.setattr(
+        operation_lock_module._PROCESS_LOCK,
+        "acquire",
+        _tracked_acquire,
+    )
+    monkeypatch.setattr(module, "clear_plugin_llm_tools", _clear_tools)
+
+    try:
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+            module.state.plugin_hosts[plugin_id] = host
+
+        service = module.PluginLifecycleService()
+        async with operation_lock_module.plugin_operation_lock.hold():
+            if operation == "start":
+                task = asyncio.create_task(
+                    service.start_plugin(plugin_id, refresh_registry=False)
+                )
+            else:
+                task = asyncio.create_task(service.stop_plugin(plugin_id))
+            await asyncio.wait_for(second_acquire_attempted.wait(), timeout=5)
+            assert task.done() is False
+
+        response = await asyncio.wait_for(task, timeout=5)
+        assert response["success"] is True
+    finally:
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+            module.state.plugin_hosts.update(hosts_backup)
+
+
+class _FakeInstallSourceManager:
+    def __init__(
+        self,
+        *,
+        package_id: str,
+        profile_dir: str = "",
+        profile_installed: bool | None = None,
+        channel: str = "imported",
+        root_id: str = "user",
+        plugin_id: str | None = None,
+        active_package_ids: tuple[str, ...] = (),
+        active_profile_dirs: tuple[str, ...] = (),
+        active_root_ids: tuple[str, ...] = (),
+        active_directory_names: tuple[str, ...] = (),
+        active_channels: tuple[str, ...] = (),
+        list_entries_error: Exception | None = None,
+    ) -> None:
+        self.package_id = package_id
+        self.profile_dir = profile_dir
+        self.profile_installed = profile_installed
+        self.channel = channel
+        self.root_id = root_id
+        self.plugin_id = plugin_id
+        self.active_package_ids = active_package_ids
+        self.active_profile_dirs = active_profile_dirs
+        self.active_root_ids = active_root_ids
+        self.active_directory_names = active_directory_names
+        self.active_channels = active_channels
+        self.list_entries_error = list_entries_error
+        self.marked_removed: list[Path] = []
+        self.restored_entries: list[object] = []
+        self.is_degraded = False
+
+    def package_id_for_directory(
+        self,
+        _directory_path: Path,
+        *,
+        include_removed: bool = False,
+    ) -> str:
+        del include_removed
+        return self.package_id
+
+    def mark_removed(self, *, directory_path: Path) -> None:
+        self.marked_removed.append(directory_path)
+
+    def restore_entry_for_rollback(self, entry: object) -> None:
+        self.restored_entries.append(entry)
+
+    def entry_for_directory(
+        self,
+        directory_path: Path,
+        *,
+        include_removed: bool = False,
+    ) -> SimpleNamespace:
+        del include_removed
+        return SimpleNamespace(
+            package_id=self.package_id,
+            plugin_id=self.plugin_id or directory_path.name,
+            profile_dir=self.profile_dir,
+            profile_installed=self.profile_installed,
+            channel=self.channel,
+            root_id=self.root_id,
+            directory_name=directory_path.name,
+            removed=False,
+        )
+
+    def profile_dir_for_directory(
+        self,
+        _directory_path: Path,
+        *,
+        include_removed: bool = False,
+    ) -> str:
+        del include_removed
+        return self.profile_dir
+
+    def list_entries(self) -> list[SimpleNamespace]:
+        if self.list_entries_error is not None:
+            raise self.list_entries_error
+        return [
+            SimpleNamespace(
+                package_id=package_id,
+                profile_dir=(self.active_profile_dirs[index] if index < len(self.active_profile_dirs) else ""),
+                profile_installed=None,
+                channel=(
+                    self.active_channels[index]
+                    if index < len(self.active_channels)
+                    else "imported"
+                ),
+                root_id=(self.active_root_ids[index] if index < len(self.active_root_ids) else "user"),
+                directory_name=(
+                    self.active_directory_names[index]
+                    if index < len(self.active_directory_names)
+                    else f"other_{index}"
+                ),
+            )
+            for index, package_id in enumerate(self.active_package_ids)
+        ]
 
 
 @pytest.mark.plugin_unit
@@ -110,6 +291,49 @@ def test_get_plugin_config_path_returns_none_for_missing_file(monkeypatch: pytes
     monkeypatch.setattr(module, "PLUGIN_CONFIG_ROOTS", (root,))
 
     assert module._get_plugin_config_path("demo") is None
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
+async def test_start_plugin_already_running_reports_preference_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "running_plugin" / "plugin.toml"
+    host = _FakeProcessHost(
+        plugin_id="running_plugin",
+        entry_point="tests.fake:Plugin",
+        config_path=config_path,
+    )
+    hosts_backup = dict(module.state.plugin_hosts)
+
+    monkeypatch.setattr(
+        module,
+        "set_runtime_override",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            runtime_overrides_module.RuntimeOverrideWriteError("disk full")
+        ),
+    )
+
+    try:
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+            module.state.plugin_hosts["running_plugin"] = host
+
+        with pytest.raises(ServerDomainError) as exc_info:
+            await module.PluginLifecycleService().start_plugin(
+                "running_plugin",
+                persist_user_intent=True,
+            )
+
+        assert exc_info.value.code == "PLUGIN_RUNTIME_PREFERENCE_PERSIST_FAILED"
+        assert exc_info.value.details["runtime_state_changed"] is False
+        with module.state.acquire_plugin_hosts_read_lock():
+            assert module.state.plugin_hosts["running_plugin"] is host
+    finally:
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+            module.state.plugin_hosts.update(hosts_backup)
 
 
 @pytest.mark.plugin_unit
@@ -156,6 +380,30 @@ def test_parse_single_plugin_config_warns_on_directory_id_mismatch(
 
     assert parsed is not None
     assert any("directory name" in message and "does not match declared plugin.id" in message for message in messages)
+
+
+@pytest.mark.plugin_unit
+def test_parse_single_plugin_config_rejects_removed_script_type(tmp_path: Path) -> None:
+    plugin_dir = tmp_path / "legacy_script"
+    plugin_dir.mkdir(parents=True)
+    config_path = plugin_dir / "plugin.toml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "[plugin]",
+                "id = 'legacy_script'",
+                "type = 'script'",
+                "entry = 'plugin.plugins.legacy_script:Plugin'",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    logger = _CaptureLogger()
+
+    parsed = registry_module._parse_single_plugin_config(config_path, set(), logger)
+
+    assert parsed is None
+    assert any("unsupported type='script'" in message for message in logger.errors)
 
 
 @pytest.mark.plugin_unit
@@ -214,6 +462,22 @@ def test_parse_single_plugin_config_warns_on_noncanonical_fields(
 
 
 @pytest.mark.plugin_unit
+def test_normalize_startup_failure_policy_defaults_none_to_warn() -> None:
+    assert module._normalize_startup_failure_policy(None, plugin_id="demo") == "warn"
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.parametrize("raw_value", ["", False, 0])
+def test_normalize_startup_failure_policy_rejects_falsy_non_default_values(raw_value: object) -> None:
+    with pytest.raises(ServerDomainError) as exc_info:
+        module._normalize_startup_failure_policy(raw_value, plugin_id="demo")
+
+    assert exc_info.value.code == "INVALID_PLUGIN_CONFIG"
+    assert exc_info.value.details["error_type"] == "InvalidStartupFailurePolicy"
+    assert "startup_failure" in exc_info.value.message
+
+
+@pytest.mark.plugin_unit
 @pytest.mark.asyncio
 async def test_start_plugin_refreshes_registry_before_loading(
     monkeypatch: pytest.MonkeyPatch,
@@ -243,6 +507,14 @@ async def test_start_plugin_refreshes_registry_before_loading(
     handlers_backup = dict(module.state.event_handlers)
     cache_backup = copy.deepcopy(module.state._snapshot_cache)
     refresh_calls: list[str] = []
+    loop_thread = threading.current_thread()
+    capability_threads: dict[str, threading.Thread] = {}
+    for capability_name in ("create_plugin_host", "scan_plugin_metadata_isolated", "install_isolated_plugin_metadata"):
+        original = getattr(module, capability_name)
+        def track(*args, _name=capability_name, _original=original, **kwargs):
+            capability_threads[_name] = threading.current_thread()
+            return _original(*args, **kwargs)
+        monkeypatch.setattr(module, capability_name, track)
 
     try:
         with module.state.acquire_plugins_write_lock():
@@ -267,8 +539,15 @@ async def test_start_plugin_refreshes_registry_before_loading(
             },
         )
         monkeypatch.setattr(module, "_resolve_plugin_id_conflict", lambda *args, **kwargs: args[0])
-        monkeypatch.setattr(module, "PluginProcessHost", _FakeProcessHost)
-        monkeypatch.setattr(module, "_import_plugin_module", lambda *args, **kwargs: SimpleNamespace(FakeAdapterPlugin=_FakeAdapterPlugin))
+        def host_factory(**kwargs):
+            capability_threads["create_plugin_host"] = threading.current_thread()
+            return _FakeProcessHost(**kwargs)
+        scan = _metadata_scan_for(_FakeAdapterPlugin)
+        def metadata_scan(**kwargs):
+            capability_threads["scan_plugin_metadata_isolated"] = threading.current_thread()
+            return scan(**kwargs)
+        monkeypatch.setattr(module, "create_plugin_host", host_factory)
+        monkeypatch.setattr(module, "scan_plugin_metadata_isolated", metadata_scan)
         monkeypatch.setattr(module, "emit_lifecycle_event", lambda event: None)
 
         service = module.PluginLifecycleService()
@@ -276,6 +555,10 @@ async def test_start_plugin_refreshes_registry_before_loading(
 
         assert response["success"] is True
         assert refresh_calls == ["refresh_adapter"]
+        assert set(capability_threads) == {
+            "create_plugin_host", "scan_plugin_metadata_isolated", "install_isolated_plugin_metadata"
+        }
+        assert all(thread is not loop_thread for thread in capability_threads.values())
     finally:
         with module.state.acquire_plugins_write_lock():
             module.state.plugins.clear()
@@ -288,6 +571,605 @@ async def test_start_plugin_refreshes_registry_before_loading(
             module.state.event_handlers.update(handlers_backup)
         with module.state._snapshot_cache_lock:
             module.state._snapshot_cache = cache_backup
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize("start_fails", [False, True])
+async def test_delete_user_override_restores_running_builtin_and_preserves_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    start_fails: bool,
+) -> None:
+    exec_root = tmp_path / "exec" / "plugins"
+    user_dir = exec_root / "study_companion"
+    user_config = user_dir / "plugin.toml"
+    user_dir.mkdir(parents=True)
+    user_config.write_text("[plugin]\nid='study_companion'\n", encoding="utf-8")
+    builtin_config = tmp_path / "builtin" / "study_companion" / "plugin.toml"
+    builtin_config.parent.mkdir(parents=True)
+    builtin_config.write_text("[plugin]\nid='study_companion'\n", encoding="utf-8")
+    state_dir = tmp_path / "state" / "plugins" / "study_companion" / "data"
+    state_files = {
+        state_dir / "study.db": b"persistent-db",
+        state_dir / "study.db-wal": b"persistent-wal",
+        state_dir / "study.db-shm": b"persistent-shm",
+    }
+    for path, content in state_files.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+    hashes_before = {
+        path: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in state_files
+    }
+
+    plugins_backup = copy.deepcopy(module.state.plugins)
+    hosts_backup = dict(module.state.plugin_hosts)
+    cache_backup = copy.deepcopy(module.state._snapshot_cache)
+    start_calls: list[str] = []
+    try:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins["study_companion"] = {
+                "id": "study_companion",
+                "config_path": str(user_config),
+                "effective_source": "user",
+            }
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+            module.state.plugin_hosts["study_companion"] = object()
+
+        async def stop_plugin(self, plugin_id: str, **_kwargs: object) -> dict[str, object]:
+            with module.state.acquire_plugin_hosts_write_lock():
+                module.state.plugin_hosts.pop(plugin_id, None)
+            return {"success": True}
+
+        async def start_plugin(self, plugin_id: str, **_kwargs: object) -> dict[str, object]:
+            start_calls.append(plugin_id)
+            if start_fails:
+                raise ServerDomainError(
+                    code="PLUGIN_START_FAILED",
+                    message="builtin start failed",
+                    status_code=500,
+                )
+            return {"success": True}
+
+        async def refresh_registry() -> dict[str, object]:
+            with module.state.acquire_plugins_write_lock():
+                module.state.plugins["study_companion"] = {
+                    "id": "study_companion",
+                    "config_path": str(builtin_config),
+                    "effective_source": "builtin",
+                }
+            return {"success": True}
+
+        monkeypatch.setattr(
+            uninstall_module, "get_user_plugin_exec_root", lambda: exec_root
+        )
+        monkeypatch.setattr(
+            uninstall_module,
+            "get_plugin_state_root",
+            lambda: tmp_path / "state" / "plugins",
+        )
+        monkeypatch.setattr(
+            uninstall_module,
+            "PLUGIN_CONFIG_ROOTS",
+            (exec_root, builtin_config.parent.parent),
+        )
+        monkeypatch.setattr(module.PluginLifecycleService, "stop_plugin", stop_plugin)
+        monkeypatch.setattr(module.PluginLifecycleService, "start_plugin", start_plugin)
+        monkeypatch.setattr(
+            uninstall_module.plugin_registry_service,
+            "refresh_registry",
+            refresh_registry,
+        )
+        install_source_manager = _FakeInstallSourceManager(package_id="")
+        monkeypatch.setattr(
+            uninstall_module, "get_install_source_manager", lambda: install_source_manager
+        )
+        monkeypatch.setattr(module, "emit_lifecycle_event", lambda _event: None)
+
+        response = await module.PluginLifecycleService().delete_plugin("study_companion")
+
+        assert response["success"] is True
+        assert response["restored_builtin"] is True
+        assert response["restored_builtin_started"] is not start_fails
+        assert response["preference_action"] == "preserved"
+        assert response["filesystem_rollback"] == "not_needed"
+        assert response["cleanup_pending"] is False
+        restart_error = response["restored_builtin_restart_error"]
+        if start_fails:
+            assert restart_error == {
+                "code": "PLUGIN_BUILTIN_RESTORE_START_FAILED",
+                "message": "builtin start failed",
+                "error_type": "ServerDomainError",
+            }
+        else:
+            assert restart_error is None
+        assert start_calls == ["study_companion"]
+        assert user_dir.exists() is False
+        assert builtin_config.is_file()
+        assert {
+            path: hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in state_files
+        } == hashes_before
+    finally:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins.update(plugins_backup)
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+            module.state.plugin_hosts.update(hosts_backup)
+        with module.state._snapshot_cache_lock:
+            module.state._snapshot_cache = cache_backup
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
+async def test_delete_user_override_preserves_disabled_preference_for_restored_builtin(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    _isolate_runtime_overrides: dict,
+) -> None:
+    exec_root = tmp_path / "exec"
+    user_dir = exec_root / "study_companion"
+    user_config = user_dir / "plugin.toml"
+    user_dir.mkdir(parents=True)
+    user_config.write_text("[plugin]\nid='study_companion'\n", encoding="utf-8")
+    builtin_config = tmp_path / "builtin" / "study_companion" / "plugin.toml"
+    builtin_config.parent.mkdir(parents=True)
+    builtin_config.write_text("[plugin]\nid='study_companion'\n", encoding="utf-8")
+    plugins_backup = copy.deepcopy(module.state.plugins)
+    hosts_backup = dict(module.state.plugin_hosts)
+    try:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins["study_companion"] = {
+                "config_path": str(user_config),
+                "effective_source": "user",
+            }
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+        runtime_overrides_module.set_runtime_override(
+            "study_companion",
+            False,
+            auto_start=False,
+        )
+
+        async def refresh_registry() -> dict[str, object]:
+            with module.state.acquire_plugins_write_lock():
+                module.state.plugins["study_companion"] = {
+                    "config_path": str(builtin_config),
+                    "effective_source": "builtin",
+                    "runtime_enabled": False,
+                    "runtime_auto_start": False,
+                }
+            return {"success": True}
+
+        monkeypatch.setattr(
+            uninstall_module, "get_user_plugin_exec_root", lambda: exec_root
+        )
+        monkeypatch.setattr(
+            uninstall_module, "get_plugin_state_root", lambda: tmp_path / "state"
+        )
+        monkeypatch.setattr(
+            uninstall_module,
+            "PLUGIN_CONFIG_ROOTS",
+            (exec_root, builtin_config.parent.parent),
+        )
+        monkeypatch.setattr(
+            uninstall_module.plugin_registry_service,
+            "refresh_registry",
+            refresh_registry,
+        )
+        install_source_manager = _FakeInstallSourceManager(package_id="")
+        monkeypatch.setattr(
+            uninstall_module, "get_install_source_manager", lambda: install_source_manager
+        )
+        monkeypatch.setattr(module, "emit_lifecycle_event", lambda _event: None)
+
+        response = await module.PluginLifecycleService().delete_plugin("study_companion")
+
+        assert response["restored_builtin"] is True
+        assert response["restored_builtin_started"] is False
+        assert response["preference_action"] == "preserved"
+        assert _isolate_runtime_overrides == {
+            "study_companion": {"enabled": False, "auto_start": False},
+        }
+    finally:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins.update(plugins_backup)
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+            module.state.plugin_hosts.update(hosts_backup)
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
+async def test_delete_manual_plugin_fails_before_runtime_or_filesystem_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    plugin_dir = tmp_path / "manual_plugin"
+    plugin_dir.mkdir()
+    (plugin_dir / "plugin.toml").write_text(
+        "[plugin]\nid='manual_plugin'\nentry='tests.fake:Plugin'\n",
+        encoding="utf-8",
+    )
+    manager = _FakeInstallSourceManager(package_id="", channel="manual")
+    runtime_checks: list[str] = []
+
+    monkeypatch.setattr(
+        module,
+        "_get_plugin_meta_sync",
+        lambda _plugin_id: {"id": "manual_plugin"},
+    )
+    monkeypatch.setattr(
+        module,
+        "_resolve_plugin_config_path_sync",
+        lambda _plugin_id, _meta: plugin_dir / "plugin.toml",
+    )
+    monkeypatch.setattr(uninstall_module, "get_install_source_manager", lambda: manager)
+    monkeypatch.setattr(
+        module,
+        "_plugin_is_running_sync",
+        lambda plugin_id: runtime_checks.append(plugin_id) or True,
+    )
+
+    with pytest.raises(ServerDomainError) as captured:
+        await module.PluginLifecycleService().delete_plugin("manual_plugin")
+
+    assert captured.value.code == "PLUGIN_MANUAL_NOT_MANAGED"
+    assert captured.value.status_code == 409
+    assert captured.value.details["plugin_id"] == "manual_plugin"
+    assert captured.value.details["stage"] == "ownership"
+    assert runtime_checks == []
+    assert manager.marked_removed == []
+    assert plugin_dir.is_dir()
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
+async def test_delete_reloads_install_source_before_ownership_gate(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    plugin_dir = tmp_path / "managed_plugin"
+    plugin_dir.mkdir()
+    config_path = plugin_dir / "plugin.toml"
+    config_path.write_text(
+        "[plugin]\nid='managed_plugin'\nentry='tests.fake:Plugin'\n",
+        encoding="utf-8",
+    )
+    manager = _FakeInstallSourceManager(package_id="", channel="imported")
+    load_calls = 0
+
+    def reload_stale_snapshot() -> None:
+        nonlocal load_calls
+        load_calls += 1
+        manager.channel = "manual"
+
+    manager.load = reload_stale_snapshot  # type: ignore[attr-defined]
+    runtime_checks: list[str] = []
+
+    monkeypatch.setattr(
+        module,
+        "_get_plugin_meta_sync",
+        lambda _plugin_id: {"id": "managed_plugin"},
+    )
+    monkeypatch.setattr(
+        module,
+        "_resolve_plugin_config_path_sync",
+        lambda _plugin_id, _meta: config_path,
+    )
+    monkeypatch.setattr(uninstall_module, "get_install_source_manager", lambda: manager)
+    monkeypatch.setattr(
+        module,
+        "_plugin_is_running_sync",
+        lambda plugin_id: runtime_checks.append(plugin_id) or False,
+    )
+
+    with pytest.raises(ServerDomainError) as captured:
+        await module.PluginLifecycleService().delete_plugin("managed_plugin")
+
+    assert captured.value.code == "PLUGIN_MANUAL_NOT_MANAGED"
+    assert load_calls == 1
+    assert runtime_checks == []
+    assert plugin_dir.is_dir()
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize("channel", ["imported", "market"])
+async def test_delete_runtime_alias_uses_declared_id_for_managed_ownership(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    channel: str,
+) -> None:
+    root = tmp_path / "plugins"
+    plugin_dir = root / "demo_1"
+    config_path = plugin_dir / "plugin.toml"
+    plugin_dir.mkdir(parents=True)
+    config_path.write_text(
+        "[plugin]\nid='demo'\nentry='tests.fake:Plugin'\n",
+        encoding="utf-8",
+    )
+    manager = _FakeInstallSourceManager(
+        package_id="",
+        channel=channel,
+        plugin_id="demo",
+    )
+    plugins_backup = copy.deepcopy(module.state.plugins)
+    hosts_backup = dict(module.state.plugin_hosts)
+    handlers_backup = dict(module.state.event_handlers)
+    cache_backup = copy.deepcopy(module.state._snapshot_cache)
+
+    try:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins["demo_1"] = {
+                "id": "demo_1",
+                "config_path": str(config_path),
+                "effective_source": "user",
+            }
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+        with module.state.acquire_event_handlers_write_lock():
+            module.state.event_handlers.clear()
+
+        async def _refresh_registry() -> dict[str, object]:
+            return {"success": True}
+
+        monkeypatch.setattr(uninstall_module, "PLUGIN_CONFIG_ROOTS", (root,))
+        monkeypatch.setattr(uninstall_module, "get_install_source_manager", lambda: manager)
+        monkeypatch.setattr(
+            uninstall_module.plugin_registry_service,
+            "refresh_registry",
+            _refresh_registry,
+        )
+        monkeypatch.setattr(module, "emit_lifecycle_event", lambda _event: None)
+
+        response = await module.PluginLifecycleService().delete_plugin("demo_1")
+
+        assert response["success"] is True
+        assert response["plugin_id"] == "demo_1"
+        assert response["deleted_from_disk"] is True
+        assert response["preference_action"] == "cleared"
+        assert plugin_dir.exists() is False
+        assert manager.marked_removed == [plugin_dir]
+    finally:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins.update(plugins_backup)
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+            module.state.plugin_hosts.update(hosts_backup)
+        with module.state.acquire_event_handlers_write_lock():
+            module.state.event_handlers.clear()
+            module.state.event_handlers.update(handlers_backup)
+        with module.state._snapshot_cache_lock:
+            module.state._snapshot_cache = cache_backup
+
+
+@pytest.mark.plugin_unit
+def test_delete_path_guard_rejects_builtin_and_state_roots(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    exec_root = tmp_path / "exec"
+    builtin_root = tmp_path / "builtin"
+    state_root = tmp_path / "plugins"
+    monkeypatch.setattr(uninstall_module, "get_user_plugin_exec_root", lambda: exec_root)
+    monkeypatch.setattr(uninstall_module, "get_plugin_state_root", lambda: state_root)
+    monkeypatch.setattr(uninstall_module, "BUILTIN_PLUGIN_CONFIG_ROOT", builtin_root)
+    monkeypatch.setattr(
+        uninstall_module, "PLUGIN_CONFIG_ROOTS", (exec_root, builtin_root)
+    )
+
+    assert uninstall_module._path_within_plugin_roots_sync(exec_root / "demo") is True
+    assert uninstall_module._path_within_plugin_roots_sync(builtin_root / "demo") is False
+    assert uninstall_module._path_within_plugin_roots_sync(state_root / "demo") is False
+
+    monkeypatch.setattr(uninstall_module, "get_user_plugin_exec_root", lambda: state_root)
+    monkeypatch.setattr(
+        uninstall_module, "PLUGIN_CONFIG_ROOTS", (state_root, builtin_root)
+    )
+    assert uninstall_module._path_within_plugin_roots_sync(state_root / "demo") is False
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("persist_fails", "refreshed_plugin_id", "resolved_plugin_id"),
+    [
+        (False, "demo_plugin", "demo_plugin"),
+        (True, "demo_plugin", "demo_plugin"),
+        (False, "refreshed_plugin", "resolved_plugin"),
+    ],
+    ids=("success", "persistence-failure", "multi-stage-id-resolution"),
+)
+async def test_start_plugin_persists_intent_after_success_and_migrates_resolved_ids(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    _isolate_runtime_overrides: dict,
+    persist_fails: bool,
+    refreshed_plugin_id: str,
+    resolved_plugin_id: str,
+) -> None:
+    config_path = tmp_path / "demo_plugin" / "plugin.toml"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(
+        "\n".join(
+            [
+                "[plugin]",
+                "id = 'demo_plugin'",
+                "name = 'Demo Plugin'",
+                "entry = 'tests.fake:Plugin'",
+                "",
+                "[plugin_runtime]",
+                "enabled = true",
+                "auto_start = false",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    seen: dict[str, object] = {}
+
+    async def _refresh_plugin(plugin_id: str) -> dict[str, object]:
+        seen["override_at_refresh"] = runtime_overrides_module.get_runtime_override(plugin_id)
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins[refreshed_plugin_id] = {
+                "id": refreshed_plugin_id,
+                "runtime_enabled": True,
+                "runtime_auto_start": True,
+            }
+        return {"success": True, "plugin_id": refreshed_plugin_id}
+
+    # This test covers the legacy opt-in where manual start also persists
+    # auto_start; the default-off behaviour is covered separately.
+    monkeypatch.setattr(module, "PLUGIN_SYNC_AUTO_START_ON_TOGGLE", True)
+    monkeypatch.setattr(module.plugin_registry_service, "refresh_plugin", _refresh_plugin)
+    monkeypatch.setattr(module, "_get_plugin_config_path", lambda _plugin_id: config_path)
+    monkeypatch.setattr(
+        module,
+        "resolve_plugin_config_from_path",
+        lambda *args, **kwargs: {
+            "effective_config": kwargs["base_config"],
+            "warnings": [],
+        },
+    )
+    monkeypatch.setattr(module, "_resolve_plugin_id_conflict", lambda *args, **kwargs: resolved_plugin_id)
+    monkeypatch.setattr(module, "_find_missing_python_requirements", lambda *args, **kwargs: [])
+    monkeypatch.setattr(module, "create_plugin_host", _FakeProcessHost)
+    monkeypatch.setattr(module, "scan_plugin_metadata_isolated", _metadata_scan_for(type("Plugin", (), {})))
+    monkeypatch.setattr(module, "emit_lifecycle_event", lambda event: None)
+
+    plugins_backup = copy.deepcopy(module.state.plugins)
+    hosts_backup = dict(module.state.plugin_hosts)
+    cache_backup = copy.deepcopy(module.state._snapshot_cache)
+
+    try:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+
+        runtime_overrides_module.set_runtime_override("demo_plugin", False)
+        if refreshed_plugin_id != "demo_plugin":
+            runtime_overrides_module.set_runtime_override(
+                refreshed_plugin_id,
+                False,
+                auto_start=False,
+            )
+
+        if persist_fails:
+            def _fail_persist(*_args, **_kwargs) -> None:
+                raise ServerDomainError(
+                    code="PLUGIN_RUNTIME_PREFERENCE_PERSIST_FAILED",
+                    message="PLUGIN_RUNTIME_PREFERENCE_PERSIST_FAILED",
+                    status_code=500,
+                    details={
+                        "error_type": "RuntimeOverrideWriteError",
+                        "runtime_state_changed": True,
+                    },
+                )
+
+            monkeypatch.setattr(module, "_persist_user_runtime_intent", _fail_persist)
+
+        response = await module.PluginLifecycleService().start_plugin("demo_plugin", persist_user_intent=True)
+
+        assert response["success"] is True
+        assert seen["override_at_refresh"] is False
+        if persist_fails:
+            assert _isolate_runtime_overrides == {"demo_plugin": False}
+            assert response["partial_success"] is True
+            assert response["preference_persisted"] is False
+            assert response["runtime_state_changed"] is True
+        else:
+            assert _isolate_runtime_overrides == {
+                resolved_plugin_id: {"enabled": True, "auto_start": True},
+            }
+            assert response["preference_persisted"] is True
+        assert response["plugin_id"] == resolved_plugin_id
+        if resolved_plugin_id == "demo_plugin":
+            with module.state.acquire_plugins_read_lock():
+                assert module.state.plugins["demo_plugin"]["runtime_auto_start"] is True
+    finally:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins.update(plugins_backup)
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+            module.state.plugin_hosts.update(hosts_backup)
+        with module.state._snapshot_cache_lock:
+            module.state._snapshot_cache = cache_backup
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
+async def test_start_plugin_refresh_failure_does_not_persist_user_intent(
+    monkeypatch: pytest.MonkeyPatch,
+    _isolate_runtime_overrides: dict,
+) -> None:
+    runtime_overrides_module.set_runtime_override(
+        "failed_plugin",
+        False,
+        auto_start=False,
+    )
+
+    async def _fail_refresh(_plugin_id: str) -> dict[str, object]:
+        raise ServerDomainError(
+            code="PLUGIN_REGISTRY_CONFLICT",
+            message="conflict",
+            status_code=409,
+        )
+
+    monkeypatch.setattr(module.plugin_registry_service, "refresh_plugin", _fail_refresh)
+
+    with pytest.raises(ServerDomainError) as exc_info:
+        await module.PluginLifecycleService().start_plugin(
+            "failed_plugin",
+            persist_user_intent=True,
+        )
+
+    assert exc_info.value.code == "PLUGIN_REGISTRY_CONFLICT"
+    assert _isolate_runtime_overrides == {
+        "failed_plugin": {"enabled": False, "auto_start": False},
+    }
+
+
+@pytest.mark.plugin_unit
+def test_persist_user_runtime_intent_migrates_resolved_plugin_preferences(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[tuple[str, ...], str, bool, bool | None]] = []
+
+    monkeypatch.setattr(module, "PLUGIN_SYNC_AUTO_START_ON_TOGGLE", True)
+    monkeypatch.setattr(
+        module,
+        "migrate_runtime_override",
+        lambda sources, target, enabled, *, auto_start=None: calls.append(
+            (tuple(sources), target, enabled, auto_start)
+        ),
+    )
+
+    module._persist_user_runtime_intent(
+        "renamed_plugin",
+        True,
+        previous_plugin_ids=("original_plugin", "intermediate_plugin"),
+        runtime_state_changed=True,
+    )
+
+    assert calls == [
+        (
+            ("original_plugin", "intermediate_plugin"),
+            "renamed_plugin",
+            True,
+            True,
+        )
+    ]
 
 
 @pytest.mark.plugin_unit
@@ -339,8 +1221,8 @@ async def test_start_plugin_checks_python_requirements_against_vendor_paths(
     )
     monkeypatch.setattr(module, "_resolve_plugin_id_conflict", lambda *args, **kwargs: args[0])
     monkeypatch.setattr(module, "_find_missing_python_requirements", _fake_find_missing)
-    monkeypatch.setattr(module, "PluginProcessHost", _FakeProcessHost)
-    monkeypatch.setattr(module, "_import_plugin_module", lambda *args, **kwargs: SimpleNamespace(FakeAdapterPlugin=_FakeAdapterPlugin))
+    monkeypatch.setattr(module, "create_plugin_host", _FakeProcessHost)
+    monkeypatch.setattr(module, "scan_plugin_metadata_isolated", _metadata_scan_for(_FakeAdapterPlugin))
     monkeypatch.setattr(module, "emit_lifecycle_event", lambda event: None)
 
     plugins_backup = copy.deepcopy(module.state.plugins)
@@ -363,6 +1245,1092 @@ async def test_start_plugin_checks_python_requirements_against_vendor_paths(
         with module.state.acquire_plugin_hosts_write_lock():
             module.state.plugin_hosts.clear()
             module.state.plugin_hosts.update(hosts_backup)
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
+async def test_start_plugin_rejects_entry_directory_mismatch_before_creating_host(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "repo_file_manager" / "plugin.toml"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(
+        "\n".join(
+            [
+                "[plugin]",
+                "id = 'file_manager'",
+                "name = 'File Manager'",
+                "type = 'plugin'",
+                "entry = 'plugins.file_manager:FileManagerPlugin'",
+                "",
+                "[plugin_runtime]",
+                "enabled = true",
+                "auto_start = false",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    host_created = False
+
+    class _UnexpectedHost(_FakeProcessHost):
+        def __init__(self, *args, **kwargs) -> None:
+            nonlocal host_created
+            host_created = True
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(
+        module,
+        "resolve_plugin_config_from_path",
+        lambda *args, **kwargs: {
+            "effective_config": kwargs["base_config"],
+            "warnings": [],
+        },
+    )
+    monkeypatch.setattr(module, "create_plugin_host", _UnexpectedHost)
+
+    plugins_backup = copy.deepcopy(module.state.plugins)
+    hosts_backup = dict(module.state.plugin_hosts)
+    cache_backup = copy.deepcopy(module.state._snapshot_cache)
+    try:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins["file_manager"] = {
+                "id": "file_manager",
+                "config_path": str(config_path),
+                "runtime_enabled": True,
+                "runtime_auto_start": False,
+            }
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+
+        with pytest.raises(ServerDomainError) as exc_info:
+            await module.PluginLifecycleService().start_plugin("file_manager", refresh_registry=False)
+
+        assert exc_info.value.code == "PLUGIN_ENTRY_DIRECTORY_MISMATCH"
+        assert exc_info.value.status_code == 400
+        assert "repo_file_manager" in exc_info.value.message
+        assert host_created is False
+    finally:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins.update(plugins_backup)
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+            module.state.plugin_hosts.update(hosts_backup)
+        with module.state._snapshot_cache_lock:
+            module.state._snapshot_cache = cache_backup
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
+async def test_start_plugin_clamps_its_startup_timeout_to_the_caller_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The clamp has to reach the host, not just exist as a helper.
+
+    ``reload_all_plugins`` hands each start whatever is left of the round
+    budget; if ``start_plugin`` accepted that number and then ignored it, the
+    reload would still run past its advertised wall clock while every unit test
+    on the helper kept passing. So this asserts on the value the host was
+    actually started with (codex / CodeRabbit / Greptile).
+
+    Mutation: delete the clamp from ``start_plugin`` and pass the configured
+    timeout straight through.
+    """
+    config_path = tmp_path / "clamped_adapter" / "plugin.toml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        "\n".join(
+            [
+                "[plugin]",
+                "id = 'clamped_adapter'",
+                "name = 'Clamped Adapter'",
+                "type = 'adapter'",
+                "entry = 'tests.fake_mcp:FakeAdapterPlugin'",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    class _RecordingHost(_FakeProcessHost):
+        instances: list["_RecordingHost"] = []
+
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            _RecordingHost.instances.append(self)
+
+    plugins_backup = copy.deepcopy(module.state.plugins)
+    hosts_backup = dict(module.state.plugin_hosts)
+    handlers_backup = dict(module.state.event_handlers)
+    cache_backup = copy.deepcopy(module.state._snapshot_cache)
+
+    try:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins["clamped_adapter"] = {
+                "id": "clamped_adapter",
+                "name": "Clamped Adapter",
+                "type": "adapter",
+                "config_path": str(config_path),
+                "entry_point": "tests.fake_mcp:FakeAdapterPlugin",
+            }
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+        with module.state.acquire_event_handlers_write_lock():
+            module.state.event_handlers.clear()
+
+        monkeypatch.setattr(module, "PLUGIN_STARTUP_TIMEOUT", 10.0, raising=False)
+        monkeypatch.setattr(
+            module,
+            "resolve_plugin_config_from_path",
+            lambda *args, **kwargs: {
+                "effective_config": kwargs["base_config"],
+                "warnings": [],
+            },
+        )
+        monkeypatch.setattr(module, "_resolve_plugin_id_conflict", lambda *args, **kwargs: args[0])
+        monkeypatch.setattr(module, "create_plugin_host", _RecordingHost)
+        inner_scan = _metadata_scan_for(_FakeAdapterPlugin)
+        scan_timeouts: list[object] = []
+
+        def _recording_scan(**kwargs):
+            scan_timeouts.append(kwargs.get("timeout"))
+            kwargs.pop("timeout", None)
+            return inner_scan(**kwargs)
+
+        monkeypatch.setattr(module, "scan_plugin_metadata_isolated", _recording_scan)
+        monkeypatch.setattr(module, "emit_lifecycle_event", lambda event: None)
+
+        response = await module.PluginLifecycleService().start_plugin(
+            "clamped_adapter",
+            refresh_registry=False,
+            start_deadline=time.monotonic() + 2.5,
+        )
+
+        assert response["success"] is True
+        assert _RecordingHost.instances
+        assert _RecordingHost.instances[0].startup_timeout == pytest.approx(2.5, abs=0.5), (
+            f"剩余预算没有压到真正启动 host 的那一步：{_RecordingHost.instances[0].startup_timeout}"
+        )
+        # Scanning follows host startup and has its own 10s limit; without clamping both, the budget covers
+        # only one step of this startup.
+        assert scan_timeouts, "前提没成立：没有走到元数据扫描"
+        assert scan_timeouts[0] == pytest.approx(2.5, abs=0.6), (
+            f"元数据扫描没有按剩余预算收窄：{scan_timeouts}"
+        )
+    finally:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins.update(plugins_backup)
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+            module.state.plugin_hosts.update(hosts_backup)
+        with module.state.acquire_event_handlers_write_lock():
+            module.state.event_handlers.clear()
+            module.state.event_handlers.update(handlers_backup)
+        with module.state._snapshot_cache_lock:
+            module.state._snapshot_cache = cache_backup
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
+async def test_start_plugin_uses_default_startup_timeout_when_runtime_timeout_omitted(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "default_timeout_adapter" / "plugin.toml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        "\n".join(
+            [
+                "[plugin]",
+                "id = 'default_timeout_adapter'",
+                "name = 'Default Timeout Adapter'",
+                "type = 'adapter'",
+                "entry = 'tests.fake_mcp:FakeAdapterPlugin'",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    class _RecordingHost(_FakeProcessHost):
+        instances: list["_RecordingHost"] = []
+
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            _RecordingHost.instances.append(self)
+
+    plugins_backup = copy.deepcopy(module.state.plugins)
+    hosts_backup = dict(module.state.plugin_hosts)
+    handlers_backup = dict(module.state.event_handlers)
+    cache_backup = copy.deepcopy(module.state._snapshot_cache)
+
+    try:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins["default_timeout_adapter"] = {
+                "id": "default_timeout_adapter",
+                "name": "Default Timeout Adapter",
+                "type": "adapter",
+                "config_path": str(config_path),
+                "entry_point": "tests.fake_mcp:FakeAdapterPlugin",
+            }
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+        with module.state.acquire_event_handlers_write_lock():
+            module.state.event_handlers.clear()
+
+        monkeypatch.setattr(module, "PLUGIN_STARTUP_TIMEOUT", 0.01, raising=False)
+        monkeypatch.setattr(
+            module,
+            "resolve_plugin_config_from_path",
+            lambda *args, **kwargs: {
+                "effective_config": kwargs["base_config"],
+                "warnings": [],
+            },
+        )
+        monkeypatch.setattr(module, "_resolve_plugin_id_conflict", lambda *args, **kwargs: args[0])
+        monkeypatch.setattr(module, "create_plugin_host", _RecordingHost)
+        monkeypatch.setattr(
+            module,
+            "scan_plugin_metadata_isolated",
+            _metadata_scan_for(_FakeAdapterPlugin),
+        )
+        monkeypatch.setattr(module, "emit_lifecycle_event", lambda event: None)
+
+        response = await module.PluginLifecycleService().start_plugin(
+            "default_timeout_adapter",
+            refresh_registry=False,
+        )
+
+        assert response["success"] is True
+        assert _RecordingHost.instances
+        assert _RecordingHost.instances[0].startup_timeout == 0.01
+    finally:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins.update(plugins_backup)
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+            module.state.plugin_hosts.update(hosts_backup)
+        with module.state.acquire_event_handlers_write_lock():
+            module.state.event_handlers.clear()
+            module.state.event_handlers.update(handlers_backup)
+        with module.state._snapshot_cache_lock:
+            module.state._snapshot_cache = cache_backup
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timeout_literal", ["0", "300.1"])
+async def test_start_plugin_rejects_invalid_runtime_startup_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    timeout_literal: str,
+) -> None:
+    config_path = tmp_path / "invalid_timeout_adapter" / "plugin.toml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        "\n".join(
+            [
+                "[plugin]",
+                "id = 'invalid_timeout_adapter'",
+                "name = 'Invalid Timeout Adapter'",
+                "type = 'adapter'",
+                "entry = 'tests.fake_mcp:FakeAdapterPlugin'",
+                "",
+                "[plugin_runtime]",
+                "enabled = true",
+                "auto_start = false",
+                f"timeout = {timeout_literal}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    class _RecordingHost(_FakeProcessHost):
+        instances: list["_RecordingHost"] = []
+
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            _RecordingHost.instances.append(self)
+
+    plugins_backup = copy.deepcopy(module.state.plugins)
+    hosts_backup = dict(module.state.plugin_hosts)
+    handlers_backup = dict(module.state.event_handlers)
+    cache_backup = copy.deepcopy(module.state._snapshot_cache)
+
+    try:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins["invalid_timeout_adapter"] = {
+                "id": "invalid_timeout_adapter",
+                "name": "Invalid Timeout Adapter",
+                "type": "adapter",
+                "config_path": str(config_path),
+                "entry_point": "tests.fake_mcp:FakeAdapterPlugin",
+            }
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+        with module.state.acquire_event_handlers_write_lock():
+            module.state.event_handlers.clear()
+
+        monkeypatch.setattr(
+            module,
+            "resolve_plugin_config_from_path",
+            lambda *args, **kwargs: {
+                "effective_config": kwargs["base_config"],
+                "warnings": [],
+            },
+        )
+        monkeypatch.setattr(module, "_resolve_plugin_id_conflict", lambda *args, **kwargs: args[0])
+        monkeypatch.setattr(module, "create_plugin_host", _RecordingHost)
+        monkeypatch.setattr(module, "emit_lifecycle_event", lambda event: None)
+
+        with pytest.raises(ServerDomainError) as exc_info:
+            await module.PluginLifecycleService().start_plugin(
+                "invalid_timeout_adapter",
+                refresh_registry=False,
+            )
+
+        assert exc_info.value.code == "INVALID_PLUGIN_CONFIG"
+        assert "timeout" in exc_info.value.message
+        assert _RecordingHost.instances == []
+    finally:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins.update(plugins_backup)
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+            module.state.plugin_hosts.update(hosts_backup)
+        with module.state.acquire_event_handlers_write_lock():
+            module.state.event_handlers.clear()
+            module.state.event_handlers.update(handlers_backup)
+        with module.state._snapshot_cache_lock:
+            module.state._snapshot_cache = cache_backup
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
+async def test_start_plugin_rejects_invalid_default_startup_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "invalid_default_timeout_adapter" / "plugin.toml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        "\n".join(
+            [
+                "[plugin]",
+                "id = 'invalid_default_timeout_adapter'",
+                "name = 'Invalid Default Timeout Adapter'",
+                "type = 'adapter'",
+                "entry = 'tests.fake_mcp:FakeAdapterPlugin'",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    class _RecordingHost(_FakeProcessHost):
+        instances: list["_RecordingHost"] = []
+
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            _RecordingHost.instances.append(self)
+
+    plugins_backup = copy.deepcopy(module.state.plugins)
+    hosts_backup = dict(module.state.plugin_hosts)
+    handlers_backup = dict(module.state.event_handlers)
+    cache_backup = copy.deepcopy(module.state._snapshot_cache)
+
+    try:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins["invalid_default_timeout_adapter"] = {
+                "id": "invalid_default_timeout_adapter",
+                "name": "Invalid Default Timeout Adapter",
+                "type": "adapter",
+                "config_path": str(config_path),
+                "entry_point": "tests.fake_mcp:FakeAdapterPlugin",
+            }
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+        with module.state.acquire_event_handlers_write_lock():
+            module.state.event_handlers.clear()
+
+        monkeypatch.setattr(module, "PLUGIN_STARTUP_TIMEOUT", 300.1, raising=False)
+        monkeypatch.setattr(
+            module,
+            "resolve_plugin_config_from_path",
+            lambda *args, **kwargs: {
+                "effective_config": kwargs["base_config"],
+                "warnings": [],
+            },
+        )
+        monkeypatch.setattr(module, "_resolve_plugin_id_conflict", lambda *args, **kwargs: args[0])
+        monkeypatch.setattr(module, "create_plugin_host", _RecordingHost)
+        monkeypatch.setattr(module, "emit_lifecycle_event", lambda event: None)
+
+        with pytest.raises(ServerDomainError) as exc_info:
+            await module.PluginLifecycleService().start_plugin(
+                "invalid_default_timeout_adapter",
+                refresh_registry=False,
+            )
+
+        assert exc_info.value.code == "INVALID_PLUGIN_CONFIG"
+        assert exc_info.value.details["error_type"] == "InvalidStartupTimeout"
+        assert "PLUGIN_STARTUP_TIMEOUT" in exc_info.value.message
+        assert _RecordingHost.instances == []
+    finally:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins.update(plugins_backup)
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+            module.state.plugin_hosts.update(hosts_backup)
+        with module.state.acquire_event_handlers_write_lock():
+            module.state.event_handlers.clear()
+            module.state.event_handlers.update(handlers_backup)
+        with module.state._snapshot_cache_lock:
+            module.state._snapshot_cache = cache_backup
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
+async def test_start_plugin_defaults_startup_failure_to_warn_and_marks_degraded(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "warn_startup_adapter" / "plugin.toml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        "\n".join(
+            [
+                "[plugin]",
+                "id = 'warn_startup_adapter'",
+                "name = 'Warn Startup Adapter'",
+                "type = 'adapter'",
+                "entry = 'tests.fake_mcp:FakeAdapterPlugin'",
+                "",
+                "[plugin_runtime]",
+                "enabled = true",
+                "auto_start = false",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    class _StartupWarningHost(_FakeProcessHost):
+        instances: list["_StartupWarningHost"] = []
+
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            _StartupWarningHost.instances.append(self)
+
+        async def start(
+            self,
+            message_target_queue: object,
+            startup_timeout: float | None = None,
+            startup_failure: str = "warn",
+        ) -> dict[str, object]:
+            self.startup_timeout = startup_timeout
+            self.startup_failure = startup_failure
+            self.started = True
+            return {"status": "failed", "startup_error": "lifecycle.startup failed"}
+
+    plugins_backup = copy.deepcopy(module.state.plugins)
+    hosts_backup = dict(module.state.plugin_hosts)
+    handlers_backup = dict(module.state.event_handlers)
+    cache_backup = copy.deepcopy(module.state._snapshot_cache)
+
+    try:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins["warn_startup_adapter"] = {
+                "id": "warn_startup_adapter",
+                "name": "Warn Startup Adapter",
+                "type": "adapter",
+                "config_path": str(config_path),
+                "entry_point": "tests.fake_mcp:FakeAdapterPlugin",
+            }
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+        with module.state.acquire_event_handlers_write_lock():
+            module.state.event_handlers.clear()
+
+        monkeypatch.setattr(
+            module,
+            "resolve_plugin_config_from_path",
+            lambda *args, **kwargs: {
+                "effective_config": kwargs["base_config"],
+                "warnings": [],
+            },
+        )
+        monkeypatch.setattr(module, "_resolve_plugin_id_conflict", lambda *args, **kwargs: args[0])
+        monkeypatch.setattr(module, "create_plugin_host", _StartupWarningHost)
+        monkeypatch.setattr(
+            module,
+            "scan_plugin_metadata_isolated",
+            _metadata_scan_for(_FakeAdapterPlugin),
+        )
+        monkeypatch.setattr(module, "emit_lifecycle_event", lambda event: None)
+
+        response = await module.PluginLifecycleService().start_plugin(
+            "warn_startup_adapter",
+            refresh_registry=False,
+        )
+
+        assert response["success"] is True
+        assert response["startup_degraded"] is True
+        assert response["startup_error"] == "lifecycle.startup failed"
+        assert _StartupWarningHost.instances[0].startup_failure == "warn"
+        assert _StartupWarningHost.instances[0].stopped is False
+        with module.state.acquire_plugins_read_lock():
+            meta = module.state.plugins["warn_startup_adapter"]
+        assert meta["runtime_startup_state"] == "degraded"
+        assert meta["runtime_startup_error"] == "lifecycle.startup failed"
+        with module.state.acquire_plugin_hosts_read_lock():
+            assert "warn_startup_adapter" in module.state.plugin_hosts
+    finally:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins.update(plugins_backup)
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+            module.state.plugin_hosts.update(hosts_backup)
+        with module.state.acquire_event_handlers_write_lock():
+            module.state.event_handlers.clear()
+            module.state.event_handlers.update(handlers_backup)
+        with module.state._snapshot_cache_lock:
+            module.state._snapshot_cache = cache_backup
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
+async def test_start_plugin_startup_failure_fail_keeps_startup_error_fatal(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "fail_startup_adapter" / "plugin.toml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        "\n".join(
+            [
+                "[plugin]",
+                "id = 'fail_startup_adapter'",
+                "name = 'Fail Startup Adapter'",
+                "type = 'adapter'",
+                "entry = 'tests.fake_mcp:FakeAdapterPlugin'",
+                "",
+                "[plugin_runtime]",
+                "enabled = true",
+                "auto_start = false",
+                "startup_failure = 'fail'",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    class _StrictStartupHost(_FakeProcessHost):
+        instances: list["_StrictStartupHost"] = []
+
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            _StrictStartupHost.instances.append(self)
+
+        async def start(
+            self,
+            message_target_queue: object,
+            startup_timeout: float | None = None,
+            startup_failure: str = "warn",
+        ) -> dict[str, object]:
+            self.startup_timeout = startup_timeout
+            self.startup_failure = startup_failure
+            self.started = True
+            if startup_failure == "fail":
+                raise PluginLifecycleError(self.plugin_id, "startup", "lifecycle.startup failed")
+            return {"status": "failed", "startup_error": "lifecycle.startup failed"}
+
+    plugins_backup = copy.deepcopy(module.state.plugins)
+    hosts_backup = dict(module.state.plugin_hosts)
+    handlers_backup = dict(module.state.event_handlers)
+    cache_backup = copy.deepcopy(module.state._snapshot_cache)
+
+    try:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins["fail_startup_adapter"] = {
+                "id": "fail_startup_adapter",
+                "name": "Fail Startup Adapter",
+                "type": "adapter",
+                "config_path": str(config_path),
+                "entry_point": "tests.fake_mcp:FakeAdapterPlugin",
+            }
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+        with module.state.acquire_event_handlers_write_lock():
+            module.state.event_handlers.clear()
+
+        monkeypatch.setattr(
+            module,
+            "resolve_plugin_config_from_path",
+            lambda *args, **kwargs: {
+                "effective_config": kwargs["base_config"],
+                "warnings": [],
+            },
+        )
+        monkeypatch.setattr(module, "_resolve_plugin_id_conflict", lambda *args, **kwargs: args[0])
+        monkeypatch.setattr(module, "create_plugin_host", _StrictStartupHost)
+        monkeypatch.setattr(
+            module,
+            "scan_plugin_metadata_isolated",
+            _metadata_scan_for(_FakeAdapterPlugin),
+        )
+        monkeypatch.setattr(module, "emit_lifecycle_event", lambda event: None)
+
+        with pytest.raises(ServerDomainError) as exc_info:
+            await module.PluginLifecycleService().start_plugin("fail_startup_adapter", refresh_registry=False)
+
+        assert exc_info.value.code == "PLUGIN_START_FAILED"
+        assert _StrictStartupHost.instances
+        host = _StrictStartupHost.instances[0]
+        assert host.startup_failure == "fail"
+        assert host.stopped is True
+        with module.state.acquire_plugin_hosts_read_lock():
+            assert "fail_startup_adapter" not in module.state.plugin_hosts
+    finally:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins.update(plugins_backup)
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+            module.state.plugin_hosts.update(hosts_backup)
+        with module.state.acquire_event_handlers_write_lock():
+            module.state.event_handlers.clear()
+            module.state.event_handlers.update(handlers_backup)
+        with module.state._snapshot_cache_lock:
+            module.state._snapshot_cache = cache_backup
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
+async def test_start_plugin_does_not_map_startup_business_timeout_to_start_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "business_timeout_adapter" / "plugin.toml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        "\n".join(
+            [
+                "[plugin]",
+                "id = 'business_timeout_adapter'",
+                "name = 'Business Timeout Adapter'",
+                "type = 'adapter'",
+                "entry = 'tests.fake_mcp:FakeAdapterPlugin'",
+                "",
+                "[plugin_runtime]",
+                "enabled = true",
+                "auto_start = false",
+                "startup_failure = 'fail'",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    class _BusinessTimeoutHost(_FakeProcessHost):
+        instances: list["_BusinessTimeoutHost"] = []
+
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            _BusinessTimeoutHost.instances.append(self)
+
+        async def start(
+            self,
+            message_target_queue: object,
+            startup_timeout: float | None = None,
+            startup_failure: str = "warn",
+        ) -> None:
+            self.startup_timeout = startup_timeout
+            self.startup_failure = startup_failure
+            self.started = True
+            raise PluginLifecycleError(self.plugin_id, "startup", "database timeout while connecting")
+
+    plugins_backup = copy.deepcopy(module.state.plugins)
+    hosts_backup = dict(module.state.plugin_hosts)
+    handlers_backup = dict(module.state.event_handlers)
+    cache_backup = copy.deepcopy(module.state._snapshot_cache)
+
+    try:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins["business_timeout_adapter"] = {
+                "id": "business_timeout_adapter",
+                "name": "Business Timeout Adapter",
+                "type": "adapter",
+                "config_path": str(config_path),
+                "entry_point": "tests.fake_mcp:FakeAdapterPlugin",
+            }
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+        with module.state.acquire_event_handlers_write_lock():
+            module.state.event_handlers.clear()
+
+        monkeypatch.setattr(
+            module,
+            "resolve_plugin_config_from_path",
+            lambda *args, **kwargs: {
+                "effective_config": kwargs["base_config"],
+                "warnings": [],
+            },
+        )
+        monkeypatch.setattr(module, "_resolve_plugin_id_conflict", lambda *args, **kwargs: args[0])
+        monkeypatch.setattr(module, "create_plugin_host", _BusinessTimeoutHost)
+        monkeypatch.setattr(
+            module,
+            "scan_plugin_metadata_isolated",
+            _metadata_scan_for(_FakeAdapterPlugin),
+        )
+        monkeypatch.setattr(module, "emit_lifecycle_event", lambda event: None)
+
+        with pytest.raises(ServerDomainError) as exc_info:
+            await module.PluginLifecycleService().start_plugin("business_timeout_adapter", refresh_registry=False)
+
+        assert exc_info.value.code == "PLUGIN_START_FAILED"
+        assert exc_info.value.status_code == 500
+        assert exc_info.value.details["error_type"] == "PluginLifecycleError"
+        assert "database timeout while connecting" in exc_info.value.message
+        assert _BusinessTimeoutHost.instances[0].stopped is True
+    finally:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins.update(plugins_backup)
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+            module.state.plugin_hosts.update(hosts_backup)
+        with module.state.acquire_event_handlers_write_lock():
+            module.state.event_handlers.clear()
+            module.state.event_handlers.update(handlers_backup)
+        with module.state._snapshot_cache_lock:
+            module.state._snapshot_cache = cache_backup
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
+async def test_start_plugin_applies_runtime_startup_timeout_to_legacy_host_and_cleans_host(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "slow_adapter" / "plugin.toml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        "\n".join(
+            [
+                "[plugin]",
+                "id = 'slow_adapter'",
+                "name = 'Slow Adapter'",
+                "type = 'adapter'",
+                "entry = 'tests.fake_mcp:FakeAdapterPlugin'",
+                "",
+                "[plugin_runtime]",
+                "enabled = true",
+                "auto_start = false",
+                "timeout = 0.01",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    class _SlowProcessHost(_FakeProcessHost):
+        instances: list["_SlowProcessHost"] = []
+
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            self.shutdown_timeout: float | None = None
+            _SlowProcessHost.instances.append(self)
+
+        async def start(self, message_target_queue: object) -> None:
+            self.started = True
+            await asyncio.sleep(0.05)
+
+        async def shutdown(self, timeout: float = module.PLUGIN_SHUTDOWN_TIMEOUT) -> None:
+            self.stopped = True
+            self.shutdown_timeout = timeout
+
+    plugins_backup = copy.deepcopy(module.state.plugins)
+    hosts_backup = dict(module.state.plugin_hosts)
+    handlers_backup = dict(module.state.event_handlers)
+    cache_backup = copy.deepcopy(module.state._snapshot_cache)
+
+    try:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins["slow_adapter"] = {
+                "id": "slow_adapter",
+                "name": "Slow Adapter",
+                "type": "adapter",
+                "config_path": str(config_path),
+                "entry_point": "tests.fake_mcp:FakeAdapterPlugin",
+            }
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+        with module.state.acquire_event_handlers_write_lock():
+            module.state.event_handlers.clear()
+
+        monkeypatch.setattr(
+            module,
+            "resolve_plugin_config_from_path",
+            lambda *args, **kwargs: {
+                "effective_config": kwargs["base_config"],
+                "warnings": [],
+            },
+        )
+        monkeypatch.setattr(module, "_resolve_plugin_id_conflict", lambda *args, **kwargs: args[0])
+        monkeypatch.setattr(module, "create_plugin_host", _SlowProcessHost)
+        monkeypatch.setattr(
+            module,
+            "scan_plugin_metadata_isolated",
+            _metadata_scan_for(_FakeAdapterPlugin),
+        )
+        monkeypatch.setattr(module, "emit_lifecycle_event", lambda event: None)
+
+        with pytest.raises(ServerDomainError) as exc_info:
+            await module.PluginLifecycleService().start_plugin("slow_adapter", refresh_registry=False)
+
+        assert exc_info.value.code == "PLUGIN_START_TIMEOUT"
+        assert _SlowProcessHost.instances
+        assert _SlowProcessHost.instances[0].stopped is True
+        with module.state.acquire_plugin_hosts_read_lock():
+            assert "slow_adapter" not in module.state.plugin_hosts
+    finally:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins.update(plugins_backup)
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+            module.state.plugin_hosts.update(hosts_backup)
+        with module.state.acquire_event_handlers_write_lock():
+            module.state.event_handlers.clear()
+            module.state.event_handlers.update(handlers_backup)
+        with module.state._snapshot_cache_lock:
+            module.state._snapshot_cache = cache_backup
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
+async def test_start_plugin_lets_timeout_aware_host_own_startup_timeout_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "aware_adapter" / "plugin.toml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        "\n".join(
+            [
+                "[plugin]",
+                "id = 'aware_adapter'",
+                "name = 'Aware Adapter'",
+                "type = 'adapter'",
+                "entry = 'tests.fake_mcp:FakeAdapterPlugin'",
+                "",
+                "[plugin_runtime]",
+                "enabled = true",
+                "auto_start = false",
+                "timeout = 0.01",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    class _TimeoutAwareHost(_FakeProcessHost):
+        instances: list["_TimeoutAwareHost"] = []
+
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            self.cancelled = False
+            self.startup_cleanup_ran = False
+            _TimeoutAwareHost.instances.append(self)
+
+        async def start(self, message_target_queue: object, startup_timeout: float | None = None) -> None:
+            self.started = True
+            self.startup_timeout = startup_timeout
+            try:
+                await asyncio.sleep(float(startup_timeout or 0.01) * 2)
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
+            self.startup_cleanup_ran = True
+            raise PluginLifecycleError(
+                self.plugin_id,
+                "startup",
+                f"startup timed out after {startup_timeout}s",
+            )
+
+    plugins_backup = copy.deepcopy(module.state.plugins)
+    hosts_backup = dict(module.state.plugin_hosts)
+    handlers_backup = dict(module.state.event_handlers)
+    cache_backup = copy.deepcopy(module.state._snapshot_cache)
+
+    try:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins["aware_adapter"] = {
+                "id": "aware_adapter",
+                "name": "Aware Adapter",
+                "type": "adapter",
+                "config_path": str(config_path),
+                "entry_point": "tests.fake_mcp:FakeAdapterPlugin",
+            }
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+        with module.state.acquire_event_handlers_write_lock():
+            module.state.event_handlers.clear()
+
+        monkeypatch.setattr(
+            module,
+            "resolve_plugin_config_from_path",
+            lambda *args, **kwargs: {
+                "effective_config": kwargs["base_config"],
+                "warnings": [],
+            },
+        )
+        monkeypatch.setattr(module, "_resolve_plugin_id_conflict", lambda *args, **kwargs: args[0])
+        monkeypatch.setattr(module, "create_plugin_host", _TimeoutAwareHost)
+        monkeypatch.setattr(
+            module,
+            "scan_plugin_metadata_isolated",
+            _metadata_scan_for(_FakeAdapterPlugin),
+        )
+        monkeypatch.setattr(module, "emit_lifecycle_event", lambda event: None)
+
+        with pytest.raises(ServerDomainError) as exc_info:
+            await module.PluginLifecycleService().start_plugin("aware_adapter", refresh_registry=False)
+
+        assert exc_info.value.code == "PLUGIN_START_TIMEOUT"
+        assert _TimeoutAwareHost.instances
+        host = _TimeoutAwareHost.instances[0]
+        assert host.startup_timeout == 0.01
+        assert host.cancelled is False
+        assert host.startup_cleanup_ran is True
+        assert host.stopped is True
+        with module.state.acquire_plugin_hosts_read_lock():
+            assert "aware_adapter" not in module.state.plugin_hosts
+    finally:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins.update(plugins_backup)
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+            module.state.plugin_hosts.update(hosts_backup)
+        with module.state.acquire_event_handlers_write_lock():
+            module.state.event_handlers.clear()
+            module.state.event_handlers.update(handlers_backup)
+        with module.state._snapshot_cache_lock:
+            module.state._snapshot_cache = cache_backup
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
+async def test_start_plugin_classifies_exponent_form_startup_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "tiny_timeout_adapter" / "plugin.toml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        "\n".join(
+            [
+                "[plugin]",
+                "id = 'tiny_timeout_adapter'",
+                "name = 'Tiny Timeout Adapter'",
+                "type = 'adapter'",
+                "entry = 'tests.fake_mcp:FakeAdapterPlugin'",
+                "",
+                "[plugin_runtime]",
+                "enabled = true",
+                "auto_start = false",
+                "timeout = 1e-6",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    class _ExponentTimeoutHost(_FakeProcessHost):
+        instances: list["_ExponentTimeoutHost"] = []
+
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            _ExponentTimeoutHost.instances.append(self)
+
+        async def start(self, message_target_queue: object, startup_timeout: float | None = None) -> None:
+            self.started = True
+            self.startup_timeout = startup_timeout
+            raise PluginLifecycleError(
+                self.plugin_id,
+                "startup",
+                f"startup timed out after {startup_timeout}s",
+            )
+
+    plugins_backup = copy.deepcopy(module.state.plugins)
+    hosts_backup = dict(module.state.plugin_hosts)
+    handlers_backup = dict(module.state.event_handlers)
+    cache_backup = copy.deepcopy(module.state._snapshot_cache)
+
+    try:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins["tiny_timeout_adapter"] = {
+                "id": "tiny_timeout_adapter",
+                "name": "Tiny Timeout Adapter",
+                "type": "adapter",
+                "config_path": str(config_path),
+                "entry_point": "tests.fake_mcp:FakeAdapterPlugin",
+            }
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+        with module.state.acquire_event_handlers_write_lock():
+            module.state.event_handlers.clear()
+
+        monkeypatch.setattr(
+            module,
+            "resolve_plugin_config_from_path",
+            lambda *args, **kwargs: {
+                "effective_config": kwargs["base_config"],
+                "warnings": [],
+            },
+        )
+        monkeypatch.setattr(module, "_resolve_plugin_id_conflict", lambda *args, **kwargs: args[0])
+        monkeypatch.setattr(module, "create_plugin_host", _ExponentTimeoutHost)
+        monkeypatch.setattr(
+            module,
+            "scan_plugin_metadata_isolated",
+            _metadata_scan_for(_FakeAdapterPlugin),
+        )
+        monkeypatch.setattr(module, "emit_lifecycle_event", lambda event: None)
+
+        with pytest.raises(ServerDomainError) as exc_info:
+            await module.PluginLifecycleService().start_plugin("tiny_timeout_adapter", refresh_registry=False)
+
+        assert exc_info.value.code == "PLUGIN_START_TIMEOUT"
+        assert exc_info.value.status_code == 504
+        assert _ExponentTimeoutHost.instances
+        host = _ExponentTimeoutHost.instances[0]
+        assert host.startup_timeout == 1e-6
+        assert host.stopped is True
+    finally:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins.update(plugins_backup)
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+            module.state.plugin_hosts.update(hosts_backup)
+        with module.state.acquire_event_handlers_write_lock():
+            module.state.event_handlers.clear()
+            module.state.event_handlers.update(handlers_backup)
+        with module.state._snapshot_cache_lock:
+            module.state._snapshot_cache = cache_backup
 
 
 @pytest.mark.plugin_unit
@@ -436,8 +2404,8 @@ async def test_start_plugin_persists_entries_preview_and_invalidates_stale_cache
             },
         )
         monkeypatch.setattr(module, "_resolve_plugin_id_conflict", lambda *args, **kwargs: args[0])
-        monkeypatch.setattr(module, "PluginProcessHost", _FakeProcessHost)
-        monkeypatch.setattr(module, "_import_plugin_module", lambda *args, **kwargs: SimpleNamespace(FakeAdapterPlugin=_FakeAdapterPlugin))
+        monkeypatch.setattr(module, "create_plugin_host", _FakeProcessHost)
+        monkeypatch.setattr(module, "scan_plugin_metadata_isolated", _metadata_scan_for(_FakeAdapterPlugin))
         monkeypatch.setattr(module, "emit_lifecycle_event", lambda event: None)
 
         service = module.PluginLifecycleService()
@@ -526,8 +2494,8 @@ async def test_start_plugin_logs_structured_config_warnings_from_resolver(
             },
         )
         monkeypatch.setattr(module, "_resolve_plugin_id_conflict", lambda *args, **kwargs: args[0])
-        monkeypatch.setattr(module, "PluginProcessHost", _FakeProcessHost)
-        monkeypatch.setattr(module, "_import_plugin_module", lambda *args, **kwargs: SimpleNamespace(FakeAdapterPlugin=_FakeAdapterPlugin))
+        monkeypatch.setattr(module, "create_plugin_host", _FakeProcessHost)
+        monkeypatch.setattr(module, "scan_plugin_metadata_isolated", _metadata_scan_for(_FakeAdapterPlugin))
         monkeypatch.setattr(module, "emit_lifecycle_event", lambda event: None)
         monkeypatch.setattr(module, "logger", capture_logger)
 
@@ -638,8 +2606,8 @@ async def test_start_plugin_allows_retry_for_load_failed_plugin(
             },
         )
         monkeypatch.setattr(module, "_resolve_plugin_id_conflict", lambda *args, **kwargs: args[0])
-        monkeypatch.setattr(module, "PluginProcessHost", _FakeProcessHost)
-        monkeypatch.setattr(module, "_import_plugin_module", lambda *args, **kwargs: SimpleNamespace(FakeAdapterPlugin=_FakeAdapterPlugin))
+        monkeypatch.setattr(module, "create_plugin_host", _FakeProcessHost)
+        monkeypatch.setattr(module, "scan_plugin_metadata_isolated", _metadata_scan_for(_FakeAdapterPlugin))
         monkeypatch.setattr(module, "emit_lifecycle_event", lambda event: None)
 
         service = module.PluginLifecycleService()
@@ -665,128 +2633,6 @@ async def test_start_plugin_allows_retry_for_load_failed_plugin(
 
 
 @pytest.mark.plugin_unit
-@pytest.mark.asyncio
-async def test_start_plugin_passes_prebuilt_extension_configs_to_host(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    host_config_path = tmp_path / "host_plugin" / "plugin.toml"
-    ext_config_path = tmp_path / "demo_ext" / "plugin.toml"
-    host_config_path.parent.mkdir(parents=True, exist_ok=True)
-    ext_config_path.parent.mkdir(parents=True, exist_ok=True)
-    host_config_path.write_text(
-        "\n".join(
-            [
-                "[plugin]",
-                "id = 'host_plugin'",
-                "name = 'Host Plugin'",
-                "type = 'plugin'",
-                "entry = 'tests.fake_mcp:FakeAdapterPlugin'",
-                "",
-                "[plugin_runtime]",
-                "enabled = true",
-                "auto_start = true",
-            ]
-        ),
-        encoding="utf-8",
-    )
-    ext_config_path.write_text(
-        "\n".join(
-            [
-                "[plugin]",
-                "id = 'demo_ext'",
-                "name = 'Demo Extension'",
-                "type = 'extension'",
-                "entry = 'tests.fake_ext:DemoExtRouter'",
-                "",
-                "[plugin.host]",
-                "plugin_id = 'host_plugin'",
-                "prefix = '/demo'",
-                "",
-                "[plugin_runtime]",
-                "enabled = true",
-                "auto_start = true",
-            ]
-        ),
-        encoding="utf-8",
-    )
-
-    plugins_backup = copy.deepcopy(module.state.plugins)
-    hosts_backup = dict(module.state.plugin_hosts)
-    handlers_backup = dict(module.state.event_handlers)
-    cache_backup = copy.deepcopy(module.state._snapshot_cache)
-
-    try:
-        with module.state.acquire_plugins_write_lock():
-            module.state.plugins.clear()
-            module.state.plugins["host_plugin"] = {
-                "id": "host_plugin",
-                "name": "Host Plugin",
-                "type": "plugin",
-                "description": "",
-                "version": "0.1.0",
-                "config_path": str(host_config_path),
-                "entry_point": "tests.fake_mcp:FakeAdapterPlugin",
-                "short_description": "keep me",
-                "keywords": ["host"],
-                "sdk_supported": ">=0.1",
-                "runtime_enabled": True,
-                "runtime_auto_start": True,
-            }
-            module.state.plugins["demo_ext"] = {
-                "id": "demo_ext",
-                "name": "Demo Extension",
-                "type": "extension",
-                "config_path": str(ext_config_path),
-                "entry_point": "tests.fake_ext:DemoExtRouter",
-                "host_plugin_id": "host_plugin",
-                "runtime_enabled": True,
-                "runtime_auto_start": False,
-            }
-        with module.state.acquire_plugin_hosts_write_lock():
-            module.state.plugin_hosts.clear()
-        with module.state.acquire_event_handlers_write_lock():
-            module.state.event_handlers.clear()
-
-        monkeypatch.setattr(module, "PluginProcessHost", _FakeProcessHost)
-        monkeypatch.setattr(module, "_import_plugin_module", lambda *args, **kwargs: SimpleNamespace(FakeAdapterPlugin=_FakeAdapterPlugin))
-        monkeypatch.setattr(module, "emit_lifecycle_event", lambda event: None)
-
-        service = module.PluginLifecycleService()
-        response = await service.start_plugin("host_plugin", refresh_registry=False)
-
-        assert response["success"] is True
-        with module.state.acquire_plugin_hosts_read_lock():
-            host_obj = module.state.plugin_hosts["host_plugin"]
-        assert isinstance(host_obj, _FakeProcessHost)
-        assert host_obj.extension_configs == [
-            {
-                "ext_id": "demo_ext",
-                "ext_entry": "tests.fake_ext:DemoExtRouter",
-                "prefix": "/demo",
-                "config_path": str(ext_config_path.resolve()),
-            }
-        ]
-
-        with module.state.acquire_plugins_read_lock():
-            plugin_meta = dict(module.state.plugins["host_plugin"])
-        assert plugin_meta["short_description"] == "keep me"
-        assert plugin_meta["keywords"] == ["host"]
-        assert plugin_meta["sdk_supported"] == ">=0.1"
-    finally:
-        with module.state.acquire_plugins_write_lock():
-            module.state.plugins.clear()
-            module.state.plugins.update(plugins_backup)
-        with module.state.acquire_plugin_hosts_write_lock():
-            module.state.plugin_hosts.clear()
-            module.state.plugin_hosts.update(hosts_backup)
-        with module.state.acquire_event_handlers_write_lock():
-            module.state.event_handlers.clear()
-            module.state.event_handlers.update(handlers_backup)
-        with module.state._snapshot_cache_lock:
-            module.state._snapshot_cache = cache_backup
-
-
 @pytest.mark.plugin_unit
 def test_parse_single_plugin_config_uses_resolver_effective_config_and_logs_warnings(
     monkeypatch: pytest.MonkeyPatch,
@@ -876,6 +2722,11 @@ async def test_delete_plugin_removes_directory_and_metadata(
     cache_backup = copy.deepcopy(module.state._snapshot_cache)
     refresh_calls: list[str] = []
     events: list[dict[str, object]] = []
+    profiles_root = tmp_path / "profiles"
+    profile_dir = profiles_root / "demo_package"
+    profile_dir.mkdir(parents=True)
+    (profile_dir / "default.toml").write_text("[profile]\n", encoding="utf-8")
+    install_source_manager = _FakeInstallSourceManager(package_id="demo_package")
 
     try:
         with module.state.acquire_plugins_write_lock():
@@ -897,9 +2748,16 @@ async def test_delete_plugin_removes_directory_and_metadata(
             refresh_calls.append("refresh")
             return {"success": True}
 
-        monkeypatch.setattr(module, "PLUGIN_CONFIG_ROOTS", (tmp_path,))
-        monkeypatch.setattr(module.plugin_registry_service, "refresh_registry", _refresh_registry)
+        monkeypatch.setattr(uninstall_module, "PLUGIN_CONFIG_ROOTS", (tmp_path,))
+        monkeypatch.setattr(
+            uninstall_module.plugin_registry_service,
+            "refresh_registry",
+            _refresh_registry,
+        )
         monkeypatch.setattr(module, "emit_lifecycle_event", lambda event: events.append(dict(event)))
+        monkeypatch.setattr(
+            uninstall_module, "get_install_source_manager", lambda: install_source_manager
+        )
 
         service = module.PluginLifecycleService()
         response = await service.delete_plugin("demo_plugin")
@@ -907,8 +2765,12 @@ async def test_delete_plugin_removes_directory_and_metadata(
         assert response["success"] is True
         assert response["plugin_id"] == "demo_plugin"
         assert response["deleted_from_disk"] is True
+        assert response["preference_action"] == "cleared"
+        assert response["runtime_restart"] == "not_needed"
         assert refresh_calls == ["refresh"]
         assert plugin_dir.exists() is False
+        assert profile_dir.exists() is True
+        assert install_source_manager.marked_removed == [plugin_dir]
         with module.state.acquire_plugins_read_lock():
             assert "demo_plugin" not in module.state.plugins
         with module.state.acquire_event_handlers_read_lock():
@@ -926,6 +2788,113 @@ async def test_delete_plugin_removes_directory_and_metadata(
             module.state.event_handlers.update(handlers_backup)
         with module.state._snapshot_cache_lock:
             module.state._snapshot_cache = cache_backup
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
+async def test_delete_plugin_retains_profile_and_restarts_after_code_staging_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    plugin_dir = tmp_path / "running_plugin"
+    config_path = plugin_dir / "plugin.toml"
+    plugin_dir.mkdir(parents=True)
+    config_path.write_text("[plugin]\nid='running_plugin'\nentry='tests.fake:Plugin'\n", encoding="utf-8")
+    profiles_root = tmp_path / "profiles"
+    profile_dir = profiles_root / "running_package"
+    profile_dir.mkdir(parents=True)
+    (profile_dir / "settings.toml").write_text("[settings]\nvalue='keep'\n", encoding="utf-8")
+    install_source_manager = _FakeInstallSourceManager(package_id="running_package")
+    plugins_backup = copy.deepcopy(module.state.plugins)
+    hosts_backup = dict(module.state.plugin_hosts)
+    restart_calls: list[str] = []
+
+    try:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins["running_plugin"] = {
+                "id": "running_plugin",
+                "config_path": str(config_path),
+            }
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+            module.state.plugin_hosts["running_plugin"] = object()
+
+        async def _stop_plugin(self, plugin_id: str, **_kwargs: object) -> dict[str, object]:
+            assert plugin_id == "running_plugin"
+            with module.state.acquire_plugin_hosts_write_lock():
+                module.state.plugin_hosts.pop(plugin_id, None)
+            return {"success": True}
+
+        async def _start_plugin(self, plugin_id: str, **_kwargs: object) -> dict[str, object]:
+            restart_calls.append(plugin_id)
+            return {"success": True}
+
+        def _fail_code_staging(path: Path) -> object:
+            assert path == plugin_dir
+            raise PermissionError("plugin is in use")
+
+        monkeypatch.setattr(uninstall_module, "PLUGIN_CONFIG_ROOTS", (tmp_path,))
+        monkeypatch.setattr(
+            uninstall_module, "get_install_source_manager", lambda: install_source_manager
+        )
+        monkeypatch.setattr(module.PluginLifecycleService, "stop_plugin", _stop_plugin)
+        monkeypatch.setattr(module.PluginLifecycleService, "start_plugin", _start_plugin)
+        monkeypatch.setattr(
+            uninstall_module, "_stage_plugin_code_sync", _fail_code_staging
+        )
+
+        with pytest.raises(ServerDomainError, match="Failed to delete plugin") as captured:
+            await module.PluginLifecycleService().delete_plugin("running_plugin")
+
+        assert captured.value.details["stage"] == "stage_code"
+        assert captured.value.details["filesystem_rollback"] == "not_needed"
+        assert captured.value.details["runtime_restart"] == "succeeded"
+        assert profile_dir.is_dir()
+        assert (profile_dir / "settings.toml").is_file()
+        assert plugin_dir.is_dir()
+        assert config_path.is_file()
+        assert restart_calls == ["running_plugin"]
+        assert install_source_manager.marked_removed == []
+        assert install_source_manager.restored_entries == []
+    finally:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins.update(plugins_backup)
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+            module.state.plugin_hosts.update(hosts_backup)
+
+
+@pytest.mark.plugin_unit
+def test_deferred_profile_cleanup_migrates_legacy_record(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    record_path = tmp_path / "stable" / "package_profile_cleanup.json"
+    legacy_record_path = tmp_path / "legacy" / "package_profile_cleanup.json"
+    staged_dir = tmp_path / "profiles" / (".demo.deleting-" + "a" * 32)
+    staged_dir.mkdir(parents=True)
+    legacy_record_path.parent.mkdir(parents=True)
+    uninstall_module._save_deferred_profile_cleanup_paths_sync(
+        legacy_record_path,
+        [str(staged_dir)],
+    )
+    monkeypatch.setattr(
+        uninstall_module,
+        "_deferred_profile_cleanup_record_path_sync",
+        lambda: record_path,
+    )
+    monkeypatch.setattr(
+        uninstall_module,
+        "_legacy_deferred_profile_cleanup_record_path_sync",
+        lambda: legacy_record_path,
+    )
+
+    assert uninstall_module.retry_deferred_profile_cleanup_sync() == 1
+    assert staged_dir.exists() is False
+    assert legacy_record_path.exists() is False
+    assert record_path.exists() is False
 
 
 @pytest.mark.plugin_unit
@@ -974,10 +2943,18 @@ async def test_delete_plugin_stops_running_host_before_removing(
             stop_calls.append(plugin_id)
             return await original_stop_plugin(self, plugin_id)
 
-        monkeypatch.setattr(module, "PLUGIN_CONFIG_ROOTS", (tmp_path,))
+        monkeypatch.setattr(uninstall_module, "PLUGIN_CONFIG_ROOTS", (tmp_path,))
         monkeypatch.setattr(module.PluginLifecycleService, "stop_plugin", _tracked_stop)
-        monkeypatch.setattr(module.plugin_registry_service, "refresh_registry", _refresh_registry)
+        monkeypatch.setattr(
+            uninstall_module.plugin_registry_service,
+            "refresh_registry",
+            _refresh_registry,
+        )
         monkeypatch.setattr(module, "emit_lifecycle_event", lambda event: None)
+        install_source_manager = _FakeInstallSourceManager(package_id="")
+        monkeypatch.setattr(
+            uninstall_module, "get_install_source_manager", lambda: install_source_manager
+        )
 
         service = module.PluginLifecycleService()
         response = await service.delete_plugin("running_plugin")
@@ -997,218 +2974,6 @@ async def test_delete_plugin_stops_running_host_before_removing(
         with module.state.acquire_event_handlers_write_lock():
             module.state.event_handlers.clear()
             module.state.event_handlers.update(handlers_backup)
-        with module.state._snapshot_cache_lock:
-            module.state._snapshot_cache = cache_backup
-
-
-@pytest.mark.plugin_unit
-@pytest.mark.asyncio
-async def test_delete_extension_disables_runtime_when_host_is_running(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    ext_dir = tmp_path / "demo_ext"
-    config_path = ext_dir / "plugin.toml"
-    ext_dir.mkdir(parents=True, exist_ok=True)
-    config_path.write_text(
-        "\n".join(
-            [
-                "[plugin]",
-                "id = 'demo_ext'",
-                "type = 'extension'",
-                "entry = 'tests.fake_ext:Plugin'",
-                "",
-                "[plugin.host]",
-                "plugin_id = 'host_plugin'",
-            ]
-        ),
-        encoding="utf-8",
-    )
-
-    plugins_backup = copy.deepcopy(module.state.plugins)
-    hosts_backup = dict(module.state.plugin_hosts)
-    handlers_backup = dict(module.state.event_handlers)
-    cache_backup = copy.deepcopy(module.state._snapshot_cache)
-    disabled_calls: list[str] = []
-
-    try:
-        with module.state.acquire_plugins_write_lock():
-            module.state.plugins.clear()
-            module.state.plugins["demo_ext"] = {
-                "id": "demo_ext",
-                "name": "Demo Extension",
-                "type": "extension",
-                "config_path": str(config_path),
-                "entry_point": "tests.fake_ext:Plugin",
-                "host_plugin_id": "host_plugin",
-                "runtime_enabled": True,
-            }
-        with module.state.acquire_plugin_hosts_write_lock():
-            module.state.plugin_hosts.clear()
-            module.state.plugin_hosts["host_plugin"] = _FakeProcessHost(
-                plugin_id="host_plugin",
-                entry_point="tests.fake:Host",
-                config_path=tmp_path / "host_plugin" / "plugin.toml",
-            )
-        with module.state.acquire_event_handlers_write_lock():
-            module.state.event_handlers.clear()
-
-        async def _refresh_registry() -> dict[str, object]:
-            return {"success": True}
-
-        original_disable_extension = module.PluginLifecycleService.disable_extension
-
-        async def _tracked_disable(self, ext_id: str) -> dict[str, object]:
-            disabled_calls.append(ext_id)
-            return await original_disable_extension(self, ext_id)
-
-        monkeypatch.setattr(module, "PLUGIN_CONFIG_ROOTS", (tmp_path,))
-        monkeypatch.setattr(module.PluginLifecycleService, "disable_extension", _tracked_disable)
-        monkeypatch.setattr(module.plugin_registry_service, "refresh_registry", _refresh_registry)
-        monkeypatch.setattr(module, "emit_lifecycle_event", lambda event: None)
-
-        service = module.PluginLifecycleService()
-        response = await service.delete_plugin("demo_ext")
-
-        assert response["success"] is True
-        assert response["host_plugin_id"] == "host_plugin"
-        assert disabled_calls == ["demo_ext"]
-        assert ext_dir.exists() is False
-        with module.state.acquire_plugins_read_lock():
-            assert "demo_ext" not in module.state.plugins
-    finally:
-        with module.state.acquire_plugins_write_lock():
-            module.state.plugins.clear()
-            module.state.plugins.update(plugins_backup)
-        with module.state.acquire_plugin_hosts_write_lock():
-            module.state.plugin_hosts.clear()
-            module.state.plugin_hosts.update(hosts_backup)
-        with module.state.acquire_event_handlers_write_lock():
-            module.state.event_handlers.clear()
-            module.state.event_handlers.update(handlers_backup)
-        with module.state._snapshot_cache_lock:
-            module.state._snapshot_cache = cache_backup
-
-
-@pytest.mark.plugin_unit
-@pytest.mark.asyncio
-async def test_delete_plugin_rejects_host_with_bound_extensions(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    host_dir = tmp_path / "host_plugin"
-    host_config_path = host_dir / "plugin.toml"
-    host_dir.mkdir(parents=True, exist_ok=True)
-    host_config_path.write_text("[plugin]\nid='host_plugin'\nentry='tests.fake:Host'\n", encoding="utf-8")
-
-    plugins_backup = copy.deepcopy(module.state.plugins)
-    hosts_backup = dict(module.state.plugin_hosts)
-    handlers_backup = dict(module.state.event_handlers)
-    cache_backup = copy.deepcopy(module.state._snapshot_cache)
-
-    try:
-        with module.state.acquire_plugins_write_lock():
-            module.state.plugins.clear()
-            module.state.plugins["host_plugin"] = {
-                "id": "host_plugin",
-                "name": "Host Plugin",
-                "type": "plugin",
-                "config_path": str(host_config_path),
-                "entry_point": "tests.fake:Host",
-            }
-            module.state.plugins["demo_ext"] = {
-                "id": "demo_ext",
-                "name": "Demo Extension",
-                "type": "extension",
-                "config_path": str(tmp_path / "demo_ext" / "plugin.toml"),
-                "entry_point": "tests.fake_ext:Plugin",
-                "host_plugin_id": "host_plugin",
-                "runtime_enabled": True,
-            }
-        with module.state.acquire_plugin_hosts_write_lock():
-            module.state.plugin_hosts.clear()
-        with module.state.acquire_event_handlers_write_lock():
-            module.state.event_handlers.clear()
-
-        monkeypatch.setattr(module, "PLUGIN_CONFIG_ROOTS", (tmp_path,))
-
-        service = module.PluginLifecycleService()
-        with pytest.raises(ServerDomainError) as exc_info:
-            await service.delete_plugin("host_plugin")
-
-        assert exc_info.value.code == "PLUGIN_DELETE_BLOCKED_BY_EXTENSIONS"
-        assert exc_info.value.status_code == 409
-        assert "demo_ext" in exc_info.value.message
-        assert host_dir.exists() is True
-    finally:
-        with module.state.acquire_plugins_write_lock():
-            module.state.plugins.clear()
-            module.state.plugins.update(plugins_backup)
-        with module.state.acquire_plugin_hosts_write_lock():
-            module.state.plugin_hosts.clear()
-            module.state.plugin_hosts.update(hosts_backup)
-        with module.state.acquire_event_handlers_write_lock():
-            module.state.event_handlers.clear()
-            module.state.event_handlers.update(handlers_backup)
-        with module.state._snapshot_cache_lock:
-            module.state._snapshot_cache = cache_backup
-
-
-def _seed_extension(config_path: Path, host_plugin_id: str = "host_plugin") -> None:
-    with module.state.acquire_plugins_write_lock():
-        module.state.plugins.clear()
-        module.state.plugins["demo_ext"] = {
-            "id": "demo_ext",
-            "name": "Demo Extension",
-            "type": "extension",
-            "config_path": str(config_path),
-            "entry_point": "tests.fake_ext:Plugin",
-            "host_plugin_id": host_plugin_id,
-            "runtime_enabled": True,
-        }
-    with module.state.acquire_plugin_hosts_write_lock():
-        module.state.plugin_hosts.clear()
-        module.state.plugin_hosts[host_plugin_id] = _FakeProcessHost(
-            plugin_id=host_plugin_id,
-            entry_point="tests.fake:Host",
-            config_path=config_path.parent.parent / host_plugin_id / "plugin.toml",
-        )
-
-
-@pytest.mark.plugin_unit
-@pytest.mark.asyncio
-async def test_disable_and_enable_extension_persist_runtime_override(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    _isolate_runtime_overrides: dict,
-) -> None:
-    config_path = tmp_path / "demo_ext" / "plugin.toml"
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.write_text("[plugin]\nid='demo_ext'\n", encoding="utf-8")
-
-    plugins_backup = copy.deepcopy(module.state.plugins)
-    hosts_backup = dict(module.state.plugin_hosts)
-    cache_backup = copy.deepcopy(module.state._snapshot_cache)
-
-    try:
-        _seed_extension(config_path)
-        monkeypatch.setattr(module, "emit_lifecycle_event", lambda event: None)
-
-        service = module.PluginLifecycleService()
-        await service.disable_extension("demo_ext")
-        assert _isolate_runtime_overrides == {"demo_ext": False}
-        assert runtime_overrides_module.get_runtime_override("demo_ext") is False
-
-        await service.enable_extension("demo_ext")
-        assert _isolate_runtime_overrides == {"demo_ext": True}
-        assert runtime_overrides_module.get_runtime_override("demo_ext") is True
-    finally:
-        with module.state.acquire_plugins_write_lock():
-            module.state.plugins.clear()
-            module.state.plugins.update(plugins_backup)
-        with module.state.acquire_plugin_hosts_write_lock():
-            module.state.plugin_hosts.clear()
-            module.state.plugin_hosts.update(hosts_backup)
         with module.state._snapshot_cache_lock:
             module.state._snapshot_cache = cache_backup
 
@@ -1254,9 +3019,17 @@ async def test_delete_plugin_clears_runtime_override(
         async def _refresh_registry() -> dict[str, object]:
             return {"success": True}
 
-        monkeypatch.setattr(module, "PLUGIN_CONFIG_ROOTS", (tmp_path,))
-        monkeypatch.setattr(module.plugin_registry_service, "refresh_registry", _refresh_registry)
+        monkeypatch.setattr(uninstall_module, "PLUGIN_CONFIG_ROOTS", (tmp_path,))
+        monkeypatch.setattr(
+            uninstall_module.plugin_registry_service,
+            "refresh_registry",
+            _refresh_registry,
+        )
         monkeypatch.setattr(module, "emit_lifecycle_event", lambda event: None)
+        install_source_manager = _FakeInstallSourceManager(package_id="")
+        monkeypatch.setattr(
+            uninstall_module, "get_install_source_manager", lambda: install_source_manager
+        )
 
         service = module.PluginLifecycleService()
         await service.delete_plugin("demo_plugin")
@@ -1300,6 +3073,75 @@ def _seed_running_plugin(plugin_id: str, config_path: Path) -> None:
 
 @pytest.mark.plugin_unit
 @pytest.mark.asyncio
+async def test_concurrent_stops_do_not_teardown_the_same_host_twice(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    shutdown_calls = 0
+
+    class _WaitingHost(_FakeProcessHost):
+        async def shutdown(
+            self, timeout: float = module.PLUGIN_SHUTDOWN_TIMEOUT
+        ) -> None:
+            nonlocal shutdown_calls
+            shutdown_calls += 1
+            entered.set()
+            await release.wait()
+
+    # stop_plugin() pops the host and therefore calls
+    # state.invalidate_snapshot_cache("hosts"), so the snapshot cache is
+    # mutated global state this test has to hand back. pytest-randomly means
+    # the victim of a leak is whatever happens to run next, so restore the
+    # same four things every other test in this file restores.
+    plugins_backup = copy.deepcopy(module.state.plugins)
+    hosts_backup = dict(module.state.plugin_hosts)
+    handlers_backup = dict(module.state.event_handlers)
+    cache_backup = copy.deepcopy(module.state._snapshot_cache)
+    try:
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+            module.state.plugin_hosts["demo_plugin"] = _WaitingHost(
+                plugin_id="demo_plugin",
+                entry_point="tests.fake:Plugin",
+                config_path=tmp_path / "demo_plugin" / "plugin.toml",
+            )
+        with module.state.acquire_event_handlers_write_lock():
+            module.state.event_handlers.clear()
+
+        monkeypatch.setattr(module, "emit_lifecycle_event", lambda event: None)
+
+        service = module.PluginLifecycleService()
+        first = asyncio.create_task(service.stop_plugin("demo_plugin"))
+        await entered.wait()
+        second = asyncio.create_task(service.stop_plugin("demo_plugin"))
+        await asyncio.sleep(0.05)
+
+        assert shutdown_calls == 1
+
+        release.set()
+        assert (await first)["success"] is True
+        with pytest.raises(ServerDomainError) as exc_info:
+            await second
+        assert exc_info.value.code == "PLUGIN_NOT_RUNNING"
+    finally:
+        release.set()
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins.update(plugins_backup)
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+            module.state.plugin_hosts.update(hosts_backup)
+        with module.state.acquire_event_handlers_write_lock():
+            module.state.event_handlers.clear()
+            module.state.event_handlers.update(handlers_backup)
+        with module.state._snapshot_cache_lock:
+            module.state._snapshot_cache = cache_backup
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
 async def test_stop_plugin_persist_user_intent_writes_runtime_override(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1317,11 +3159,16 @@ async def test_stop_plugin_persist_user_intent_writes_runtime_override(
     try:
         _seed_running_plugin("demo_plugin", config_path)
         monkeypatch.setattr(module, "emit_lifecycle_event", lambda event: None)
+        # Legacy opt-in (NEKO_PLUGIN_SYNC_AUTO_START_ON_TOGGLE=1).
+        monkeypatch.setattr(module, "PLUGIN_SYNC_AUTO_START_ON_TOGGLE", True)
 
         service = module.PluginLifecycleService()
         await service.stop_plugin("demo_plugin", persist_user_intent=True)
-        assert _isolate_runtime_overrides == {"demo_plugin": False}
+        assert _isolate_runtime_overrides == {
+            "demo_plugin": {"enabled": False, "auto_start": False},
+        }
         assert runtime_overrides_module.get_runtime_override("demo_plugin") is False
+        assert runtime_overrides_module.get_runtime_auto_start_override("demo_plugin") is False
     finally:
         with module.state.acquire_plugins_write_lock():
             module.state.plugins.clear()
@@ -1373,3 +3220,956 @@ async def test_stop_plugin_internal_call_does_not_touch_override(
             module.state.event_handlers.update(handlers_backup)
         with module.state._snapshot_cache_lock:
             module.state._snapshot_cache = cache_backup
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
+async def test_stop_plugin_can_leave_auto_start_unchanged_when_sync_is_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    _isolate_runtime_overrides: dict,
+) -> None:
+    config_path = tmp_path / "demo_plugin" / "plugin.toml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text("[plugin]\nid='demo_plugin'\n", encoding="utf-8")
+
+    plugins_backup = copy.deepcopy(module.state.plugins)
+    hosts_backup = dict(module.state.plugin_hosts)
+    handlers_backup = dict(module.state.event_handlers)
+    cache_backup = copy.deepcopy(module.state._snapshot_cache)
+
+    try:
+        _seed_running_plugin("demo_plugin", config_path)
+        runtime_overrides_module.set_runtime_override(
+            "demo_plugin",
+            True,
+            auto_start=True,
+        )
+        monkeypatch.setattr(module, "PLUGIN_SYNC_AUTO_START_ON_TOGGLE", False)
+        monkeypatch.setattr(module, "emit_lifecycle_event", lambda event: None)
+
+        await module.PluginLifecycleService().stop_plugin(
+            "demo_plugin",
+            persist_user_intent=True,
+        )
+
+        assert _isolate_runtime_overrides == {
+            "demo_plugin": {"enabled": True, "auto_start": True},
+        }
+    finally:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins.update(plugins_backup)
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+            module.state.plugin_hosts.update(hosts_backup)
+        with module.state.acquire_event_handlers_write_lock():
+            module.state.event_handlers.clear()
+            module.state.event_handlers.update(handlers_backup)
+        with module.state._snapshot_cache_lock:
+            module.state._snapshot_cache = cache_backup
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
+async def test_stop_plugin_returns_partial_success_on_preference_write_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "demo_plugin" / "plugin.toml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text("[plugin]\nid='demo_plugin'\n", encoding="utf-8")
+
+    plugins_backup = copy.deepcopy(module.state.plugins)
+    hosts_backup = dict(module.state.plugin_hosts)
+    handlers_backup = dict(module.state.event_handlers)
+    cache_backup = copy.deepcopy(module.state._snapshot_cache)
+
+    try:
+        _seed_running_plugin("demo_plugin", config_path)
+        monkeypatch.setattr(module, "emit_lifecycle_event", lambda event: None)
+        # Only the legacy sync mode persists anything on a manual stop.
+        monkeypatch.setattr(module, "PLUGIN_SYNC_AUTO_START_ON_TOGGLE", True)
+        monkeypatch.setattr(
+            module,
+            "set_runtime_override",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                runtime_overrides_module.RuntimeOverrideWriteError("disk full")
+            ),
+        )
+
+        response = await module.PluginLifecycleService().stop_plugin(
+            "demo_plugin",
+            persist_user_intent=True,
+        )
+
+        assert response["success"] is True
+        assert response["partial_success"] is True
+        assert response["preference_persisted"] is False
+        assert response["runtime_state_changed"] is True
+        assert response["preference_error"] == {
+            "code": "PLUGIN_RUNTIME_PREFERENCE_PERSIST_FAILED",
+            "error_type": "RuntimeOverrideWriteError",
+        }
+        with module.state.acquire_plugin_hosts_read_lock():
+            assert "demo_plugin" not in module.state.plugin_hosts
+    finally:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins.update(plugins_backup)
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+            module.state.plugin_hosts.update(hosts_backup)
+        with module.state.acquire_event_handlers_write_lock():
+            module.state.event_handlers.clear()
+            module.state.event_handlers.update(handlers_backup)
+        with module.state._snapshot_cache_lock:
+            module.state._snapshot_cache = cache_backup
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
+async def test_start_plugin_checks_python_requirements_off_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Dependency gates perform real disk I/O and must not occupy the event loop.
+
+    Listing every vendor/ dist-info then reading each METADATA took 0.31s on cold Windows reads
+    (200 distributions), rising to 0.97s (600). On the loop thread, the whole server
+    cannot answer requests during that time. This guard checks the executing thread, not merely execution.
+    """
+    config_path = tmp_path / "vendor_adapter" / "plugin.toml"
+    vendor_dir = config_path.parent / "vendor"
+    vendor_dir.mkdir(parents=True)
+    config_path.write_text(
+        "\n".join(
+            [
+                "[plugin]",
+                "id = 'vendor_adapter'",
+                "name = 'Vendor Adapter'",
+                "type = 'adapter'",
+                "entry = 'tests.fake_mcp:FakeAdapterPlugin'",
+                "",
+                "[plugin_runtime]",
+                "enabled = true",
+                "auto_start = false",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (config_path.parent / "pyproject.toml").write_text(
+        '[project]\ndependencies = ["demo-lib>=2"]\n',
+        encoding="utf-8",
+    )
+
+    loop_thread = threading.current_thread()
+    seen: dict[str, object] = {}
+
+    def _fake_find_missing(requirements, *, search_paths=None):
+        seen["thread"] = threading.current_thread()
+        seen["requirements"] = list(requirements)
+        seen["search_paths"] = list(search_paths or [])
+        # The returned name **intentionally differs from the declared name**: the gate must read the checker's verdict,
+        # not the plugin's own declaration. Both are nonempty, so merely asserting an error cannot distinguish
+        # swapped unpacking order, which reports the declared list as missing, telling the user
+        # to install a package already installed (revealed by a surviving mutation).
+        return ["missing-pkg>=9"]
+
+    monkeypatch.setattr(module.plugin_registry_service, "refresh_plugin", lambda _plugin_id: {"success": True})
+    monkeypatch.setattr(module, "_get_plugin_config_path", lambda _plugin_id: config_path)
+    monkeypatch.setattr(
+        module,
+        "resolve_plugin_config_from_path",
+        lambda *args, **kwargs: {
+            "effective_config": kwargs["base_config"],
+            "warnings": [],
+        },
+    )
+    monkeypatch.setattr(module, "_resolve_plugin_id_conflict", lambda *args, **kwargs: args[0])
+    monkeypatch.setattr(module, "_find_missing_python_requirements", _fake_find_missing)
+    monkeypatch.setattr(module, "create_plugin_host", _FakeProcessHost)
+    monkeypatch.setattr(module, "scan_plugin_metadata_isolated", _metadata_scan_for(_FakeAdapterPlugin))
+    monkeypatch.setattr(module, "emit_lifecycle_event", lambda event: None)
+
+    plugins_backup = copy.deepcopy(module.state.plugins)
+    hosts_backup = dict(module.state.plugin_hosts)
+    try:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+
+        with pytest.raises(ServerDomainError) as exc_info:
+            await module.PluginLifecycleService().start_plugin(
+                "vendor_adapter", refresh_registry=False
+            )
+
+        assert exc_info.value.code == "PLUGIN_PYTHON_DEPENDENCIES_MISSING"
+        assert "missing-pkg>=9" in str(exc_info.value)
+        assert seen["requirements"] == ["demo-lib>=2"]
+        assert seen["search_paths"] == [vendor_dir]
+        assert seen["thread"] is not loop_thread
+    finally:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins.update(plugins_backup)
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+            module.state.plugin_hosts.update(hosts_backup)
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize("schema_version", ["current", 3])
+async def test_start_plugin_scans_once_when_the_packaged_schema_is_stale(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    schema_version: int,
+) -> None:
+    """A stale ``plugin.meta.json`` sends ``start_plugin`` through the worker.
+
+    Schema 3 handlers are truncated and are refused by the reader; the fallback
+    that turns that refusal into one isolated scan lives in ``start_plugin``,
+    not in the reader. A current artifact must still start without any scan.
+
+    Mutation: drop the ``isolated_metadata is None`` branch from ``start_plugin``.
+    """
+    import json
+    import tomllib
+
+    from plugin.server.infrastructure import packaged_metadata
+
+    if schema_version == "current":
+        schema_version = packaged_metadata.PACKAGED_METADATA_SCHEMA_VERSION
+    current = schema_version == packaged_metadata.PACKAGED_METADATA_SCHEMA_VERSION
+    plugin_dir = tmp_path / "packaged_adapter"
+    plugin_dir.mkdir(parents=True)
+    config_path = plugin_dir / "plugin.toml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "[plugin]",
+                "id = 'packaged_adapter'",
+                "name = 'Packaged Adapter'",
+                "type = 'adapter'",
+                "entry = 'tests.fake_mcp:FakeAdapterPlugin'",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    conf = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    handler = {"event_type": "plugin_entry", "id": "list_servers", "name": "List Servers"}
+    payload = {
+        "schema_version": schema_version,
+        "sdk_version": packaged_metadata.SDK_VERSION,
+        "source_sha256": packaged_metadata.compute_source_sha256(plugin_dir),
+        "source_files": packaged_metadata.source_file_names(plugin_dir)[0],
+        "source_bytes": packaged_metadata.source_stat_summary(plugin_dir).total_bytes,
+        "build_env": packaged_metadata.build_environment(),
+        "entries": [{"id": "list_servers", "name": "List Servers"}],
+        "handlers": {
+            "packaged_adapter.list_servers": handler,
+            "packaged_adapter:plugin_entry:list_servers": handler,
+        },
+        "entry_methods": {"list_servers": "list_servers"},
+        "entries_config_sha256": packaged_metadata.entries_config_digest(conf, conf["plugin"]),
+    }
+    (plugin_dir / packaged_metadata.PACKAGED_METADATA_FILENAME).write_text(
+        json.dumps(payload), encoding="utf-8"
+    )
+
+    plugins_backup = copy.deepcopy(module.state.plugins)
+    hosts_backup = dict(module.state.plugin_hosts)
+    handlers_backup = dict(module.state.event_handlers)
+    cache_backup = copy.deepcopy(module.state._snapshot_cache)
+
+    try:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins["packaged_adapter"] = {
+                "id": "packaged_adapter",
+                "name": "Packaged Adapter",
+                "type": "adapter",
+                "config_path": str(config_path),
+                "entry_point": "tests.fake_mcp:FakeAdapterPlugin",
+            }
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+        with module.state.acquire_event_handlers_write_lock():
+            module.state.event_handlers.clear()
+
+        monkeypatch.setattr(
+            module,
+            "resolve_plugin_config_from_path",
+            lambda *args, **kwargs: {
+                "effective_config": kwargs["base_config"],
+                "warnings": [],
+            },
+        )
+        monkeypatch.setattr(module, "_resolve_plugin_id_conflict", lambda *args, **kwargs: args[0])
+        monkeypatch.setattr(module, "create_plugin_host", _FakeProcessHost)
+        inner_scan = _metadata_scan_for(_FakeAdapterPlugin)
+        scans: list[str] = []
+        scanned_handler = dict(handler, name="Scanned")
+
+        def _recording_scan(**kwargs):
+            scans.append(str(kwargs["plugin_id"]))
+            kwargs.pop("timeout", None)
+            scanned = inner_scan(**kwargs)
+            # Scan results differ from the package copy by one name, revealing which version is ultimately registered.
+            return IsolatedPluginMetadata(
+                entries_preview=scanned.entries_preview,
+                handlers={"packaged_adapter.list_servers": scanned_handler},
+                entry_methods={"list_servers": "list_servers"},
+            )
+
+        monkeypatch.setattr(module, "scan_plugin_metadata_isolated", _recording_scan)
+        monkeypatch.setattr(module, "emit_lifecycle_event", lambda event: None)
+
+        response = await module.PluginLifecycleService().start_plugin(
+            "packaged_adapter", refresh_registry=False,
+        )
+
+        assert response["success"] is True
+        registered = module.state.event_handlers["packaged_adapter.list_servers"].meta
+        if current:
+            assert scans == [], "当前 schema 的包不该再起隔离扫描"
+            assert registered.name == "List Servers", "注册的不是包里那份 handler"
+        else:
+            assert scans == ["packaged_adapter"], (
+                f"过期 schema 的包应该恰好回落扫描一次：{scans}"
+            )
+            assert registered.name == "Scanned", "扫描结果没有被应用到注册表"
+    finally:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins.update(plugins_backup)
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+            module.state.plugin_hosts.update(hosts_backup)
+        with module.state.acquire_event_handlers_write_lock():
+            module.state.event_handlers.clear()
+            module.state.event_handlers.update(handlers_backup)
+        with module.state._snapshot_cache_lock:
+            module.state._snapshot_cache = cache_backup
+
+
+def _write_stale_package(plugin_dir: Path, *, schema_version: object, handler: dict) -> Path:
+    """A plugin.meta.json that matches this tree except for its schema version."""
+    import json
+
+    from plugin.server.infrastructure import packaged_metadata
+
+    config_path = plugin_dir / "plugin.toml"
+    payload = {
+        "schema_version": schema_version,
+        "sdk_version": packaged_metadata.SDK_VERSION,
+        "source_sha256": packaged_metadata.compute_source_sha256(plugin_dir),
+        "source_files": packaged_metadata.source_file_names(plugin_dir)[0],
+        "source_bytes": packaged_metadata.source_stat_summary(plugin_dir).total_bytes,
+        "build_env": packaged_metadata.build_environment(),
+        "entries": [{"id": "list_servers", "name": "List Servers"}],
+        "handlers": {"packaged_adapter.list_servers": handler},
+        "entry_methods": {"list_servers": "list_servers"},
+        "entries_config_sha256": packaged_metadata.entries_config_digest({}, {}),
+    }
+    meta_path = plugin_dir / packaged_metadata.PACKAGED_METADATA_FILENAME
+    meta_path.write_text(json.dumps(payload), encoding="utf-8")
+    return config_path
+
+
+async def _start_packaged_adapter(
+    monkeypatch, config_path: Path, *, scanned_handler: dict, effective_overlay: dict | None = None,
+    runtime_id: str = "packaged_adapter", scan_side_effect=None, start_deadline: float | None = None,
+) -> list[str]:
+    """Run start_plugin against a fake host and return the plugin ids that were scanned."""
+    with module.state.acquire_plugins_write_lock():
+        module.state.plugins.clear()
+        module.state.plugins["packaged_adapter"] = {
+            "id": "packaged_adapter",
+            "name": "Packaged Adapter",
+            "type": "adapter",
+            "config_path": str(config_path),
+            "entry_point": "tests.fake_mcp:FakeAdapterPlugin",
+        }
+    with module.state.acquire_plugin_hosts_write_lock():
+        module.state.plugin_hosts.clear()
+    with module.state.acquire_event_handlers_write_lock():
+        module.state.event_handlers.clear()
+    monkeypatch.setattr(
+        module,
+        "resolve_plugin_config_from_path",
+        lambda *args, **kwargs: {
+            "effective_config": {**kwargs["base_config"], **(effective_overlay or {})},
+            "warnings": [],
+        },
+    )
+    monkeypatch.setattr(module, "_resolve_plugin_id_conflict", lambda *args, **kwargs: runtime_id)
+    monkeypatch.setattr(module, "create_plugin_host", _FakeProcessHost)
+    monkeypatch.setattr(module, "emit_lifecycle_event", lambda event: None)
+    inner_scan = _metadata_scan_for(_FakeAdapterPlugin)
+    scans: list[str] = []
+
+    def _recording_scan(**kwargs):
+        scans.append(str(kwargs["plugin_id"]))
+        kwargs.pop("timeout", None)
+        if scan_side_effect is not None:
+            scan_side_effect()
+        scanned = inner_scan(**kwargs)
+        return IsolatedPluginMetadata(
+            entries_preview=scanned.entries_preview,
+            handlers={f"{runtime_id}.list_servers": scanned_handler},
+            entry_methods={"list_servers": "list_servers"},
+        )
+
+    monkeypatch.setattr(module, "scan_plugin_metadata_isolated", _recording_scan)
+    response = await module.PluginLifecycleService().start_plugin(
+        "packaged_adapter", refresh_registry=False, start_deadline=start_deadline,
+    )
+    assert response["success"] is True
+    return scans
+
+
+@pytest.fixture
+def _isolated_plugin_state():
+    plugins_backup = copy.deepcopy(module.state.plugins)
+    hosts_backup = dict(module.state.plugin_hosts)
+    handlers_backup = dict(module.state.event_handlers)
+    cache_backup = copy.deepcopy(module.state._snapshot_cache)
+    try:
+        yield
+    finally:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins.update(plugins_backup)
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+            module.state.plugin_hosts.update(hosts_backup)
+        with module.state.acquire_event_handlers_write_lock():
+            module.state.event_handlers.clear()
+            module.state.event_handlers.update(handlers_backup)
+        with module.state._snapshot_cache_lock:
+            module.state._snapshot_cache = cache_backup
+
+
+def _packaged_adapter_dir(tmp_path: Path) -> Path:
+    plugin_dir = tmp_path / "packaged_adapter"
+    plugin_dir.mkdir(parents=True)
+    (plugin_dir / "plugin.toml").write_text(
+        "\n".join(
+            [
+                "[plugin]",
+                "id = 'packaged_adapter'",
+                "name = 'Packaged Adapter'",
+                "type = 'adapter'",
+                "entry = 'tests.fake_mcp:FakeAdapterPlugin'",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return plugin_dir
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
+async def test_a_stale_package_is_upgraded_in_place_by_its_first_start(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _isolated_plugin_state,
+) -> None:
+    """One scan, then the fast path — instead of one scan per start forever.
+
+    A schema bump refuses every package built before it. Nothing rewrote the
+    file, so a plugin whose author never repackages paid an isolated import on
+    every start. The start path has just imported the tree; what it learned is
+    what the packager would have written.
+
+    Mutation: drop the ``_refresh_scanned_packaged_metadata`` call.
+    """
+    import json
+
+    from plugin.server.infrastructure import packaged_metadata
+
+    plugin_dir = _packaged_adapter_dir(tmp_path)
+    old_handler = {"event_type": "plugin_entry", "id": "list_servers", "name": "Old"}
+    config_path = _write_stale_package(plugin_dir, schema_version=3, handler=old_handler)
+    scanned = {"event_type": "plugin_entry", "id": "list_servers", "name": "Scanned", "timeout": 7}
+
+    scans = await _start_packaged_adapter(monkeypatch, config_path, scanned_handler=scanned)
+    assert scans == ["packaged_adapter"]
+
+    meta_path = plugin_dir / packaged_metadata.PACKAGED_METADATA_FILENAME
+    written = json.loads(meta_path.read_text(encoding="utf-8"))
+    assert written["schema_version"] == packaged_metadata.PACKAGED_METADATA_SCHEMA_VERSION
+    assert written["handlers"]["packaged_adapter.list_servers"] == scanned
+    assert written["entries"][0]["id"] == "list_servers"
+    # The reader must accept written files unchanged so the next startup really skips scanning.
+    packaged = packaged_metadata.read_packaged_metadata(plugin_dir)
+    assert packaged is not None
+    assert packaged.handlers["packaged_adapter.list_servers"]["name"] == "Scanned"
+    manifest = {"plugin": {"id": "packaged_adapter"}}
+    reused = module._read_packaged_isolated_metadata(
+        config_path, "packaged_adapter", conf=manifest, pdata=manifest["plugin"],
+    )
+    assert reused is not None
+    assert reused.handlers["packaged_adapter.list_servers"]["timeout"] == 7
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", [
+    "no_file", "current_schema", "config_overrides", "unwritable", "renamed",
+    "import_mutates_tree", "reload_budget",
+])
+async def test_a_scan_does_not_write_metadata_it_has_no_business_writing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _isolated_plugin_state, reason,
+) -> None:
+    """The upgrade is for a stale file, nothing else.
+
+    No file means a hand-dropped or dev-mode plugin, which never had one and
+    must not start growing one. A current-schema file that was refused for
+    another reason (a foreign build environment here) is not fixed by a
+    rewrite. An effective configuration that overrides the entries table would
+    freeze one machine's overrides into the package. A directory the host
+    cannot write to is not a failed start. A plugin renamed by an id
+    conflict scans handler keys under the runtime id, which must not land in
+    the package of the manifest id (coderabbit). An import that changes its
+    own tree leaves handlers and fingerprint describing different states, the
+    case the packager refuses too (codex). And under a reload_all deadline the
+    optional work is skipped rather than charged to the round (codex).
+    """
+    from plugin.server.infrastructure import packaged_metadata
+
+    plugin_dir = _packaged_adapter_dir(tmp_path)
+    meta_path = plugin_dir / packaged_metadata.PACKAGED_METADATA_FILENAME
+    old_handler = {"event_type": "plugin_entry", "id": "list_servers", "name": "Old"}
+    scanned = {"event_type": "plugin_entry", "id": "list_servers", "name": "Scanned"}
+    conf_overlay = None
+    if reason == "no_file":
+        config_path = plugin_dir / "plugin.toml"
+    elif reason == "current_schema":
+        config_path = _write_stale_package(
+            plugin_dir, schema_version=packaged_metadata.PACKAGED_METADATA_SCHEMA_VERSION,
+            handler=old_handler,
+        )
+        monkeypatch.setattr(packaged_metadata, "_environment_matches", lambda raw: False)
+    elif reason == "config_overrides":
+        config_path = _write_stale_package(plugin_dir, schema_version=3, handler=old_handler)
+        conf_overlay = {"entries": [{"id": "list_servers", "timeout": 5}]}
+    elif reason == "unwritable":
+        config_path = _write_stale_package(plugin_dir, schema_version=3, handler=old_handler)
+
+        def _refuse(*args, **kwargs):
+            raise PermissionError("read-only plugin directory")
+
+        monkeypatch.setattr(packaged_metadata, "atomic_write_bytes", _refuse)
+    else:
+        config_path = _write_stale_package(plugin_dir, schema_version=3, handler=old_handler)
+    before = meta_path.read_bytes() if meta_path.exists() else None
+
+    def _import_writes_a_cache_file():
+        (plugin_dir / "cache.json").write_text("{}", encoding="utf-8")
+
+    scans = await _start_packaged_adapter(
+        monkeypatch, config_path, scanned_handler=scanned, effective_overlay=conf_overlay,
+        runtime_id="packaged_adapter_1" if reason == "renamed" else "packaged_adapter",
+        scan_side_effect=_import_writes_a_cache_file if reason == "import_mutates_tree" else None,
+        start_deadline=time.monotonic() + 20.0 if reason == "reload_budget" else None,
+    )
+    assert scans == ["packaged_adapter_1" if reason == "renamed" else "packaged_adapter"]
+    if before is None:
+        assert not meta_path.exists(), "没有元数据文件的插件不该被凭空造出一份"
+    elif reason == "config_overrides":
+        assert meta_path.read_bytes() == before, "生效配置改过 entries 表，不能把这台机器的覆盖冻进包里"
+    elif reason == "unwritable":
+        assert meta_path.read_bytes() == before
+    else:
+        assert meta_path.read_bytes() == before, "当前 schema 的文件被拒是别的原因，重写修不了它"
+
+
+def _backup_lifecycle_state():
+    return (
+        copy.deepcopy(module.state.plugins),
+        dict(module.state.plugin_hosts),
+        dict(module.state.event_handlers),
+        copy.deepcopy(module.state._snapshot_cache),
+    )
+
+
+def _restore_lifecycle_state(plugins_backup, hosts_backup, handlers_backup, cache_backup) -> None:
+    with module.state.acquire_plugins_write_lock():
+        module.state.plugins.clear()
+        module.state.plugins.update(plugins_backup)
+    with module.state.acquire_plugin_hosts_write_lock():
+        module.state.plugin_hosts.clear()
+        module.state.plugin_hosts.update(hosts_backup)
+    with module.state.acquire_event_handlers_write_lock():
+        module.state.event_handlers.clear()
+        module.state.event_handlers.update(handlers_backup)
+    with module.state._snapshot_cache_lock:
+        module.state._snapshot_cache = cache_backup
+
+
+def _demo_config(tmp_path: Path) -> Path:
+    config_path = tmp_path / "demo_plugin" / "plugin.toml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text("[plugin]\nid='demo_plugin'\n", encoding="utf-8")
+    return config_path
+
+
+@pytest.mark.plugin_unit
+def test_sync_auto_start_on_toggle_defaults_to_false(monkeypatch: pytest.MonkeyPatch) -> None:
+    import runpy
+
+    import plugin.settings as settings_module
+
+    # Exercise the import-time default without redefining shared exceptions.
+    with monkeypatch.context() as patch:
+        patch.delenv("NEKO_PLUGIN_SYNC_AUTO_START_ON_TOGGLE", raising=False)
+        assert runpy.run_path(settings_module.__file__)["PLUGIN_SYNC_AUTO_START_ON_TOGGLE"] is False
+        patch.setenv("NEKO_PLUGIN_SYNC_AUTO_START_ON_TOGGLE", "1")
+        assert runpy.run_path(settings_module.__file__)["PLUGIN_SYNC_AUTO_START_ON_TOGGLE"] is True
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.parametrize(
+    ("sync_enabled", "enabled", "expected"),
+    [
+        (False, True, {"enabled": True, "auto_start": False}),
+        # A default manual stop persists nothing: the seed stays as it was.
+        (False, False, {"enabled": True, "auto_start": True}),
+        (True, True, {"enabled": True, "auto_start": True}),
+        (True, False, {"enabled": False, "auto_start": False}),
+    ],
+    ids=("default-start", "default-stop", "env-start", "env-stop"),
+)
+def test_manual_toggle_auto_start_follows_sync_flag(
+    monkeypatch: pytest.MonkeyPatch,
+    _isolate_runtime_overrides: dict,
+    sync_enabled: bool,
+    enabled: bool,
+    expected: dict[str, bool],
+) -> None:
+    # Seed the opposite auto_start so any rewrite is visible.
+    runtime_overrides_module.set_runtime_override(
+        "demo_plugin", not enabled, auto_start=not enabled
+    )
+    monkeypatch.setattr(module, "PLUGIN_SYNC_AUTO_START_ON_TOGGLE", sync_enabled)
+    monkeypatch.setattr(module, "clear_autostart_pending", lambda _plugin_id: True)
+
+    persisted = module._persist_user_runtime_intent("demo_plugin", enabled)
+
+    assert persisted is (enabled or sync_enabled)
+    assert _isolate_runtime_overrides == {"demo_plugin": expected}
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
+async def test_stop_plugin_leaves_auto_start_unchanged_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    _isolate_runtime_overrides: dict,
+) -> None:
+    config_path = _demo_config(tmp_path)
+    backup = _backup_lifecycle_state()
+    try:
+        _seed_running_plugin("demo_plugin", config_path)
+        runtime_overrides_module.set_runtime_override("demo_plugin", True, auto_start=True)
+        monkeypatch.setattr(module, "emit_lifecycle_event", lambda event: None)
+        # Pin the default mode so NEKO_PLUGIN_SYNC_AUTO_START_ON_TOGGLE in the
+        # environment cannot flip this test.
+        monkeypatch.setattr(module, "PLUGIN_SYNC_AUTO_START_ON_TOGGLE", False)
+
+        response = await module.PluginLifecycleService().stop_plugin(
+            "demo_plugin", persist_user_intent=True
+        )
+
+        assert response["preference_persisted"] is False
+        # Nothing is persisted, so the next launch still autostarts it.
+        assert _isolate_runtime_overrides == {
+            "demo_plugin": {"enabled": True, "auto_start": True},
+        }
+    finally:
+        _restore_lifecycle_state(*backup)
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize("auto_start", [True, False])
+@pytest.mark.parametrize("has_enabled_override", [True, False])
+async def test_set_plugin_auto_start_keeps_process_and_unblocks_next_launch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    _isolate_runtime_overrides: dict,
+    auto_start: bool,
+    has_enabled_override: bool,
+) -> None:
+    config_path = _demo_config(tmp_path)
+    backup = _backup_lifecycle_state()
+    try:
+        _seed_running_plugin("demo_plugin", config_path)
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins["demo_plugin"]["runtime_enabled"] = False
+            module.state.plugins["demo_plugin"]["runtime_auto_start"] = not auto_start
+        if has_enabled_override:
+            runtime_overrides_module.set_runtime_override("demo_plugin", False)
+        with module.state.acquire_plugin_hosts_read_lock():
+            host = module.state.plugin_hosts["demo_plugin"]
+
+        pending_calls: list[str] = []
+
+        def _clear_pending(plugin_id: str) -> bool:
+            pending_calls.append(plugin_id)
+            return True
+
+        monkeypatch.setattr(module, "clear_autostart_pending", _clear_pending)
+        monkeypatch.setattr(module, "is_autostart_approved", lambda _plugin_id, **_kwargs: False)
+
+        async def _must_not_run(*_args, **_kwargs):
+            raise AssertionError("auto-start toggle must not start or stop the plugin")
+
+        service = module.PluginLifecycleService()
+        monkeypatch.setattr(service, "start_plugin", _must_not_run)
+        monkeypatch.setattr(service, "stop_plugin", _must_not_run)
+
+        response = await service.set_plugin_auto_start("demo_plugin", auto_start)
+
+        assert response["success"] is True
+        assert response["auto_start"] is auto_start
+        # Turning auto-start on lifts the enabled=false a stop left behind and
+        # the pending approval, or the next launch would still skip it.
+        assert _isolate_runtime_overrides == {
+            "demo_plugin": {
+                **({"enabled": auto_start} if has_enabled_override or auto_start else {}),
+                "auto_start": auto_start,
+            },
+        }
+        assert pending_calls == (["demo_plugin"] if auto_start else [])
+        with module.state.acquire_plugin_hosts_read_lock():
+            assert module.state.plugin_hosts.get("demo_plugin") is host
+        with module.state.acquire_plugins_read_lock():
+            meta = module.state.plugins["demo_plugin"]
+            assert meta["runtime_auto_start"] is auto_start
+            assert meta["runtime_enabled"] is auto_start
+    finally:
+        _restore_lifecycle_state(*backup)
+
+
+@pytest.mark.plugin_unit
+def test_auto_start_registry_publication_updates_both_fields_before_invalidating(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backup = _backup_lifecycle_state()
+    published: list[dict] = []
+    try:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins["demo_plugin"] = {
+                "runtime_enabled": False, "runtime_auto_start": False,
+                "runtime_load_state": "failed",
+            }
+        monkeypatch.setattr(module.state, "invalidate_snapshot_cache", lambda _category: published.append(
+            copy.deepcopy(module.state.plugins["demo_plugin"])
+        ))
+        module._set_plugin_runtime_auto_start_sync("demo_plugin", True, restore_enabled=True)
+        assert published == [{
+            "runtime_enabled": True, "runtime_auto_start": True,
+            "runtime_load_state": "failed",
+        }]
+    finally:
+        _restore_lifecycle_state(*backup)
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize("auto_start", [True, False])
+async def test_auto_start_toggle_with_unreadable_approval_store(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    _isolate_runtime_overrides: dict,
+    auto_start: bool,
+) -> None:
+    from plugin.server.infrastructure import autostart_approvals
+    from utils import config_manager
+
+    def _unreadable_config():
+        raise OSError("approval store unavailable")
+
+    monkeypatch.setattr(config_manager, "get_config_manager", _unreadable_config)
+    autostart_approvals._reset_cache_for_testing()
+    backup = _backup_lifecycle_state()
+    try:
+        _seed_running_plugin("demo_plugin", _demo_config(tmp_path))
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins["demo_plugin"]["runtime_auto_start"] = False
+        # The boot path intentionally falls back to approved on a failed read.
+        assert autostart_approvals.is_autostart_approved("demo_plugin") is True
+        if auto_start:
+            with pytest.raises(ServerDomainError) as exc_info:
+                await module.PluginLifecycleService().set_plugin_auto_start("demo_plugin", True)
+            assert exc_info.value.code == "PLUGIN_AUTOSTART_APPROVAL_PERSIST_FAILED"
+            assert exc_info.value.status_code == 500
+            assert _isolate_runtime_overrides == {}
+        else:
+            result = await module.PluginLifecycleService().set_plugin_auto_start("demo_plugin", False)
+            assert result["success"] is True
+            assert _isolate_runtime_overrides == {"demo_plugin": {"auto_start": False}}
+        with module.state.acquire_plugins_read_lock():
+            assert module.state.plugins["demo_plugin"]["runtime_auto_start"] is False
+    finally:
+        autostart_approvals._reset_cache_for_testing()
+        _restore_lifecycle_state(*backup)
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
+async def test_set_plugin_auto_start_without_enabled_override_stores_auto_start_only(
+    tmp_path: Path,
+    _isolate_runtime_overrides: dict,
+) -> None:
+    config_path = _demo_config(tmp_path)
+    backup = _backup_lifecycle_state()
+    try:
+        _seed_running_plugin("demo_plugin", config_path)
+
+        await module.PluginLifecycleService().set_plugin_auto_start("demo_plugin", False)
+
+        assert _isolate_runtime_overrides == {"demo_plugin": {"auto_start": False}}
+        assert runtime_overrides_module.get_runtime_override("demo_plugin") is None
+        assert runtime_overrides_module.get_runtime_auto_start_override("demo_plugin") is False
+    finally:
+        _restore_lifecycle_state(*backup)
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
+async def test_set_plugin_auto_start_unknown_plugin_is_404(
+    _isolate_runtime_overrides: dict,
+) -> None:
+    backup = _backup_lifecycle_state()
+    try:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+        with pytest.raises(ServerDomainError) as exc_info:
+            await module.PluginLifecycleService().set_plugin_auto_start("missing", True)
+        assert exc_info.value.code == "PLUGIN_NOT_FOUND"
+        assert exc_info.value.status_code == 404
+        assert _isolate_runtime_overrides == {}
+    finally:
+        _restore_lifecycle_state(*backup)
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
+async def test_set_plugin_auto_start_persist_failure_keeps_registry(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config_path = _demo_config(tmp_path)
+    backup = _backup_lifecycle_state()
+    try:
+        _seed_running_plugin("demo_plugin", config_path)
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins["demo_plugin"]["runtime_auto_start"] = True
+
+        def _fail(*_args, **_kwargs):
+            raise runtime_overrides_module.RuntimeOverrideWriteError("disk full")
+
+        monkeypatch.setattr(module, "set_runtime_auto_start_override", _fail)
+
+        with pytest.raises(ServerDomainError) as exc_info:
+            await module.PluginLifecycleService().set_plugin_auto_start("demo_plugin", False)
+
+        assert exc_info.value.code == "PLUGIN_RUNTIME_PREFERENCE_PERSIST_FAILED"
+        assert exc_info.value.status_code == 500
+        assert exc_info.value.details["runtime_state_changed"] is False
+        with module.state.acquire_plugins_read_lock():
+            assert module.state.plugins["demo_plugin"]["runtime_auto_start"] is True
+    finally:
+        _restore_lifecycle_state(*backup)
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
+async def test_set_plugin_auto_start_rolls_back_preference_when_approval_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    _isolate_runtime_overrides: dict,
+) -> None:
+    config_path = _demo_config(tmp_path)
+    backup = _backup_lifecycle_state()
+    try:
+        _seed_running_plugin("demo_plugin", config_path)
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins["demo_plugin"]["runtime_auto_start"] = False
+        monkeypatch.setattr(module, "is_autostart_approved", lambda _plugin_id, **_kwargs: False)
+        monkeypatch.setattr(module, "clear_autostart_pending", lambda _plugin_id: False)
+
+        with pytest.raises(ServerDomainError) as exc_info:
+            await module.PluginLifecycleService().set_plugin_auto_start("demo_plugin", True)
+
+        assert exc_info.value.code == "PLUGIN_AUTOSTART_APPROVAL_PERSIST_FAILED"
+        assert exc_info.value.status_code == 500
+        # The written preference is rolled back, so the 500 matches what the user sees.
+        assert runtime_overrides_module.get_runtime_override_entry("demo_plugin") is None
+        with module.state.acquire_plugins_read_lock():
+            assert module.state.plugins["demo_plugin"]["runtime_auto_start"] is False
+    finally:
+        _restore_lifecycle_state(*backup)
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
+async def test_set_plugin_auto_start_keeps_pending_when_rollback_also_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    _isolate_runtime_overrides: dict,
+) -> None:
+    config_path = _demo_config(tmp_path)
+    backup = _backup_lifecycle_state()
+    try:
+        _seed_running_plugin("demo_plugin", config_path)
+        monkeypatch.setattr(module, "is_autostart_approved", lambda _plugin_id, **_kwargs: False)
+        monkeypatch.setattr(module, "clear_autostart_pending", lambda _plugin_id: False)
+
+        def _fail_restore(*_args, **_kwargs):
+            raise runtime_overrides_module.RuntimeOverrideWriteError("disk full")
+
+        monkeypatch.setattr(module, "restore_runtime_override", _fail_restore)
+
+        with pytest.raises(ServerDomainError) as exc_info:
+            await module.PluginLifecycleService().set_plugin_auto_start("demo_plugin", True)
+
+        # The pending approval was never cleared, so launch still skips the plugin.
+        assert exc_info.value.code == "PLUGIN_AUTOSTART_APPROVAL_PERSIST_FAILED"
+    finally:
+        _restore_lifecycle_state(*backup)
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
+async def test_set_plugin_auto_start_leaves_approval_pending_when_preference_write_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    _isolate_runtime_overrides: dict,
+) -> None:
+    config_path = _demo_config(tmp_path)
+    backup = _backup_lifecycle_state()
+    try:
+        _seed_running_plugin("demo_plugin", config_path)
+        calls: list[str] = []
+        monkeypatch.setattr(module, "is_autostart_approved", lambda _plugin_id, **_kwargs: False)
+        monkeypatch.setattr(
+            module, "clear_autostart_pending", lambda pid: calls.append(f"clear:{pid}") or True
+        )
+
+        def _fail(*_args, **_kwargs):
+            raise runtime_overrides_module.RuntimeOverrideWriteError("disk full")
+
+        monkeypatch.setattr(module, "set_runtime_auto_start_override", _fail)
+
+        with pytest.raises(ServerDomainError) as exc_info:
+            await module.PluginLifecycleService().set_plugin_auto_start("demo_plugin", True)
+
+        assert exc_info.value.code == "PLUGIN_RUNTIME_PREFERENCE_PERSIST_FAILED"
+        assert calls == []
+    finally:
+        _restore_lifecycle_state(*backup)

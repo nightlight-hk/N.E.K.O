@@ -1,33 +1,54 @@
 # -*- coding: utf-8 -*-
+# Copyright 2025-2026 Project N.E.K.O. Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
-EventLog — per-character append-only 审计 + 重放日志（P2 基础设施）。
+EventLog — per-character append-only audit + replay log (P2 infrastructure).
 
-为什么存在（对应 docs/design/memory-event-log-rfc.md）：
-  P0 持久化了 rebuttal 游标；P1 加了 outbox 让后台 task 被 kill 后可以
-  补跑。剩下的结构性问题是：视图（facts.json / reflections.json /
-  persona.json）是"状态转移"的唯一记录——没有有序历史，所以"写视图一半
-  崩"是不可见的，跨文件不变量也无法核查。
+Why it exists (see docs/design/memory-event-log-rfc.md):
+  P0 persisted the rebuttal cursor; P1 added the outbox so background tasks
+  killed mid-flight can be re-run. The remaining structural problem: the
+  views (facts.json / reflections.json / persona.json) are the only record
+  of "state transitions" — there is no ordered history, so "crashed halfway
+  through a view write" is invisible and cross-file invariants cannot be
+  checked.
 
-  本模块加 events.ndjson（per character）：每次状态转移**先**写事件、
-  再写视图。启动期 reconciler 对比 log tail 与哨兵
-  (events_applied.json)，把 view 没落盘的事件重放到视图里。
+  This module adds events.ndjson (per character): every state transition
+  writes the event **first**, then the view. At startup the reconciler
+  compares the log tail against the sentinel (events_applied.json) and
+  replays into the views any events the views never persisted.
 
-非目标：
-  - 不是完整的 event sourcing（视图仍是可手写的"真相源"）。
-  - 不是规则引擎或状态机 DSL。
-  - 不是跨角色的（per character 文件；架构假设单写者）。
+Non-goals:
+  - Not full event sourcing (views remain the hand-editable "source of truth").
+  - Not a rule engine or state-machine DSL.
+  - Not cross-character (per-character files; the architecture assumes a
+    single writer).
 
-写入纪律（RFC §3.4）：
-  所有会发事件的写点必须走 record_and_save，它把
-  load → append → mutate → save → sentinel-advance 五步放进一把
-  per-character threading.Lock 里，整体包在一个 asyncio.to_thread
-  worker 中。不跨 await 持锁——延续 outbox / cursors 的模式。
+Write discipline (RFC §3.4):
+  Every write site that emits events must go through record_and_save, which
+  puts the five steps load → append → mutate → save → sentinel-advance
+  inside one per-character threading.Lock, the whole wrapped in one
+  asyncio.to_thread worker. Never hold the lock across an await — continuing
+  the outbox / cursors pattern.
 
-  append 先于 mutate 的原因：load 返回的 view 常是 manager 持有的共享
-  cache；若先 mutate 后 append 而 append 抛错（例如 fsync OSError），
-  cache 会留下"无事件对应的脏改动"，后续任一次正常 save 都会把它刷
-  盘，破坏 event↔view 对应关系。先 append 成功再 mutate 保证 cache
-  只在事件已耐久落盘后才被改动。
+  Why append precedes mutate: the view returned by load is often a shared
+  cache held by the manager; if we mutated first and append then threw
+  (e.g. an fsync OSError), the cache would keep "dirty changes with no
+  corresponding event", and any later normal save would flush them to
+  disk, breaking the event↔view correspondence. Appending successfully
+  before mutating guarantees the cache only changes after the event is
+  durably on disk.
 """
 from __future__ import annotations
 
@@ -79,8 +100,8 @@ ALL_EVENT_TYPES: frozenset[str] = frozenset({
 })
 
 
-# memory-evidence-rfc §3.3.7 — source 枚举值，放在模块级常量便于未来扩展。
-# 不强制校验（event_log 不过滤），但 reconciler handler / 测试可用来核对。
+# memory-evidence-rfc §3.3.7 — source enum values, defined as module-level constants for future extension.
+# Not enforced (event_log does not filter them), but available to reconciler handlers / tests for validation.
 EVIDENCE_SOURCE_USER_FACT = "user_fact"            # Stage-2 signal (§3.4)
 EVIDENCE_SOURCE_USER_CONFIRM = "user_confirm"      # check_feedback confirmed
 EVIDENCE_SOURCE_USER_REBUT = "user_rebut"          # check_feedback denied
@@ -118,10 +139,56 @@ SyncSaveView = Callable[[str, object], None]     # (character_name, view_obj) ->
 # change while marking the event as applied.
 #
 # Handlers MUST be synchronous (no async/await) and use the sync IO helpers
-# (atomic_write_json, not its a-twin): Reconciler.areconcile calls them
-# directly without await. An async handler would return a coroutine that
-# never runs, silently breaking reconciliation.
+# (atomic_write_json, not its a-twin): Reconciler.areconcile runs them on a
+# worker thread via EventLog.apply_and_advance, without await. An async
+# handler would return a coroutine that never runs (and would be truthy, so
+# the sentinel would advance over an event that was never applied), silently
+# breaking reconciliation. A handler must also never touch an asyncio
+# primitive (it is off the event loop) nor call back into EventLog: it runs
+# under the per-character lock, which is a plain non-reentrant threading.Lock.
 ApplyHandler = Callable[[str, dict], bool]
+
+
+class SentinelAdvanceError(RuntimeError):
+    """The apply handler already succeeded, but the sentinel could not move.
+
+    Raised only by apply_and_advance, and only after apply_fn returned — so
+    it is never a handler failure and must not be reported as one. On-disk
+    state is "view updated, sentinel not advanced", i.e. the event replays
+    again on the next boot (handlers are idempotent).
+    """
+
+
+class SentinelConflictError(RuntimeError):
+    """Another writer moved the sentinel while this replay was in flight.
+
+    Deliberately NOT a SentinelAdvanceError. That class means "the view is
+    already repaired, only the progress marker is behind"; this one is
+    raised BEFORE apply_fn runs, so nothing was applied and nothing on disk
+    changed. Catching the two together would report a round that has done
+    nothing as a round whose write landed.
+
+    Two facts follow from the conflict, and both matter:
+
+      - Writing our own event_id now would move the sentinel BACKWARDS over
+        events the other writer already claimed as applied. Those events
+        would return to the tail, and any of them without a registered
+        handler would pause replay on every subsequent boot — a permanently
+        stuck reconciler.
+      - The tail this round was holding is now behind the other writer's
+        sentinel. record_and_save writes the id of the line it just
+        appended, i.e. the end of the journal, and does so unconditionally
+        (see its docstring): the events still queued in this round were
+        declared "already applied" by that write even though they were not.
+        Replaying them as-is would push older payloads over the newer
+        writer's values, and the newer event would not be replayed again to
+        correct it.
+
+    The caller's job on this error is therefore not "stop" and not "keep
+    going with the stale list" — it is to re-derive the work from the
+    journal so the newer events are replayed on top, in journal order. See
+    Reconciler.areconcile.
+    """
 
 
 class EventLog:
@@ -165,10 +232,12 @@ class EventLog:
     # ── low-level append (no lock — caller must hold it) ────────
 
     def _write_line_unlocked(self, path: str, line: str) -> None:
-        """Append + flush + fsync. fsync 失败需上抛——record_and_save 的
-        耐久性合同是"事件先落盘再推进 view"，若 fsync 静默失败，后续
-        view.save 仍成功即破坏 event↔view 对应关系、reconciler 也无从补救。
-        由调用方（record_and_save）负责处理异常，保证 view 不会被错误推进。"""
+        """Append + flush + fsync. fsync failures must propagate — record_and_save's
+        durability contract is "the event hits disk before the view advances"; if
+        fsync failed silently while the later view.save succeeded, the event↔view
+        correspondence would break and the reconciler couldn't repair it.
+        The caller (record_and_save) handles the exception, guaranteeing the view
+        is never wrongly advanced."""
         with open(path, 'a', encoding='utf-8') as f:
             f.write(line + '\n')
             f.flush()
@@ -177,10 +246,12 @@ class EventLog:
     def _append_unlocked(self, name: str, event_type: str, payload: dict) -> str:
         """Write one event record under an already-held lock. Returns event_id.
 
-        Fails fast on unknown event_type. 若放行未登记类型，一旦 record_and_save
-        在 event append 后、view save 前崩溃，重启后 Reconciler 没有 handler
-        只能跳过（且若反推到 pause-on-unknown，整条 tail 都 stuck），
-        修复路径昂贵。写入点挡住是最便宜的防线。
+        Fails fast on unknown event_type. If unregistered types were let through and
+        record_and_save crashed after the event append but before the view save, the
+        Reconciler would have no handler on restart and could only skip it (and if
+        it were pushed toward pause-on-unknown instead, the whole tail would be
+        stuck) — an expensive repair path. Blocking at the write site is the
+        cheapest line of defense.
         """
         if event_type not in ALL_EVENT_TYPES:
             raise ValueError(
@@ -276,12 +347,133 @@ class EventLog:
             return None
         return last
 
-    def advance_sentinel(self, name: str, event_id: str | None) -> None:
-        """Persist the new sentinel atomically."""
+    def _write_sentinel_unlocked(self, name: str, event_id: str | None) -> None:
+        """Unconditionally overwrite events_applied.json. Caller holds the lock.
+
+        Unconditional means exactly that: this helper does NOT enforce
+        monotonicity, and cannot. event_id is a uuid4 — two ids carry no
+        order relative to each other; the only ordering that exists is the
+        position in events.ndjson, which this helper never reads. Writers
+        that must not move the sentinel backwards have to establish the
+        ordering themselves (see apply_and_advance's compare-and-set).
+        """
         atomic_write_json(
             self._sentinel_path(name),
             {'last_applied_event_id': event_id, 'ts': datetime.now().isoformat()},
         )
+
+    def advance_sentinel(self, name: str, event_id: str | None) -> None:
+        """Persist the new sentinel atomically, under the per-character lock.
+
+        Sentinel writers must serialise against record_and_save, which
+        rewrites the same file at the tail of its own critical section.
+        Callers that already hold the lock must use _write_sentinel_unlocked
+        instead — threading.Lock is not reentrant.
+
+        Guarantees mutual exclusion only, NOT monotonicity: the write is
+        still unconditional, so a caller holding a stale event_id can move
+        the sentinel backwards. record_and_save is safe because the id it
+        writes is the one it just appended (the newest event by
+        construction); everyone else has to reason about it.
+        """
+        # This public method has no production callers now (reconcile uses apply_and_advance,
+        # and record_and_save uses _write_sentinel_unlocked); the lock remains here for
+        # "safe by default," so future call sites cannot accidentally create an unlocked writer.
+        with self._get_lock(name):
+            self._write_sentinel_unlocked(name, event_id)
+
+    def apply_and_advance(
+        self,
+        name: str,
+        event_id: str | None,
+        apply_fn: Callable[[], bool],
+        *,
+        expected_sentinel: str | None,
+        advance: bool = True,
+    ) -> bool:
+        """Run one replay apply and advance the sentinel in ONE critical section.
+
+        apply_fn is a reconciler apply-handler already bound to its
+        (character, payload); it loads → mutates → persists its own view.
+        expected_sentinel is the sentinel value the replay based its tail
+        on — the previous event's id, or the value read when the round
+        started. It is checked against the on-disk sentinel BEFORE apply_fn
+        runs, so a stale event is never applied (see the conflict branch
+        below). advance=False skips both the check and the write: the caller
+        has already learned the sentinel is no longer theirs to move and has
+        re-derived its work list from the journal, so re-checking would only
+        raise again. Running the pair here — inside the same per-character
+        lock record_and_save uses, on a worker thread — buys three things:
+
+          1. Once a live writer has entered record_and_save's critical
+             section, its read-modify-write can no longer interleave with
+             the handler's read-modify-write on the same view file. This is
+             a partial guarantee, and the boundary matters: the reflection
+             and persona write paths load their view snapshot BEFORE
+             entering (memory/reflection/evidence_flow.py loads, then hands
+             the snapshot to record_and_save as sync_load_view), so a live
+             writer parked between its own load and its own lock acquisition
+             can still save a pre-replay snapshot over the repair. What keeps
+             that from happening in production is the startup ordering —
+             reconciliation completes before any live writer is resumed (see
+             app/memory_server/runtime.py) — and this lock is the second
+             line of defence, not the first.
+          2. The sentinel write joins the handler in the same critical
+             section: the pair is atomic with respect to other writers, and
+             the sentinel can never advance without the handler's write
+             having landed first.
+          3. The handler's file IO leaves the event loop, which is what
+             makes it eligible for file_utils' busy-retry backoff (that
+             backoff is deliberately disabled on the loop) and stops its
+             fsync from blocking the loop.
+
+        Returns whatever apply_fn returned (True = the view actually
+        changed). Raises:
+          - SentinelConflictError, before apply_fn is called at all, if the
+            on-disk sentinel is no longer expected_sentinel (someone
+            advanced it while this replay was in flight). Nothing is applied
+            and the sentinel is left alone;
+          - whatever apply_fn raised, with the sentinel untouched — the
+            caller's pause-and-retry semantics;
+          - SentinelAdvanceError if the sentinel write itself fails, so the
+            caller can tell an IO problem from a handler problem.
+        """
+        with self._get_lock(name):
+            if advance:
+                # Monotonic compare-and-set: event_id is uuid4, so IDs cannot be ordered by value;
+                # the only way to tell "whether the new sentinel is farther ahead" is to check that "the on-disk sentinel is still the one I started with."
+                # Without this check, the deadlock reproduced in review can occur: a live writer appends an event with no registered
+                # handler in this process and advances the sentinel; replay then writes the sentinel back to the old ID → that event
+                # returns to the tail → every subsequent startup hits "unregistered event type, pause replay."
+                #
+                # The check must happen **before** apply_fn. A handler does "read disk → update target-entry
+                # fields → replace the whole record"; running it once already writes this stale event's fields into the view.
+                # If a newer writer changed the same set of fields on the same entry, the stale values overwrite the new ones;
+                # detecting the CAS conflict afterward is too late (and that writer's event is after the sentinel,
+                # so it will not be replayed again to correct the view).
+                # No in-process writer can interleave between the check and apply: record_and_save /
+                # compact_if_needed / advance_sentinel all acquire this lock, and both steps
+                # run inside the critical section where we already hold it.
+                current = self.read_sentinel(name)
+                if current != expected_sentinel:
+                    raise SentinelConflictError(
+                        f"{name}: sentinel moved to {current!r} before replaying "
+                        f"{event_id!r} (expected {expected_sentinel!r}); refusing "
+                        f"to apply a tail the sentinel already passed"
+                    )
+            changed = apply_fn()
+            if not advance:
+                return bool(changed)
+            try:
+                self._write_sentinel_unlocked(name, event_id)
+            except Exception as e:
+                # The handler has already persisted its changes; a failure here is purely an I/O problem writing the sentinel.
+                # Wrap it in a dedicated exception so callers do not record it as "handler failure."
+                raise SentinelAdvanceError(
+                    f"{name}: apply of {event_id!r} persisted but the sentinel "
+                    f"write failed: {e}"
+                ) from e
+        return bool(changed)
 
     # ── compaction (RFC §3.6) ───────────────────────────────────
 
@@ -436,25 +628,48 @@ class EventLog:
         ALREADY on a worker thread (the _arecord_and_save a-twin hops us
         into one), and using async twins would pointlessly re-schedule
         through asyncio.to_thread and risk event-loop locking anti-patterns.
+
+        KNOWN LIMITATION — the sentinel write is an unconditional claim.
+        The final step writes the sentinel to the id just appended, which
+        by definition is the last line of the journal, so this method can
+        never move the sentinel backwards. What it does not check is
+        whether everything BEFORE that line was applied. Setting the
+        sentinel to the journal end asserts exactly that, and the assertion
+        is false whenever an unapplied tail is still sitting on disk: those
+        events fall behind the sentinel and no later boot replays them.
+        Whoever hits that has lost them silently.
+
+        It is reachable. Replay pauses (and leaves a tail) on an
+        unregistered event type or a raising handler; the very next live
+        write then orphans whatever was left. Startup ordering does not
+        help — this has nothing to do with reconciliation running
+        concurrently.
+
+        Closing it properly means the sentinel can no longer be "an event
+        id": a writer would have to know whether the journal ahead of its
+        own line is drained, which is a full scan on every write, or the
+        sentinel has to become a position/applied-set with an on-disk
+        format migration. Both are RFC-level changes
+        (docs/design/memory-event-log-rfc.md, concurrency section) and are
+        deliberately out of scope here. Do NOT read "the sentinel only ever
+        moves forward" as "no event can be skipped".
         """
         with self._get_lock(name):
             view = sync_load_view(name)
-            # 顺序：load → append（可能 fsync 失败抛出）→ mutate → save。
-            # append 先于 mutate 的原因：sync_load_view 常返回 manager 持有的
-            # 共享 cache，若先 mutate 再 append 而 append 抛出，cache 已脏但
-            # 事件没落盘，后续任一次正常 save 都会把"无事件对应的变更"刷盘，
-            # 破坏 event↔view 对应关系。先 append 成功再 mutate 则保证：
-            #   - append 失败：view/cache 未动，无状态泄露
-            #   - mutate/save 失败：事件已在 log，reconciler 会补齐
+            # Order: load → append (may raise on fsync failure) → mutate → save.
+            # Append first because sync_load_view often returns the manager's
+            # shared cache; if append raises after mutation, the cache is dirty but
+            # The event was not persisted; any later normal save would persist "a change with no corresponding event,"
+            # breaking the event↔view relationship. Appending successfully before mutation guarantees:
+            #   - append failure: view/cache untouched, no state leaked
+            #   - mutate/save failure: event is already in the log, and the reconciler can repair it
             event_id = self._append_unlocked(name, event_type, payload)
             sync_mutate_view(view)
             sync_save_view(name, view)
             # Inline sentinel write: still under the lock, still on this
-            # worker thread — safe to use atomic_write_json sync.
-            atomic_write_json(
-                self._sentinel_path(name),
-                {'last_applied_event_id': event_id, 'ts': datetime.now().isoformat()},
-            )
+            # worker thread — the unlocked helper, because advance_sentinel
+            # takes the same non-reentrant lock we are already holding.
+            self._write_sentinel_unlocked(name, event_id)
         return event_id
 
     # ── async duals ─────────────────────────────────────────────
@@ -470,6 +685,20 @@ class EventLog:
 
     async def aadvance_sentinel(self, name: str, event_id: str | None) -> None:
         await asyncio.to_thread(self.advance_sentinel, name, event_id)
+
+    async def aapply_and_advance(
+        self,
+        name: str,
+        event_id: str | None,
+        apply_fn: Callable[[], bool],
+        *,
+        expected_sentinel: str | None,
+        advance: bool = True,
+    ) -> bool:
+        return await asyncio.to_thread(
+            self.apply_and_advance, name, event_id, apply_fn,
+            expected_sentinel=expected_sentinel, advance=advance,
+        )
 
     async def ashould_compact(self, name: str) -> bool:
         return await asyncio.to_thread(self.should_compact, name)
@@ -500,6 +729,12 @@ class EventLog:
 
 
 # ── Reconciler scaffolding (RFC §3.5) ─────────────────────────────────────
+
+# After freezing the sentinel, probe toward the log tail again after each scan; this is the maximum number of probes. Only "a writer committed
+# during the previous scan" consumes a probe, so normal startup uses none. Eight gives the process a chance to finish after writes
+# stop without letting continuous writes keep startup stuck forever.
+_MAX_FROZEN_RESCANS = 8
+
 
 class Reconciler:
     """Applies event-log tail onto views on startup.
@@ -532,6 +767,21 @@ class Reconciler:
         lose the change. Modeled off record_and_save — the per-event-type
         equivalent is per-handler responsibility.
 
+        Concurrency: the primary guarantee is exclusivity, not locking.
+        The only production caller (app/memory_server/runtime.py) awaits
+        this loop to completion BEFORE it resumes the outbox, so no live
+        writer is running while the tail is replayed. That ordering is what
+        closes the loss window, because a live writer that loaded its view
+        snapshot before the replay would otherwise save it back over the
+        repair — with the sentinel already past the event, so no later boot
+        replays it again: silent, permanent loss.
+
+        Underneath, handler-call and sentinel-advance are one critical
+        section (EventLog.apply_and_advance) on the per-character lock that
+        record_and_save uses, on a worker thread. That is defence in depth
+        for the residual window (writers that already read their snapshot)
+        and for any future caller that reconciles outside the startup path.
+
         Failure semantics (intentional): if a handler raises, we STOP the
         whole reconcile loop for this character and leave the sentinel on
         the last successfully-applied event. Rationale — compound
@@ -546,11 +796,80 @@ class Reconciler:
         ALL_EVENT_TYPES check, so an unknown type here means a rollback
         to an older binary — operator must upgrade back or manually
         surgery the log.
+
+        Two things that are NOT handler failures and are handled apart from
+        them, because they leave different state on disk:
+          - the sentinel moved under us (another writer advanced it past
+            what this round assumed). The tail this round is carrying is
+            now stale: it sits behind that writer's sentinel, and applying
+            it as-is would push older payloads over newer values with no
+            later replay to correct them. So the round re-reads the journal
+            from its own last-applied position through to the END of the
+            file and replays that, in journal order — the queued repairs
+            still land, and the other writer's events land after them, so
+            the newest payload for any given entry wins. The sentinel is
+            frozen from then on: writing our older id back would return the
+            other writer's events to the tail, and one of them without a
+            registered handler would wedge every future boot. Nothing needs
+            to be written at the end either — the other writer already
+            parked the sentinel at the journal end.
+            That end is a snapshot, so the frozen pass re-probes for newly
+            appended events every time it drains, up to _MAX_FROZEN_RESCANS
+            times. An event landing after the snapshot is not in the tail,
+            yet the stale payloads queued ahead of it still are: replaying
+            those would push older values over the view it just wrote, and
+            with the sentinel now parked on its id no later boot replays it
+            back.
+          - the sentinel write failed (IO). The handler already persisted;
+            only the progress marker is behind, so the event replays
+            idempotently next boot. Logged as such, not as a handler fault.
+
+        Re-applying events that were already applied is safe by the same
+        property the whole design leans on elsewhere (read_since falls back
+        to a full replay when the sentinel is missing or compacted away):
+        handlers carry full-snapshot payloads and are idempotent.
         """
         last_applied = await self._event_log.aread_sentinel(name)
         tail = await self._event_log.aread_since(name, last_applied)
         applied_count = 0
-        for event in tail:
+        # CAS every event, and do it **before** running its handler: expected is where this replay believes the on-disk
+        # sentinel should be — initially the last_applied read at startup,
+        # then the event_id just written by the previous event. A mismatch means another writer changed the sentinel, so
+        # this tail is stale and no event may be applied; see apply_and_advance.
+        expected_sentinel = last_applied
+        # Once the sentinel no longer belongs to this replay, freeze it and reload pending events from the log
+        # (see the except branch below); this tail is stale and cannot be applied as-is.
+        sentinel_frozen = False
+        # After freezing, the sentinel no longer advances, so "scan to the end of the log" means one snapshot while
+        # writers may still append later. An event committed after that snapshot is absent from this tail, but an earlier stale
+        # payload is still waiting to be replayed — applying it would overwrite the view just written by that later event,
+        # while the sentinel now points to **its** id. At next startup, read_since begins after it, so the event
+        # will never be replayed to fix the view. What is lost is the writer's content, permanently, not this run's progress.
+        # Therefore after each scan, probe toward the tail again until no new events are found.
+        rescans_left = _MAX_FROZEN_RESCANS
+        i = 0
+        while True:
+            if i >= len(tail):
+                if not sentinel_frozen:
+                    return applied_count
+                extra = await self._event_log.aread_since(name, expected_sentinel)
+                if not extra:
+                    return applied_count
+                if rescans_left <= 0:
+                    # Bound the loop so continuous writes cannot keep this scan open forever or hang startup.
+                    # Stopping has a cost (entries remaining before the sentinel will not be replayed next startup),
+                    # so report it rather than truncating silently.
+                    logger.warning(
+                        f"[Reconciler] {name}: 哨兵冻结后连续 {_MAX_FROZEN_RESCANS} 轮"
+                        f"都有新事件追加，停止重扫；仍有 {len(extra)} 条未重放且位于"
+                        f"哨兵之前，下次开机不会自动补上"
+                    )
+                    return applied_count
+                rescans_left -= 1
+                tail = extra
+                i = 0
+                continue
+            event = tail[i]
             event_type = event.get('type')
             event_id = event.get('event_id')
             if event_type not in self._handlers:
@@ -561,16 +880,68 @@ class Reconciler:
                 )
                 return applied_count
             handler = self._handlers[event_type]
+            payload = event.get('payload') or {}
             try:
-                # Handler自己 load → apply → save，见 ApplyHandler 契约。
-                changed = handler(name, event.get('payload') or {})
+                # The handler does its own load → apply → save; see the ApplyHandler contract.
+                # Run the whole operation (handler + sentinel advancement) through apply_and_advance: under
+                # the per-character lock, on a worker thread, together with record_and_save
+                # Centralize on one writer. If the handler raises, the locked sentinel write does not run,
+                # and the exception passes through to_thread to the except below — failure semantics are unchanged.
+                changed = await self._event_log.aapply_and_advance(
+                    name, event_id, lambda: handler(name, payload),
+                    expected_sentinel=expected_sentinel,
+                    advance=not sentinel_frozen,
+                )
                 if changed:
                     applied_count += 1
+                expected_sentinel = event_id
+                i += 1
+            except SentinelConflictError as e:
+                # This is not a failure, and this event was not applied (the conflict check runs before the handler).
+                # Another writer already advanced the sentinel. By writing it, that writer claimed
+                # everything before it had been applied; this tail is after it and is now stale. Applying it as-is
+                # would overwrite the value the writer just stored with an old payload, while that writer's newer
+                # event is before the sentinel and will not be replayed again to correct it.
+                #
+                # So neither "stop" nor "apply as usual": reload pending work in log order,
+                # from this run's last applied position (expected_sentinel) through end of file.
+                # Queued repairs are still persisted, and that writer's event is replayed after them,
+                # so the latest payload for the same item is written last — ordering follows line position in the log,
+                # which is the event log's intended semantics. Reapplication is harmless: handlers assign full snapshots,
+                # are idempotent, and read_since already replays everything when the sentinel is lost.
+                #
+                # Freeze the sentinel from now on (advance=False). Writing the old ID would move that writer's event back to
+                # the tail, and any event without a registered handler would then make every later startup stop at
+                # "unregistered event type"; that character could never be reconciled again. No cleanup write is needed:
+                # the other writer already left the sentinel at the end of the log, which is exactly where this rescan ends.
+                if sentinel_frozen:
+                    # Structurally unreachable: after freezing, advance=False, so apply_and_advance
+                    # no longer performs CAS and cannot raise this exception. Keep the fallback in case a future
+                    # change to advance semantics would otherwise turn this into an infinite loop.
+                    logger.warning(
+                        f"[Reconciler] {name}/{event_type}/{event_id}: 哨兵冻结后"
+                        f"仍报冲突，停止本轮 replay: {e}"
+                    )
+                    return applied_count
+                sentinel_frozen = True
+                logger.warning(
+                    f"[Reconciler] {name}/{event_type}/{event_id}: 哨兵已被其他写者"
+                    f"推进，手上的尾巴已陈旧；改为从本轮已应用位置重扫到日志末尾并"
+                    f"按日志顺序重放，此后不再推进哨兵: {e}"
+                )
+                tail = await self._event_log.aread_since(name, expected_sentinel)
+                i = 0
+            except SentinelAdvanceError as e:
+                # Handler succeeded but sentinel write failed. Attribute this separately from handler failure: on disk,
+                # the view changed but the sentinel did not, so replay this event idempotently next startup.
+                logger.warning(
+                    f"[Reconciler] {name}/{event_type}/{event_id} 哨兵写入失败"
+                    f"（handler 已成功应用）: {e}；下次开机重放该条"
+                )
+                return applied_count
             except Exception as e:
                 logger.warning(
                     f"[Reconciler] {name}/{event_type}/{event_id} handler 失败: {e}；"
                     f"保留 sentinel 在上一条位置，下次重试"
                 )
                 return applied_count
-            await self._event_log.aadvance_sentinel(name, event_id)
-        return applied_count

@@ -1,4 +1,5 @@
 import json
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -87,8 +88,58 @@ def test_ensure_cloudsave_state_files_creates_defaults(tmp_path):
     assert cloud_state["version"] == cm.CLOUDSAVE_LOCAL_STATE_VERSION
     assert cloud_state["next_sequence_number"] == 1
     assert isinstance(cloud_state["client_id"], str) and cloud_state["client_id"]
+    assert isinstance(cloud_state["client_proof"], str)
+    assert len(cloud_state["client_proof"]) >= 32
     assert tombstone_state["version"] == cm.CHARACTER_TOMBSTONES_STATE_VERSION
     assert tombstone_state["tombstones"] == []
+
+
+@pytest.mark.unit
+def test_ensure_cloudsave_client_credentials_upgrades_legacy_state(tmp_path):
+    cm = _make_config_manager(tmp_path)
+    cm.ensure_cloudsave_state_files()
+    state = cm.load_cloudsave_local_state()
+    state.pop("client_proof")
+    state["version"] = 1
+    cm.save_cloudsave_local_state(state)
+
+    client_id, client_proof = cm.ensure_cloudsave_client_credentials()
+
+    persisted = cm.load_cloudsave_local_state()
+    assert client_id == state["client_id"]
+    assert persisted["client_id"] == client_id
+    assert persisted["client_proof"] == client_proof
+    assert persisted["version"] == cm.CLOUDSAVE_LOCAL_STATE_VERSION
+
+
+@pytest.mark.unit
+def test_ensure_cloudsave_client_credentials_rereads_state_inside_fence(tmp_path):
+    cm = _make_config_manager(tmp_path)
+    cm.ensure_cloudsave_state_files()
+    legacy_state = cm.load_cloudsave_local_state()
+    legacy_state.pop("client_proof")
+    legacy_state["version"] = 1
+    cm.save_cloudsave_local_state(legacy_state)
+
+    @contextmanager
+    def concurrent_export_fence(config_manager, **_kwargs):
+        exported_state = config_manager.load_cloudsave_local_state()
+        exported_state["next_sequence_number"] = 9
+        exported_state["last_successful_export_at"] = "2026-07-26T21:30:00Z"
+        config_manager.save_cloudsave_local_state(exported_state)
+        yield
+
+    with patch(
+        "utils.cloudsave_runtime.cloud_apply_fence",
+        concurrent_export_fence,
+    ):
+        client_id, client_proof = cm.ensure_cloudsave_client_credentials()
+
+    persisted = cm.load_cloudsave_local_state()
+    assert persisted["client_id"] == client_id == legacy_state["client_id"]
+    assert persisted["client_proof"] == client_proof
+    assert persisted["next_sequence_number"] == 9
+    assert persisted["last_successful_export_at"] == "2026-07-26T21:30:00Z"
 
 
 @pytest.mark.unit
@@ -220,7 +271,7 @@ def test_state_save_entrypoints_report_target_directory_blockers(tmp_path):
 
 
 @pytest.mark.unit
-def test_get_documents_directory_preserves_first_readable_legacy_candidate(tmp_path):
+def test_get_documents_directory_preserves_first_readable_legacy_candidate(tmp_path, real_root_resolution):
     import utils.config_manager as config_manager_module
     from utils.config_manager import ConfigManager
 
@@ -257,12 +308,12 @@ def test_get_documents_directory_preserves_first_readable_legacy_candidate(tmp_p
         cm = ConfigManager("N.E.K.O")
 
     assert cm.docs_dir == standard_dir
-    # Linux 回退到 XDG 可写目录时并不进入 CFA 可读目录模式，readable_live2d_dir 应保持 None。
+    # Falling back to a writable XDG directory on Linux does not enter CFA readable-directory mode; readable_live2d_dir must remain None.
     assert cm.readable_live2d_dir is None
 
 
 @pytest.mark.unit
-def test_get_documents_directory_ignores_non_document_legacy_roots_for_cfa_detection(tmp_path):
+def test_get_documents_directory_ignores_non_document_legacy_roots_for_cfa_detection(tmp_path, real_root_resolution):
     import utils.config_manager as config_manager_module
     from utils.config_manager import ConfigManager
 
@@ -311,12 +362,12 @@ def test_get_documents_directory_ignores_non_document_legacy_roots_for_cfa_detec
         cm = ConfigManager("N.E.K.O")
 
     assert cm.docs_dir == standard_dir
-    # 非 Windows CFA 场景不应暴露额外的只读回退目录。
+    # Non-Windows CFA scenarios must not expose an additional read-only fallback directory.
     assert cm.readable_live2d_dir is None
 
 
 @pytest.mark.unit
-def test_get_documents_directory_uses_linux_xdg_fallback_when_xdg_data_home_missing(tmp_path):
+def test_get_documents_directory_uses_linux_xdg_fallback_when_xdg_data_home_missing(tmp_path, real_root_resolution):
     import utils.config_manager as config_manager_module
     from utils.config_manager import ConfigManager
 
@@ -352,7 +403,7 @@ def test_get_documents_directory_uses_linux_xdg_fallback_when_xdg_data_home_miss
         cm = ConfigManager("N.E.K.O")
 
     assert cm.docs_dir == home_dir / ".local" / "share"
-    # Linux XDG fallback 下不启用 CFA 可读目录回退。
+    # Do not enable CFA readable-directory fallback under the Linux XDG fallback.
     assert cm.readable_live2d_dir is None
 
 

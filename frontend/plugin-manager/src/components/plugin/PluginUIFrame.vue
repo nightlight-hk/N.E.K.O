@@ -1,5 +1,5 @@
 <template>
-  <div class="plugin-ui-frame" :class="{ loading, error: !!error }">
+  <div class="plugin-ui-frame" :class="{ loading, error: !!error }" :style="frameStyle">
     <div v-if="loading" class="loading-overlay">
       <el-icon class="is-loading" :size="32">
         <Loading />
@@ -24,14 +24,16 @@
       <p>{{ t('plugins.ui.noUI') }}</p>
     </div>
     
+    <!-- Legacy static plugins may rely on standard browser modal dialogs. -->
     <iframe
       v-show="!loading && !error && hasUI"
       :key="iframeKey"
       ref="iframeRef"
       :src="uiUrl"
       :title="pluginId"
+      :data-load-generation="iframeGeneration"
       class="plugin-iframe"
-      sandbox="allow-scripts allow-forms allow-popups allow-same-origin"
+      sandbox="allow-scripts allow-forms allow-popups allow-same-origin allow-modals"
       @load="onIframeLoad"
       @error="onIframeError"
     />
@@ -43,16 +45,25 @@ import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { Loading, WarningFilled, InfoFilled } from '@element-plus/icons-vue'
 import { get } from '@/api'
+import { PANEL_FILL_HEIGHT } from '@/utils/constants'
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   pluginId: string
   height?: string
-}>()
+}>(), {
+  // 默认填满确定高度的宿主；显式 height 继续由调用方控制。
+  height: PANEL_FILL_HEIGHT,
+})
+
+const frameStyle = computed(() => ({
+  height: props.height,
+}))
 
 const emit = defineEmits<{
   (e: 'load'): void
   (e: 'error', error: string): void
   (e: 'message', data: any): void
+  (e: 'openSurface', payload: { pluginId?: string; surfaceId: string; kind?: string; activationRevision?: number }): void
 }>()
 
 const { t } = useI18n()
@@ -63,6 +74,10 @@ const uiCacheBust = ref(Date.now())
 const loading = ref(true)
 const error = ref<string | null>(null)
 const hasUI = ref(false)
+const iframeReady = ref(false)
+const iframeGeneration = ref(0)
+const pendingSurfaceMessages: unknown[] = []
+const maxPendingSurfaceMessages = 100
 let currentRequestId = 0
 const expectedOrigin = window.location.origin
 
@@ -76,6 +91,7 @@ const uiUrl = computed(() => {
 })
 
 async function checkUIAvailability() {
+  startIframeLoadGeneration()
   if (!props.pluginId) {
     currentRequestId += 1
     hasUI.value = false
@@ -87,7 +103,6 @@ async function checkUIAvailability() {
   
   loading.value = true
   error.value = null
-  
   try {
     const info = await get(`/plugin/${encodeURIComponent(props.pluginId)}/ui-info`)
     if (requestId !== currentRequestId) return
@@ -104,15 +119,32 @@ async function checkUIAvailability() {
   }
 }
 
-function onIframeLoad() {
+function startIframeLoadGeneration() {
+  iframeGeneration.value++
+  iframeReady.value = false
+  iframeKey.value++
+}
+
+function isCurrentIframeEvent(event: Event) {
+  const target = event.currentTarget
+  return target instanceof HTMLIFrameElement
+    && target.dataset.loadGeneration === String(iframeGeneration.value)
+}
+
+function onIframeLoad(event: Event) {
+  if (!isCurrentIframeEvent(event)) return
   loading.value = false
   error.value = null
+  iframeReady.value = true
+  flushSurfaceMessages()
   emit('load')
 }
 
-function onIframeError() {
+function onIframeError(event: Event) {
+  if (!isCurrentIframeEvent(event)) return
   loading.value = false
   error.value = t('plugins.ui.loadError')
+  iframeReady.value = false
   emit('error', error.value)
 }
 
@@ -121,14 +153,11 @@ async function reload() {
     // UI availability already confirmed (iframe load failed); skip network call
     error.value = null
     loading.value = true
+    startIframeLoadGeneration()
     uiCacheBust.value = Date.now()
-    iframeKey.value++
   } else {
+    uiCacheBust.value = Date.now()
     await checkUIAvailability()
-    if (hasUI.value && !error.value) {
-      uiCacheBust.value = Date.now()
-      iframeKey.value++
-    }
   }
 }
 
@@ -143,6 +172,24 @@ function handleMessage(event: MessageEvent) {
   const data = event.data
   if (data && typeof data === 'object' && data.type === 'plugin-ui-message') {
     emit('message', data.payload)
+  } else if (data && typeof data === 'object' && data.type === 'neko-study-open-surface') {
+    const payload = data.payload && typeof data.payload === 'object' ? data.payload : {}
+    const surfaceId = typeof payload.surfaceId === 'string' ? payload.surfaceId.trim() : ''
+    if (surfaceId) {
+      const pluginId = typeof payload.pluginId === 'string' ? payload.pluginId.trim() : ''
+      const kind = typeof payload.kind === 'string' ? payload.kind.trim() : ''
+      const activationRevision = typeof payload.activationRevision === 'number'
+        && Number.isSafeInteger(payload.activationRevision)
+        && payload.activationRevision >= 0
+        ? payload.activationRevision
+        : undefined
+      emit('openSurface', {
+        pluginId: pluginId || undefined,
+        surfaceId,
+        kind: kind || undefined,
+        ...(activationRevision === undefined ? {} : { activationRevision }),
+      })
+    }
   }
 }
 
@@ -155,9 +202,33 @@ function sendMessage(payload: any) {
   }, expectedOrigin)
 }
 
+function flushSurfaceMessages() {
+  const target = iframeRef.value?.contentWindow
+  if (!target || !iframeReady.value) return
+  for (const message of pendingSurfaceMessages.splice(0)) {
+    target.postMessage(message, expectedOrigin)
+  }
+}
+
+function sendSurfaceMessage(message: unknown) {
+  const target = iframeRef.value?.contentWindow
+  if (target && iframeReady.value) {
+    target.postMessage(message, expectedOrigin)
+    return
+  }
+  // A hidden compatibility iframe may still be checking /ui-info while the
+  // hosted panel emits its initial state. Keep the newest bounded set until
+  // the iframe load event makes a target available.
+  if (pendingSurfaceMessages.length >= maxPendingSurfaceMessages) {
+    pendingSurfaceMessages.shift()
+  }
+  pendingSurfaceMessages.push(message)
+}
+
 defineExpose({
   reload,
   sendMessage,
+  sendSurfaceMessage,
   hasUI
 })
 
@@ -171,6 +242,8 @@ onUnmounted(() => {
 })
 
 watch(() => props.pluginId, () => {
+  pendingSurfaceMessages.length = 0
+  iframeReady.value = false
   uiCacheBust.value = Date.now()
   checkUIAvailability()
 })
@@ -180,8 +253,7 @@ watch(() => props.pluginId, () => {
 .plugin-ui-frame {
   position: relative;
   width: 100%;
-  height: v-bind('props.height || "400px"');
-  min-height: 200px;
+  min-height: 0;
   border: 1px solid var(--el-border-color);
   border-radius: var(--el-border-radius-base);
   background: var(--el-bg-color);
@@ -192,6 +264,7 @@ watch(() => props.pluginId, () => {
   width: 100%;
   height: 100%;
   border: none;
+  display: block;
 }
 
 .loading-overlay,
@@ -205,10 +278,18 @@ watch(() => props.pluginId, () => {
   display: flex;
   flex-direction: column;
   align-items: center;
-  justify-content: center;
+  justify-content: safe center;
+  overflow: auto;
+  padding: var(--spacing-lg);
   gap: 12px;
   background: var(--el-bg-color);
   color: var(--el-text-color-secondary);
+}
+
+.loading-overlay > *,
+.error-overlay > *,
+.no-ui-overlay > * {
+  flex-shrink: 0;
 }
 
 .error-message {

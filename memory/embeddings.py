@@ -1,4 +1,18 @@
 # -*- coding: utf-8 -*-
+# Copyright 2025-2026 Project N.E.K.O. Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 EmbeddingService — Tier 0 of the memory hierarchy: vector embeddings.
 
@@ -45,25 +59,42 @@ match the current text + service ``model_id()`` — same pattern as the
 from __future__ import annotations
 
 import asyncio
-import base64
+import contextlib
 import enum
-import hashlib
 import logging
 import os
 import platform
 import re
 import sys
+import time
 from typing import Any
 
-# 走 get_module_logger(..., "Memory") 把本模块日志归到 N.E.K.O.Memory.*，
-# 否则 ``logging.getLogger(__name__)`` 产生的 ``memory.embeddings`` logger
-# 落在 N.E.K.O 命名空间之外，向上只能传到无 handler 的 root，导致
-# "EmbeddingService: ready / vectors disabled (reason)" 这类关键状态行
-# 永远不进 Memory 日志文件——线上排"为啥向量召回是空的"时根本看不到原因。
+from ._embeddings import lifecycle as _service_lifecycle
+from ._embeddings import hardware as _hardware
+from ._embeddings import profiles as _profiles
+from ._embeddings.schema import (
+    build_model_id,
+    clear_embedding_fields,
+    cosine_similarity as _cosine_similarity_impl,
+    decode_embedding as _decode_embedding_impl,
+    decode_valid_cached_embedding as _decode_valid_cached_embedding_impl,
+    decode_vector_fp16 as _decode_vector_fp16,
+    embedding_text_sha256 as _embedding_text_sha256,
+    encode_vector_fp16 as _encode_vector_fp16,
+    is_cached_embedding_valid as _is_cached_embedding_valid_impl,
+    parse_dim_from_model_id,
+    stamp_embedding_fields as _stamp_embedding_fields_impl,
+)
+
+# Use get_module_logger(..., "Memory") to route this module's logs under N.E.K.O.Memory.*;
+# otherwise the ``logging.getLogger(__name__)`` call creates a ``memory.embeddings`` logger
+# outside the N.E.K.O namespace, which propagates only to the handler-free root and causes
+# key status lines such as "EmbeddingService: ready / vectors disabled (reason)"
+# never to reach the Memory log file — making production diagnosis of "why vector retrieval is empty" impossible.
 try:
     from utils.logger_config import get_module_logger
     logger = get_module_logger(__name__, "Memory")
-except Exception:  # noqa: BLE001 — 极早期/裸测试环境拿不到 config，退回裸 logger
+except Exception:  # noqa: BLE001 — config may be unavailable in very early startup or bare test environments; fall back to a plain logger
     logger = logging.getLogger(__name__)
 
 
@@ -106,17 +137,20 @@ DEFAULT_VECTORS_MIN_RAM_GB = 4.0
 DEFAULT_VECTORS_MODEL_DIR_NAME = "embedding_models"
 DEFAULT_VECTORS_MAX_LENGTH = 1024
 
-# 推理峰值上限。激活内存近似 ``batch × seq × hidden × layers``;固定
-# batch + pad-to-longest 让一条长文本就能把激活顶到上百 GB(实测:
-# 用户粘贴一段长 recent 进记忆,凛天上线那个 sweep 把 RSS 从 1.1 GB
-# 顶到 12.4 GB)。改成 token 预算 ``batch × max_len ≤ _INFER_TOKEN_BUDGET``,
-# 长文本时 batch 自动缩到 1~2 条,峰值有硬上界。
+# Inference peak memory is approximately ``batch × seq × hidden × layers``; fixed
+# batch + pad-to-longest lets a single long text push activations into the hundreds of GB (observed:
+# a user pasted a long recent conversation into memory, and the sweep pushed RSS from 1.1 GB
+# to 12.4 GB). Use a token budget ``batch × max_len ≤ _INFER_BATCH_MAX_TOKENS``;
+# for long texts, batch automatically shrinks to 1–2 items, giving a hard upper bound on peak usage.
 #
-# 选 16384:在新 max_length=1024 下,一桶能放下 16 条满长(等同
-# worker BATCH_SIZE=16 的原行为),正常路径吞吐零损失;当历史数据 /
-# 测试 / 自定义 profile 把 max_length 顶到旧 8192 时也只允许 2 条
-# 一桶,峰值仍可控。"""
-_INFER_TOKEN_BUDGET = 16384
+# Chosen value: 16384. With the new max_length=1024, one batch fits 16 full-length items (same as
+# the previous worker BATCH_SIZE=16), so normal throughput is unchanged. If historical data /
+# tests / custom profiles raise max_length to the old 8192, only two items fit per
+# batch, keeping peak usage controllable."""
+_INFER_BATCH_MAX_TOKENS = 16384
+
+# Non-sticky (borrowed-model) inference failures log at most this often.
+_SOFT_FAILURE_LOG_INTERVAL_SECONDS = 60.0
 
 # Matryoshka discrete steps supported by the default local profile.
 _DIM_STEPS = (32, 64, 128, 256, 512, 768)
@@ -131,6 +165,7 @@ class EmbeddingState(enum.Enum):
     LOADING = "loading"
     READY = "ready"
     DISABLED = "disabled"
+    CLOSED = "closed"
 
 
 class _DisableReason(enum.Enum):
@@ -144,12 +179,12 @@ class _DisableReason(enum.Enum):
     # the install commands diverge.
     NO_TOKENIZERS = "tokenizers_not_importable"
     NO_MODEL_FILE = "model_file_missing"
-    # ``enable_truncation`` 失败 = tokenizer 实例存在但截断契约没能建立。
-    # 必须当成 load 失败(Codex / CodeRabbit 在 PR #1585 联合指出 P2):
-    # ``model_id`` 现在把 max_length 编进 cache id,如果继续 ready,长文本
-    # 会被「未截断」地编码、却 stamp 成 ``-mlen1024``,跟未来真的 1024 截
-    # 断的 vector 在同一 id 下混存,is_cached_embedding_valid 会判它们「同
-    # 一空间」做 cosine,召回质量静默漂移。宁可 disable 也不能错配 cache。
+    # ``enable_truncation`` failing means the tokenizer exists but its truncation contract was not established.
+    # Treat this as a load failure (Codex / CodeRabbit jointly identified P2 in PR #1585):
+    # ``model_id`` now includes max_length in the cache ID; if this still reports ready, long text
+    # will be encoded without truncation but stamped ``-mlen1024``. It would then coexist under the same ID as vectors genuinely truncated at 1024,
+    # and is_cached_embedding_valid would treat them as the "same space" for cosine similarity,
+    # silently drifting retrieval quality. Disabling is safer than a cache mismatch.
     TRUNCATION_SETUP_FAILED = "tokenizer_truncation_setup_failed"
     # Default bundle is INT8. ``auto`` picks INT8 when *any* usable SIMD int8
     # path exists: AVX-VNNI (fast) OR plain AVX2 (slower but fine for our nano
@@ -161,140 +196,17 @@ class _DisableReason(enum.Enum):
     # the log separates "no fast path at all" from the now-supported "no VNNI
     # but AVX2 present" case (Haswell 2013+ / Zen+).
     NO_SIMD_INT8_PATH = "no_avx2_or_vnni_for_int8"
+    # CPU brand string is on _CPU_BRAND_BLOCKLIST: it advertises a usable
+    # int8 SIMD path but crashes onnxruntime/MLAS at runtime (illegal
+    # instruction). Disabled *before* the session loads so the crash never
+    # happens; override per machine with NEKO_VECTORS_FORCE_ENABLE=1.
+    CPU_BLOCKLISTED = "cpu_on_known_bad_blocklist"
     LOW_RAM = "ram_below_threshold"
     LOAD_ERROR = "load_raised"
     INFERENCE_ERROR = "inference_raised"
 
 
-# ── helpers ──────────────────────────────────────────────────────────
-
-
-def _encode_vector_fp16(vector) -> str:
-    """Encode a float vector as ``base64(fp16_bytes)``.
-
-    Accepts list/tuple/numpy. fp16 has dynamic range up to ±65504, so
-    L2-normalized vectors (per-axis magnitudes < 1) can never overflow
-    on cast — we don't need a per-vector scale prefix the way int8
-    quantization would.
-    """
-    import numpy as np
-    arr = np.asarray(vector, dtype=np.float16).ravel()
-    return base64.b64encode(arr.tobytes()).decode("ascii")
-
-
-def _decode_vector_fp16(encoded: str):
-    """Inverse of :func:`_encode_vector_fp16`. Returns a numpy fp32 array.
-
-    Returns None on any decoding failure — corrupt cache fields fall
-    through to the "no embedding" path rather than raising up into the
-    retrieval/dedup loops.
-
-    Strict-validate the base64 payload (``validate=True``): the looser
-    setting silently skips non-alphabet bytes, letting a garbage-suffix
-    payload decode to plausible-but-wrong values. Reject odd-length
-    raw buffers (fp16 must align to 2 bytes — odd length means
-    truncation or corruption) and any non-finite element after cast
-    (NaN / ±Inf would otherwise propagate through every dot product
-    the decoded vector touches).
-    """
-    import numpy as np
-    try:
-        raw = base64.b64decode(encoded, validate=True)
-    except Exception:  # noqa: BLE001 — malformed base64 → treat as missing
-        return None
-    if len(raw) % 2 != 0:
-        return None
-    decoded = np.frombuffer(raw, dtype=np.float16).astype(np.float32)
-    if decoded.size == 0:
-        return decoded
-    if not np.isfinite(decoded).all():
-        return None
-    return decoded
-
-
-def decode_embedding(emb: Any):
-    """Public helper: turn a persisted ``embedding`` field into a numpy
-    fp32 array, regardless of whether the row carries the new base64
-    form, a legacy ``list[float]``, an already-decoded numpy array, or
-    None / empty.
-
-    Returns None when the field is missing or unreadable. Used by
-    cosine helpers and by recall's batched dot-product path.
-    """
-    if emb is None:
-        return None
-    import numpy as np
-    if isinstance(emb, np.ndarray):
-        if emb.size == 0:
-            return None
-        return emb.astype(np.float32, copy=False)
-    if isinstance(emb, str):
-        if not emb:
-            return None
-        return _decode_vector_fp16(emb)
-    if isinstance(emb, (list, tuple)):
-        if not emb:
-            return None
-        try:
-            return np.asarray(emb, dtype=np.float32)
-        except (TypeError, ValueError):
-            return None
-    return None
-
-
-# Anchor on the trailing ``-<dim>d-<quant>`` form emitted by
-# :func:`build_model_id` (e.g. ``local-text-retrieval-v1-256d-int8``).
-# Anchoring at end-of-string + a known quantization keyword guards
-# against profile names that happen to contain their own ``-Nd-``
-# segment (e.g. an upstream profile like ``model-384d-v2``); without
-# the anchor, ``re.search`` would pick the *first* match (384) rather
-# than the actual runtime dim (256), and is_cached_embedding_valid
-# would reject every freshly stamped vector forever (size mismatch),
-# pinning the worker into an infinite re-embed loop. Codex review
-# PR #1147.
-#
-# ``-mlen<N>`` 后缀(PR #1585):tokenizer 截断长度是 embedding 输入空间的
-# 一部分 —— 同一段 2K-token 文本在 max_length=8192 下喂全量、在
-# max_length=1024 下只喂前缀,得到的向量在同一模型下也不可比。把 mlen
-# 编进 model_id,降 max_length 时旧 cache 自动失效,worker 重新 embed,
-# 避免不同 token 输入空间的向量混用做 cosine。后缀可选(``mlen<N>?``)是
-# 为了向后兼容已经在用户磁盘上的老 cache id —— 它们解析 dim 仍然成功,
-# 在 is_cached_embedding_valid 里会因为 model_id 字符串比较失败被识别
-# 为 stale,然后被 worker 重新 stamp 上带 mlen 的新 id。
-_MODEL_ID_DIM_RE = re.compile(r"-(\d+)d-(?:int8|fp32)(?:-mlen\d+)?$")
-
-
-def parse_dim_from_model_id(model_id: str | None) -> int | None:
-    """Extract the embedding dimension from a model_id, or None if the
-    id can't be parsed.
-
-    ``embedding_model_id`` is built by :func:`build_model_id` and always
-    has the shape ``<profile>-<dim>d-<quant>`` where ``quant`` is a
-    fixed enum (``int8`` / ``fp32``). The regex anchors on that
-    trailing form so a profile name that itself contains ``-Nd-``
-    can't shadow the runtime dim segment.
-    """
-    if not model_id or not isinstance(model_id, str):
-        return None
-    m = _MODEL_ID_DIM_RE.search(model_id)
-    if not m:
-        return None
-    try:
-        return int(m.group(1))
-    except (TypeError, ValueError):
-        return None
-
-
-def _embedding_text_sha256(text: str) -> str:
-    """Stable fingerprint used for ``embedding_text_sha256`` cache keys.
-
-    Same scheme as ``token_count_text_sha256`` — utf-8 then full sha256.
-    Truncation lives at consumer sites only; we keep the full hex so a
-    future migration to a longer prefix doesn't require recomputing all
-    cached values.
-    """
-    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
-
+# ── hardware probes ─────────────────────────────────────────────────
 
 def detect_total_ram_gb() -> float | None:
     """Return total system RAM in GiB or None on detection failure.
@@ -325,6 +237,27 @@ def detect_total_ram_gb() -> float | None:
 _INTEL_VNNI_MIN_MODEL_FAMILY_6 = 0x97  # Alder Lake — also covers Raptor,
                                        # Meteor, Arrow, Lunar, Panther
                                        # Lake; Sapphire/Emerald Rapids.
+
+# CPUs that advertise a usable int8 SIMD path through every numeric signal
+# we trust (family/model, numpy AVX2/VNNI flags) yet still crash
+# onnxruntime at runtime with an illegal-instruction fault. Matched as a
+# case-insensitive substring of the CPU *brand string* ("model name" on
+# Linux / ``ProcessorNameString`` on Windows), because family/model can not
+# single out one SKU — e.g. Haswell-EP E5-2666 v3 shares 06_3FH with the
+# entire Haswell-EP cohort, the bulk of which run fine. Brand-string
+# matching is the fragile py-cpuinfo pattern this module otherwise avoids,
+# so keep this list SHORT and evidence-backed (a real SIGILL in
+# onnxruntime's .so, confirmed via ``dmesg``), never a catch-all guess.
+#
+# A hit disables the WHOLE onnxruntime session — int8 *and* fp32 — not just
+# the int8 kernel. The root cause is not yet pinned to a specific kernel, so
+# we can not assume the fp32 weights (if an operator shipped them) are safe
+# on this silicon; shipping a path we believe still SIGILLs would defeat the
+# guard. The fp32 / forced-load recovery path is not removed, only gated:
+# ``NEKO_VECTORS_FORCE_ENABLE=1`` overrides the blocklist per machine.
+_CPU_BRAND_BLOCKLIST = (
+    "e5-2666 v3",  # AWS-custom Haswell-EP; user-reported onnxruntime crash (SIGILL)
+)
 
 # AMD Family 0x19 is shared between Zen 3 (no AVX-VNNI) and Zen 4 (yes), so
 # family alone is not enough — gate on the documented Zen 4 model ranges
@@ -413,6 +346,75 @@ def _read_cpu_family_model() -> tuple[str, int, int] | None:
     except Exception:
         return None
     return None
+
+
+def _read_cpu_brand_string() -> str | None:
+    """Return the CPU brand/marketing string (e.g.
+    ``"Intel(R) Xeon(R) CPU E5-2666 v3 @ 2.90GHz"``) from a plain
+    registry / text read, or None when neither source answers.
+
+    The sole consumer is :func:`_cpu_is_blocklisted`. Brand-string parsing
+    is the fragile py-cpuinfo pattern this module avoids everywhere else
+    (numeric family/model is preferred), but it is the *only* signal that
+    pins down one SKU — family/model lumps a whole microarchitecture cohort
+    together — so it is fenced off to this one narrow use.
+    """
+    system = platform.system()
+    try:
+        if system == "Windows":
+            import winreg
+            with winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                r"HARDWARE\DESCRIPTION\System\CentralProcessor\0",
+            ) as k:
+                return winreg.QueryValueEx(k, "ProcessorNameString")[0]
+        if system == "Linux":
+            with open("/proc/cpuinfo", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("model name"):
+                        return line.split(":", 1)[1].strip()
+    except Exception:
+        return None
+    return None
+
+
+def _cpu_is_blocklisted() -> bool:
+    """True when the CPU brand string matches :data:`_CPU_BRAND_BLOCKLIST`
+    and the operator has not set ``NEKO_VECTORS_FORCE_ENABLE``.
+
+    The override is read straight from the environment (not via the
+    ``config`` module), so it keeps working after the app is Nuitka-compiled:
+    the frozen module is baked into the binary, the process environment is
+    not. It follows the documented env convention — ``NEKO_`` prefix, with
+    the bare name accepted as a fallback, matching config's ``_read_str_env``
+    key order: the FIRST env name that is present and non-empty wins, so an
+    explicit ``NEKO_VECTORS_FORCE_ENABLE`` takes precedence over the bare
+    name even when its value is falsey (it does not fall through). This is
+    the per-machine escape hatch for a false positive (a listed chip that
+    actually runs fine, or a later microcode fix) and the way to re-try a
+    forced fp32 / int8 load on a blocklisted host.
+    """
+    for _key in ("NEKO_VECTORS_FORCE_ENABLE", "VECTORS_FORCE_ENABLE"):
+        _raw = os.getenv(_key)
+        if _raw is None or not _raw.strip():
+            continue
+        # First present-and-non-empty key decides; a later key (the bare
+        # name) never overrides an explicitly-set earlier one, even if that
+        # value is falsey — so NEKO_ precedence holds.
+        if _raw.strip().lower() in ("1", "true", "yes", "on"):
+            return False        # force-enabled → never blocklisted
+        break                   # explicit falsey override → fall to brand check
+    return _brand_blocklisted()
+
+
+def _brand_blocklisted() -> bool:
+    """Pure brand-string side of :func:`_cpu_is_blocklisted` (no env
+    override): True iff the CPU brand matches :data:`_CPU_BRAND_BLOCKLIST`."""
+    brand = _read_cpu_brand_string()
+    if not brand:
+        return False
+    low = brand.lower()
+    return any(bad in low for bad in _CPU_BRAND_BLOCKLIST)
 
 
 def _vnni_via_family_model() -> tuple[bool, bool]:
@@ -718,12 +720,6 @@ def detect_avx_vnni_details() -> tuple[bool, bool]:
     return result
 
 
-def detect_avx_vnni() -> bool:
-    """Backward-compatible: whether AVX-VNNI was detected."""
-    has_vnni, _confirmed = detect_avx_vnni_details()
-    return has_vnni
-
-
 def detect_avx2_details() -> tuple[bool, bool]:
     """Return ``(has_avx2, absence_confirmed)`` for x86; ARM is treated as
     "has a usable int8 SIMD path" (NEON is universal on ARM64).
@@ -765,26 +761,6 @@ def detect_avx2_details() -> tuple[bool, bool]:
     return False, False
 
 
-def resolve_dim_for_ram(ram_gb: float | None) -> int | None:
-    """Pick a Matryoshka dim from detected RAM. None ⇒ disabled.
-
-    The bands match the design contract in the PR description — they're
-    not a hard performance cliff, but a conservative budget that leaves
-    headroom for the rest of the app (LLM client, websocket pool, TTS
-    buffers, frontend renderer if collocated).
-
-    ≥ 16 GB → 256. Higher Matryoshka levels (512/768) are reserved for
-    opt-in overrides until we have enough latency data from real installs.
-    """
-    if ram_gb is None or ram_gb < DEFAULT_VECTORS_MIN_RAM_GB:
-        return None
-    if ram_gb < 8:
-        return 64
-    if ram_gb < 16:
-        return 128
-    return 256
-
-
 def _coerce_dim(value, ram_gb: float | None) -> int | None:
     """Resolve a config value to an integer dim, or None if disabled.
 
@@ -811,28 +787,84 @@ def _coerce_dim(value, ram_gb: float | None) -> int | None:
     return as_int
 
 
+# Compatibility facade. Keep these names in this module because tests and
+# downstream integrations monkeypatch them directly.
+def decode_embedding(embedding: Any):
+    return _decode_embedding_impl(embedding, decode_string=_decode_vector_fp16)
+
+
+def cosine_similarity(a, b) -> float:
+    return _cosine_similarity_impl(a, b, decoder=decode_embedding)
+
+
+def is_cached_embedding_valid(
+    entry: dict,
+    current_text: str,
+    current_model_id: str | None,
+) -> bool:
+    return _is_cached_embedding_valid_impl(
+        entry,
+        current_text,
+        current_model_id,
+        hash_text=_embedding_text_sha256,
+        decode_string=_decode_vector_fp16,
+        parse_dim=parse_dim_from_model_id,
+    )
+
+
+def decode_valid_cached_embedding(
+    entry: dict,
+    current_text: str,
+    current_model_id: str | None,
+):
+    """``is_cached_embedding_valid`` that hands back the vector it decoded.
+
+    Same facade discipline as its neighbours — the module-level
+    ``_decode_vector_fp16`` / ``_embedding_text_sha256`` indirection is kept so
+    tests that monkeypatch those names still steer this path.
+    """
+    return _decode_valid_cached_embedding_impl(
+        entry,
+        current_text,
+        current_model_id,
+        hash_text=_embedding_text_sha256,
+        decode_string=_decode_vector_fp16,
+        parse_dim=parse_dim_from_model_id,
+    )
+
+
+def stamp_embedding_fields(
+    entry: dict,
+    vector,
+    text: str,
+    model_id: str,
+) -> None:
+    _stamp_embedding_fields_impl(
+        entry,
+        vector,
+        text,
+        model_id,
+        encoder=_encode_vector_fp16,
+        hash_text=_embedding_text_sha256,
+    )
+
+
+def resolve_dim_for_ram(ram_gb: float | None) -> int | None:
+    return _hardware.resolve_dim_for_ram(ram_gb, DEFAULT_VECTORS_MIN_RAM_GB)
+
+
 def _auto_int8_or_none(
     has_vnni: bool,
     vnni_absence_confirmed: bool,
     has_avx2: bool,
     avx2_absence_confirmed: bool,
 ) -> str | None:
-    """``auto`` policy core: pick ``int8`` when *any* usable int8 SIMD path
-    exists, else ``None`` (disable).
-
-    Tiers:
-      1. AVX-VNNI present → int8 (fast path).
-      2. VNNI inconclusive → int8 (optimistic, unchanged from before).
-      3. VNNI confirmed absent, but AVX2 present → int8 (slow-but-fine —
-         Haswell 2013+ / Zen+; covers the bulk of pre-2021 desktops).
-      4. VNNI confirmed absent, AVX2 inconclusive → int8 (optimistic).
-      5. VNNI *and* AVX2 both confirmed absent → None (SSE-only; too slow).
-    """
-    if has_vnni or not vnni_absence_confirmed:
-        return "int8"
-    if has_avx2 or not avx2_absence_confirmed:
-        return "int8"
-    return None
+    return _hardware.auto_int8_or_none(
+        has_vnni,
+        vnni_absence_confirmed,
+        has_avx2,
+        avx2_absence_confirmed,
+    )
 
 
 def _resolve_quantization(
@@ -843,134 +875,49 @@ def _resolve_quantization(
     has_avx2: bool = True,
     avx2_absence_confirmed: bool = False,
 ) -> str | None:
-    """Map ``\"auto\"`` / ``\"int8\"`` / ``\"fp32\"`` onto a loadable variant.
-
-    Returns ``\"int8\"``, ``\"fp32\"``, or ``None``. ``None`` means local
-    embeddings are off — for ``auto``, only when the CPU has *neither* AVX-VNNI
-    nor AVX2 (both confirmed). Explicit ``\"fp32\"`` always loads the FP32 ONNX
-    when files exist.
-
-    Explicit ``\"int8\"`` is always honoured (with a warning when no VNNI fast
-    path) so operators can force INT8 even on SSE-only CPUs if they accept the
-    cost. ``has_avx2`` defaults True so the historical 3-arg call sites keep the
-    old (VNNI-only) behaviour until they pass the AVX2 detection through.
-    """
-    if value == "fp32":
-        return "fp32"
-    if value == "auto" or value is None or value not in ("int8", "fp32"):
-        return _auto_int8_or_none(
-            has_vnni, vnni_absence_confirmed, has_avx2, avx2_absence_confirmed,
-        )
-    # value == "int8" (forced)
-    if not has_vnni:
+    resolved = _hardware.resolve_quantization(
+        value,
+        has_vnni,
+        vnni_absence_confirmed=vnni_absence_confirmed,
+        has_avx2=has_avx2,
+        avx2_absence_confirmed=avx2_absence_confirmed,
+    )
+    if value == "int8" and not has_vnni:
         logger.warning(
             "EmbeddingService: int8 requested but AVX-VNNI not detected "
             "(avx2=%s) — expect slower inference (AVX2 kernel or SSE fallback)",
             has_avx2,
         )
-    return "int8"
-
-
-def build_model_id(
-    profile: str, dim: int, quantization: str, max_length: int | None = None,
-) -> str:
-    """Return the canonical id used in ``embedding_model_id`` cache fields.
-
-    Format: ``<profile>-<dim>d-<quant>`` 或 ``<profile>-<dim>d-<quant>-mlen<N>``
-    (e.g. ``local-text-retrieval-v1-128d-int8-mlen1024``).
-    A change to any axis flips the id, which invalidates cached
-    embeddings on the next read — same idea as ``tokenizer_identity``.
-
-    ``max_length`` 是 tokenizer 截断长度 —— Codex 在 PR #1585 指出:同段
-    长文本在 max_length=8192 / max_length=1024 下喂进 ONNX 的 token 序列
-    根本不一样,得到的向量空间也不同;不编进 id 就会让升级后旧 cache
-    "看起来还有效",跟新 query 做 cosine 比较时静默偏移召回质量。
-    None 时回退到不带 mlen 的旧格式 — 仅给老调用点(如未传 max_length
-    的 legacy 测试 fixture)做兼容,真正的 service 路径总会传。
-    """
-    base = f"{profile}-{dim}d-{quantization}"
-    if max_length is None:
-        return base
-    return f"{base}-mlen{max_length}"
+    return resolved
 
 
 def _profile_exists(model_dir: str, profile_id: str) -> bool:
-    return os.path.isdir(os.path.join(model_dir, profile_id))
+    return _profiles.profile_exists(model_dir, profile_id)
 
 
 def _is_nonempty_file(path: str) -> bool:
-    """File present AND >0 bytes. Zero-byte residue from an interrupted
-    download passes plain ``isfile`` but trips the loader downstream — we
-    treat it as missing so the bundled fallback still kicks in."""
-    try:
-        return os.path.isfile(path) and os.path.getsize(path) > 0
-    except OSError:
-        return False
+    return _profiles.is_nonempty_file(path)
 
 
 def _profile_is_complete(
-    model_dir: str, profile_id: str, quantization: str | None = None,
+    model_dir: str,
+    profile_id: str,
+    quantization: str | None = None,
 ) -> bool:
-    """A profile dir is usable only if it has a non-empty tokenizer plus
-    a full (model + onnx_data sidecar) variant the runtime can actually
-    load.
-
-    ``quantization`` lets callers narrow the variant requirement to the
-    one ``_load_session_blocking`` will actually open. With ``None``, only
-    the shipped INT8 variant is considered complete — so a legacy fp32-only
-    app-data tree does not mask a good bundled int8 profile. Pass ``None``
-    only when the runtime quantization is not yet pinned to a single file.
-
-    Why stricter than ``_profile_exists``: a half-downloaded or partially
-    deleted app-data profile would otherwise satisfy the existence check,
-    short-circuit the bundled fallback, and then trip
-    ``NO_MODEL_FILE`` at session load — leaving the user with vectors
-    sticky-disabled even though the bundle on disk is fine.
-    """
-    profile_dir = os.path.join(model_dir, profile_id)
-    if not os.path.isdir(profile_dir):
-        return False
-    if not _is_nonempty_file(os.path.join(profile_dir, "tokenizer.json")):
-        return False
-    if quantization == "int8":
-        stems: tuple[str, ...] = ("model_quantized.onnx",)
-    elif quantization == "fp32":
-        stems = ("model.onnx",)
-    else:
-        # Only the INT8 bundle is shipped; fp32 ONNX is optional / omitted.
-        stems = ("model_quantized.onnx",)
-    for stem in stems:
-        model_path = os.path.join(profile_dir, "onnx", stem)
-        sidecar_path = model_path + "_data"
-        if _is_nonempty_file(model_path) and _is_nonempty_file(sidecar_path):
-            return True
-    return False
+    return _profiles.profile_is_complete(
+        model_dir,
+        profile_id,
+        quantization,
+        file_check=_is_nonempty_file,
+    )
 
 
 def _bundled_model_dirs() -> list[str]:
-    """Candidate roots for build-time packaged embedding assets.
-
-    Developers and CI place model files under
-    ``data/embedding_models/<profile_id>/...``. In source runs this is
-    relative to the repo root; in PyInstaller/Nuitka builds it lives next
-    to the bundled launcher resources.
-    """
-    roots: list[str] = []
-    if hasattr(sys, "_MEIPASS"):
-        roots.append(str(sys._MEIPASS))
-    if getattr(sys, "frozen", False) or "__compiled__" in globals():
-        roots.append(os.path.dirname(os.path.abspath(sys.executable)))
-    roots.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-    seen: set[str] = set()
-    model_dirs: list[str] = []
-    for root in roots:
-        path = os.path.join(root, "data", DEFAULT_VECTORS_MODEL_DIR_NAME)
-        norm = os.path.abspath(path)
-        if norm not in seen:
-            seen.add(norm)
-            model_dirs.append(norm)
-    return model_dirs
+    return _profiles.bundled_model_dirs(
+        __file__,
+        DEFAULT_VECTORS_MODEL_DIR_NAME,
+        compiled="__compiled__" in globals(),
+    )
 
 
 def _select_model_dir(
@@ -978,22 +925,13 @@ def _select_model_dir(
     profile_id: str,
     quantization: str | None = None,
 ) -> str:
-    """Prefer user-managed app-data models, otherwise use bundled assets.
-
-    A half-downloaded app-data profile, or one that only has the
-    *other* quantization variant from what the runtime resolved to, is
-    treated as broken (see ``_profile_is_complete``) and we fall back to
-    bundled — otherwise the presence-only check would prefer the broken
-    dir and sticky-disable vectors at load even though the bundle is
-    fine. Callers should pass the resolved ``quantization`` so the
-    variant check matches what ``_load_session_blocking`` will open.
-    """
-    if _profile_is_complete(app_docs_model_dir, profile_id, quantization):
-        return app_docs_model_dir
-    for bundled_dir in _bundled_model_dirs():
-        if _profile_is_complete(bundled_dir, profile_id, quantization):
-            return bundled_dir
-    return app_docs_model_dir
+    return _profiles.select_model_dir(
+        app_docs_model_dir,
+        profile_id,
+        quantization,
+        _bundled_model_dirs(),
+        completeness_check=_profile_is_complete,
+    )
 
 
 # ── service ──────────────────────────────────────────────────────────
@@ -1012,9 +950,9 @@ class EmbeddingService:
          the safe "no embedding" answer for the rest of the process
 
     Thread/coroutine safety: ``request_load()`` is idempotent under
-    concurrent callers thanks to the asyncio.Lock; embedding calls are
-    naturally serialized through ``asyncio.to_thread`` and the
-    onnxruntime session itself releases the GIL during inference.
+    concurrent callers thanks to the asyncio.Lock. Embedding calls may run
+    concurrently; lifecycle leases let shutdown drain them before releasing
+    the ONNX session and tokenizer.
     """
 
     def __init__(
@@ -1042,7 +980,23 @@ class EmbeddingService:
         # Resolved at construction so ``model_id()`` can return early
         # even before the session loads — callers reading
         # embedding_model_id at write time need a stable id.
-        self._ram_gb = ram_gb if ram_gb is not None else detect_total_ram_gb()
+        capabilities = None
+        if ram_gb is None and has_vnni is None and has_avx2 is None:
+            capabilities = _hardware.detect_capabilities(
+                detect_total_ram_gb,
+                detect_avx_vnni_details,
+                detect_avx2_details,
+            )
+            ram_gb = capabilities.ram_gb
+            has_vnni = capabilities.has_vnni
+            vnni_absence_confirmed = capabilities.vnni_absence_confirmed
+            has_avx2 = capabilities.has_avx2
+            avx2_absence_confirmed = capabilities.avx2_absence_confirmed
+        self._ram_gb = (
+            capabilities.ram_gb
+            if capabilities is not None
+            else ram_gb if ram_gb is not None else detect_total_ram_gb()
+        )
         if has_vnni is not None:
             self._has_vnni = has_vnni
             self._vnni_absence_confirmed = (
@@ -1083,11 +1037,21 @@ class EmbeddingService:
         self._session = None
         self._tokenizer = None
         self._load_lock = asyncio.Lock()
+        self._lifecycle_condition = asyncio.Condition()
+        self._active_operations = 0
+        self._closing = False
+        self._soft_failure_logged_at = float("-inf")
 
         # Decide initial disable conditions (all but model file presence,
         # which we check at load time so a deferred download path can
         # still flip vectors on after first session).
-        if not self._enabled:
+        if _cpu_is_blocklisted():
+            # Highest priority: a known-bad CPU SIGILLs onnxruntime no matter
+            # what the SIMD detection concluded, so this gate sits above the
+            # RAM / quantization checks. Logged (not silent) so the startup
+            # line tells operators why vectors are off and how to override.
+            self._mark_disabled(_DisableReason.CPU_BLOCKLISTED, log=True)
+        elif not self._enabled:
             self._mark_disabled(_DisableReason.USER_DISABLED, log=False)
         elif self._ram_gb is None or self._ram_gb < self._min_ram_gb:
             self._mark_disabled(_DisableReason.LOW_RAM, log=False)
@@ -1161,82 +1125,175 @@ class EmbeddingService:
         On any failure, transitions to DISABLED and returns False — the
         service stays off for the lifetime of the process.
         """
-        if self._state in (EmbeddingState.READY, EmbeddingState.DISABLED):
-            return self.is_available()
-
-        async with self._load_lock:
+        if not await self._begin_operation():
+            return False
+        try:
             if self._state in (EmbeddingState.READY, EmbeddingState.DISABLED):
                 return self.is_available()
-            self._state = EmbeddingState.LOADING
-            try:
-                await asyncio.to_thread(self._load_session_blocking)
-            except _DisabledError as e:
-                self._mark_disabled(e.reason)
-                return False
-            except Exception as e:  # noqa: BLE001 — any load failure → off
-                logger.warning(
-                    "EmbeddingService: load failed (%s: %s); vectors disabled",
-                    type(e).__name__, e,
-                )
-                self._mark_disabled(_DisableReason.LOAD_ERROR)
-                return False
-            self._state = EmbeddingState.READY
-            logger.info(
-                "EmbeddingService: ready (model_id=%s, ram=%.1fGB, vnni=%s, avx2=%s)",
-                self.model_id(), self._ram_gb or 0.0, self._has_vnni, self._has_avx2,
-            )
-            return True
 
-    async def embed(self, text: str) -> list[float] | None:
+            async with self._load_lock:
+                if self._closing or self._state is EmbeddingState.CLOSED:
+                    return False
+                if self._state in (EmbeddingState.READY, EmbeddingState.DISABLED):
+                    return self.is_available()
+                self._state = EmbeddingState.LOADING
+                try:
+                    await self._run_blocking(self._load_session_blocking)
+                except _DisabledError as e:
+                    if not self._closing:
+                        self._mark_disabled(e.reason)
+                    return False
+                except Exception as e:  # noqa: BLE001 — any load failure → off
+                    if not self._closing:
+                        logger.warning(
+                            "EmbeddingService: load failed (%s: %s); vectors disabled",
+                            type(e).__name__, e,
+                        )
+                        self._mark_disabled(_DisableReason.LOAD_ERROR)
+                    return False
+                if self._closing or self._state is EmbeddingState.CLOSED:
+                    return False
+                self._state = EmbeddingState.READY
+                logger.info(
+                    "EmbeddingService: ready (model_id=%s, ram=%.1fGB, vnni=%s, avx2=%s)",
+                    self.model_id(), self._ram_gb or 0.0, self._has_vnni, self._has_avx2,
+                )
+                return True
+        finally:
+            await self._end_operation()
+
+    async def close(self) -> None:
+        """Quiesce requests, then drop the native session/tokenizer references."""
+        async with self._lifecycle_condition:
+            if self._state is EmbeddingState.CLOSED:
+                return
+            self._closing = True
+            while self._active_operations:
+                await self._lifecycle_condition.wait()
+            self._session = None
+            self._tokenizer = None
+            self._state = EmbeddingState.CLOSED
+
+    async def embed(self, text: str, *, sticky_failure: bool = True) -> list[float] | None:
         """Single-text embedding. Returns None when not READY — caller
         must treat this as a cache miss and skip the vector path for
-        this query."""
+        this query.
+
+        ``sticky_failure=False`` is for borrowers of the model (the public
+        knowledge indexer): an inference error then only fails this call
+        instead of disabling vectors for the whole process."""
         if not text:
             return None
-        if not self.is_available():
+        if not await self._begin_operation():
             return None
         try:
-            vectors = await asyncio.to_thread(self._infer_blocking, [text])
-        except Exception as e:  # noqa: BLE001 — sticky inference failure
-            logger.warning(
-                "EmbeddingService: inference failed (%s: %s); vectors disabled",
-                type(e).__name__, e,
-            )
-            self._mark_disabled(_DisableReason.INFERENCE_ERROR)
-            return None
-        return vectors[0] if vectors else None
+            if not self.is_available():
+                return None
+            try:
+                vectors = await self._run_blocking(self._infer_blocking, [text])
+            except Exception as e:  # noqa: BLE001 — sticky inference failure
+                if not self._closing:
+                    self._on_inference_error(e, sticky=sticky_failure)
+                return None
+            return vectors[0] if vectors else None
+        finally:
+            await self._end_operation()
 
-    async def embed_batch(self, texts: list[str]) -> list[list[float] | None]:
+    async def embed_batch(
+        self, texts: list[str], *, sticky_failure: bool = True
+    ) -> list[list[float] | None]:
         """Batch embedding. Empty / None inputs and not-ready service
         both produce a None at the corresponding output index — keeps
-        callers' index alignment with the input list intact."""
+        callers' index alignment with the input list intact.
+
+        ``sticky_failure`` works as in ``embed``."""
         if not texts:
             return []
         result: list[list[float] | None] = [None] * len(texts)
-        if not self.is_available():
-            return result
-        # Filter out empty entries before inference but preserve
-        # positional alignment in the output via index mapping.
-        active_idx: list[int] = []
-        active_texts: list[str] = []
-        for i, t in enumerate(texts):
-            if t:
-                active_idx.append(i)
-                active_texts.append(t)
-        if not active_texts:
+        if not await self._begin_operation():
             return result
         try:
-            vectors = await asyncio.to_thread(self._infer_blocking, active_texts)
-        except Exception as e:  # noqa: BLE001
-            logger.warning(
-                "EmbeddingService: batch inference failed (%s: %s); vectors disabled",
-                type(e).__name__, e,
-            )
-            self._mark_disabled(_DisableReason.INFERENCE_ERROR)
+            if not self.is_available():
+                return result
+            # Filter out empty entries before inference but preserve
+            # positional alignment in the output via index mapping.
+            active_idx: list[int] = []
+            active_texts: list[str] = []
+            for i, t in enumerate(texts):
+                if t:
+                    active_idx.append(i)
+                    active_texts.append(t)
+            if not active_texts:
+                return result
+            try:
+                vectors = await self._run_blocking(self._infer_blocking, active_texts)
+            except Exception as e:  # noqa: BLE001
+                if not self._closing:
+                    self._on_inference_error(e, sticky=sticky_failure)
+                return result
+            for slot, vec in zip(active_idx, vectors):
+                result[slot] = vec
             return result
-        for slot, vec in zip(active_idx, vectors):
-            result[slot] = vec
-        return result
+        finally:
+            await self._end_operation()
+
+    def _on_inference_error(self, error: Exception, *, sticky: bool) -> None:
+        if not sticky:
+            # A background caller may hit the same problem batch after batch;
+            # one line a minute is enough to see it.
+            now = time.monotonic()
+            if now - self._soft_failure_logged_at >= _SOFT_FAILURE_LOG_INTERVAL_SECONDS:
+                self._soft_failure_logged_at = now
+                logger.warning(
+                    "EmbeddingService: inference failed for a non-sticky caller (%s: %s)",
+                    type(error).__name__, error,
+                )
+            return
+        logger.warning(
+            "EmbeddingService: inference failed (%s: %s); vectors disabled",
+            type(error).__name__, error,
+        )
+        self._mark_disabled(_DisableReason.INFERENCE_ERROR)
+
+    async def _begin_operation(self) -> bool:
+        """Register a request unless shutdown has started."""
+        async with self._lifecycle_condition:
+            if self._closing or self._state is EmbeddingState.CLOSED:
+                return False
+            self._active_operations += 1
+            return True
+
+    async def _end_operation(self) -> None:
+        """Release a request lease and wake a waiting shutdown."""
+        async with self._lifecycle_condition:
+            self._active_operations -= 1
+            if self._active_operations == 0:
+                self._lifecycle_condition.notify_all()
+
+    @staticmethod
+    async def _run_blocking(func, *args):
+        """Keep cancellation from outliving a native worker-thread call."""
+        worker = asyncio.create_task(asyncio.to_thread(func, *args))
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            # ``to_thread`` cannot stop a running native call.  Do not let the
+            # caller's lifecycle lease unwind until that call has actually
+            # exited, otherwise close() could clear or recreate its owners
+            # while ONNX Runtime is still using them.
+            while not worker.done():
+                try:
+                    await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    break
+            if worker.done() and not worker.cancelled():
+                # Preserve the caller's cancellation; the worker failure is
+                # secondary and has already been observed by the await above.
+                with contextlib.suppress(Exception):
+                    worker.result()
+            raise
 
     # ── internal: session load / inference ───────────────────────────
 
@@ -1294,14 +1351,47 @@ class EmbeddingService:
             raise _DisabledError(_DisableReason.NO_TOKENIZERS) from e
 
         sess_opts = ort.SessionOptions()
-        sess_opts.intra_op_num_threads = max(1, (os.cpu_count() or 2) // 2)
+        # Intra-op thread count: backfill is a background embedding task, and on low-core machines using half the cores
+        # is already noticeable (4 cores → 2 threads = 50%, competing with frontend rendering / LLM client / TTS).
+        # Use one thread on ≤4 cores to leave capacity for interactive work; keep the old "half the cores" policy above 4
+        # cores, favoring throughput on larger machines while leaving headroom.
+        #
+        # Classify "low-core machines" by *physical* cores, not os.cpu_count(): a 4-core CPU with hyperthreading
+        # (common i3/i5) reports 8 logical cores, so checking logical cores would miss these machines and enter the >4 branch with 4 threads
+        # — exactly the hardware we want to limit. psutil is already a dependency of this module (detect_total_ram_gb);
+        # if physical-core count is unavailable (unsupported platform / no psutil), fall back to logical cores. The >4 branch still halves logical-core count,
+        # byte-for-byte preserving previous behavior on larger machines.
+        logical = os.cpu_count() or 2
+        try:
+            import psutil
+            physical = psutil.cpu_count(logical=False)
+        except Exception:  # noqa: BLE001 — no psutil / unsupported platform → fall back to logical cores
+            physical = None
+        cores = physical or logical
+        sess_opts.intra_op_num_threads = 1 if cores <= 4 else max(1, logical // 2)
         sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        # Arena 默认 True(BFCArena 只涨不还):一次性大分配后 RSS 永久
-        # 钉在高水位,把瞬时尖峰变成永久占用。我们的输入有 _INFER_TOKEN_BUDGET
-        # 兜底,峰值已可控;关掉 arena 让分配器跟实际需求走,RSS 能跌回,
-        # 也避免冷路径偶发长批次永久污染基线。代价:每次 run 重新 malloc,
-        # CPU 推理本来就 100ms+ 级,malloc 几 μs 可忽略。
+        # Arena defaults to True (BFCArena only grows): after one large allocation, RSS stays
+        # permanently at its high-water mark, turning a temporary spike into permanent usage. Our input has the _INFER_BATCH_MAX_TOKENS
+        # safeguard and peak usage is already bounded; disabling the arena lets the allocator follow actual demand so RSS can fall,
+        # and prevents occasional long batches on the cold path from permanently polluting the baseline. Cost: malloc runs again each run;
+        # CPU inference already takes 100ms+, so a few microseconds for malloc are negligible.
         sess_opts.enable_cpu_mem_arena = False
+        # Disable spin-wait in the intra-op thread pool. ORT normally makes workers
+        # busy-spin briefly after each run to grab the next batch; backfill is a bursty workload — "many small runs,
+        # with Python-side tokenization / numpy preprocessing between them" — so spinning keeps cores elevated during those
+        # gaps. Blocking instead adds a few microseconds to wake threads for the next run — negligible for
+        # 100ms+ CPU inference — while substantially reducing usage during backfill / retrieval.
+        # add_session_config_entry may be absent in older ORT versions; failure simply restores the default
+        # spin behavior (no functional impact), so swallowing the exception is not a load failure.
+        try:
+            sess_opts.add_session_config_entry(
+                "session.intra_op.allow_spinning", "0",
+            )
+        except Exception as e:  # noqa: BLE001 — older ORT lacks this key → keep default spin behavior
+            logger.debug(
+                "EmbeddingService: allow_spinning=0 not applied (%s: %s)",
+                type(e).__name__, e,
+            )
         self._session = ort.InferenceSession(
             model_path, sess_options=sess_opts, providers=["CPUExecutionProvider"],
         )
@@ -1309,10 +1399,10 @@ class EmbeddingService:
         try:
             self._tokenizer.enable_truncation(max_length=DEFAULT_VECTORS_MAX_LENGTH)
         except Exception as e:  # noqa: BLE001
-            # 不能继续 ready —— 见 _DisableReason.TRUNCATION_SETUP_FAILED 注释:
-            # model_id 把 max_length 编进 cache id,truncation 没生效时长文本
-            # 会被未截断地编码、却 stamp 成 mlen1024,污染 cache 语义。让 load
-            # 失败走 disable 路径,fallback service 接管,比错配 cache 安全得多。
+            # Must not report ready — see the comment for _DisableReason.TRUNCATION_SETUP_FAILED:
+            # model_id includes max_length in the cache ID; if truncation did not take effect, long text
+            # would be encoded without truncation but stamped as mlen1024, corrupting cache semantics. Make load
+            # fail and use the disable path so fallback service takes over; a cache mismatch is worse.
             logger.warning(
                 "EmbeddingService: tokenizer truncation setup failed (max_length=%d): %s",
                 DEFAULT_VECTORS_MAX_LENGTH, e,
@@ -1332,7 +1422,7 @@ class EmbeddingService:
         long entry can blow up activation memory for the whole batch
         (a long blob pasted into recent → entire 16-batch padded to
         thousands of tokens → multi-GB activations). We re-bucket here
-        by token budget ``batch × max_len ≤ _INFER_TOKEN_BUDGET``: short
+        by token budget ``batch × max_len ≤ _INFER_BATCH_MAX_TOKENS``: short
         rows still pack densely (same throughput as before for the
         normal case), and long rows fall into smaller buckets — capping
         the per-run activation footprint regardless of input shape.
@@ -1343,8 +1433,8 @@ class EmbeddingService:
         import numpy as np
 
         input_names = {i.name for i in self._session.get_inputs()}
-        # 按长度升序桶装。排序的目的是让相近长度凑一起,避免「一条短一条长」
-        # 浪费 padding 预算。每条出桶时记录 original index,run 完按原顺序填回。
+        # Bucket by ascending length. Sorting groups similar lengths to avoid wasting padding budget on "one short + one long";
+        # record each item's original index when adding it, then restore original order after run.
         order = sorted(range(len(encoded)), key=lambda i: len(encoded[i].ids))
         out: list[list[float] | None] = [None] * len(texts)
 
@@ -1353,9 +1443,9 @@ class EmbeddingService:
         for orig_i in order:
             n = len(encoded[orig_i].ids)
             new_max = max(bucket_max_len, n)
-            # 空桶必接受(哪怕单条 > budget),否则极端 max_length 配置会死锁;
-            # 非空桶按预算 flush。
-            if bucket_idx and new_max * (len(bucket_idx) + 1) > _INFER_TOKEN_BUDGET:
+            # Always accept an empty bucket (even if one item exceeds budget) or an extreme max_length setting could deadlock;
+            # flush non-empty buckets when they exceed budget.
+            if bucket_idx and new_max * (len(bucket_idx) + 1) > _INFER_BATCH_MAX_TOKENS:
                 self._run_bucket(bucket_idx, encoded, input_names, out, np)
                 bucket_idx = [orig_i]
                 bucket_max_len = n
@@ -1365,9 +1455,9 @@ class EmbeddingService:
         if bucket_idx:
             self._run_bucket(bucket_idx, encoded, input_names, out, np)
 
-        # 桶分配按 range(len(encoded)) 全覆盖 — 任何 None 残留都是 bug
-        # 而不是「正常但失败」,所以这里 assert 而不是静默过滤(过滤会改长度,
-        # 把 zip(texts, vectors) 错位)。
+        # Bucket assignment must cover all indices in range(len(encoded)) — any remaining None is a bug,
+        # not a "normal failure," so assert instead of silently filtering (filtering changes lengths
+        # and misaligns zip(texts, vectors)).
         assert all(v is not None for v in out), "bucket coverage gap"
         return out  # type: ignore[return-value]
 
@@ -1379,10 +1469,11 @@ class EmbeddingService:
         out: list,
         np,
     ) -> None:
-        """单桶的 pad → ONNX run → pool → L2-norm → 写回 ``out``。
+        """Single-bucket pad → ONNX run → pool → L2-norm → write back into ``out``.
 
-        拆出来纯粹是为了让 ``_infer_blocking`` 的桶装循环短一些;状态全
-        通过参数传,无副作用(``out`` 是按 original index 原地写)。
+        Split out purely to keep ``_infer_blocking``'s bucketing loop short; all
+        state is passed via parameters, no side effects (``out`` is written in
+        place by original index).
         """
         ids = [encoded[i].ids for i in bucket_idx]
         mask = [encoded[i].attention_mask for i in bucket_idx]
@@ -1448,8 +1539,7 @@ def get_embedding_service() -> EmbeddingService:
     sampling), so we don't bother short-circuiting on the lock outside.
     """
     global _SERVICE
-    if _SERVICE is None:
-        _SERVICE = _build_default_service()
+    _SERVICE = _service_lifecycle.get_or_create(_SERVICE, _build_default_service)
     return _SERVICE
 
 
@@ -1461,8 +1551,18 @@ def reset_embedding_service_for_tests() -> None:
     detection can verify the warning is emitted on its synthetic boot.
     """
     global _SERVICE, _VNNI_DECISION_LOGGED
-    _SERVICE = None
+    _SERVICE = _service_lifecycle.reset_for_tests()
     _VNNI_DECISION_LOGGED = False
+
+
+async def release_embedding_service() -> None:
+    """Release the process singleton and its native session references."""
+    global _SERVICE
+    service = _SERVICE
+    if service is not None:
+        await service.close()
+    if _SERVICE is service:
+        _SERVICE = None
 
 
 def _build_default_service() -> EmbeddingService:
@@ -1540,117 +1640,3 @@ def _build_default_service() -> EmbeddingService:
         has_avx2=has_avx2,
         avx2_absence_confirmed=avx2_absence_confirmed,
     )
-
-
-# ── cosine helpers (numpy-free for callers that only need scoring) ────
-
-
-def cosine_similarity(a, b) -> float:
-    """Cosine similarity between two unit-norm vectors.
-
-    Both ``embed()`` outputs are L2-normalized, so this is a straight
-    dot product — no division required. Accepts the canonical base64
-    form, legacy ``list[float]``, or an already-decoded numpy array;
-    decodes lazily so the per-pair API stays compatible with tests and
-    fact-dedup's single-pair callsite. For hot loops over thousands of
-    candidates, prefer building a stacked matrix once via
-    :func:`decode_embedding` and using ``M @ q`` — the recall path does
-    that.
-
-    Out-of-band inputs (None, empty, dim mismatch, malformed base64)
-    return 0.0 rather than raising; retrieval and dedup are happier
-    ranking around an unrankable candidate than crashing because one
-    entry was missing its embedding.
-    """
-    av = decode_embedding(a)
-    bv = decode_embedding(b)
-    if av is None or bv is None:
-        return 0.0
-    if av.size == 0 or bv.size == 0 or av.size != bv.size:
-        return 0.0
-    import numpy as np
-    return float(np.dot(av, bv))
-
-
-def is_cached_embedding_valid(
-    entry: dict, current_text: str, current_model_id: str | None,
-) -> bool:
-    """Decide whether the persisted embedding on ``entry`` is still good.
-
-    Match contract (mirrors ``token_count`` cache in persona.py):
-      * embedding field is a non-empty base64 string (canonical form
-        emitted by :func:`stamp_embedding_fields`)
-      * the payload actually decodes (corrupt base64 → invalid)
-      * decoded length matches the dim encoded in the running
-        ``model_id`` — guards against truncated payloads and against
-        a wrong-quantization payload sneaking through under the right
-        model_id string
-      * sha256 of ``current_text`` matches stored ``embedding_text_sha256``
-      * ``embedding_model_id`` matches the running service's id
-
-    Legacy ``list[float]`` payloads are intentionally treated as invalid
-    so the warmup worker re-stamps them in the new compact form. The
-    one-time CPU cost is bounded (small N at migration time) and avoids
-    carrying two on-disk shapes forward indefinitely.
-
-    Without the decode + dim check, a corrupt cache row would pass the
-    typeof guard, never get re-stamped by the worker (it keeps
-    "validating"), and silently fall through to the unembedded pool in
-    every recall — a permanent retrieval-quality regression for that
-    entry (Codex review on PR #1147).
-
-    Any mismatch → False, callers should clear the embedding fields and
-    re-enqueue the entry for the warmup worker.
-    """
-    if not isinstance(entry, dict):
-        return False
-    emb = entry.get("embedding")
-    if not isinstance(emb, str) or not emb:
-        return False
-    if current_model_id is None:
-        return False
-    if entry.get("embedding_model_id") != current_model_id:
-        return False
-    if entry.get("embedding_text_sha256") != _embedding_text_sha256(current_text):
-        return False
-    decoded = _decode_vector_fp16(emb)
-    if decoded is None or decoded.size == 0:
-        return False
-    expected_dim = parse_dim_from_model_id(current_model_id)
-    if expected_dim is not None and decoded.size != expected_dim:
-        return False
-    return True
-
-
-def clear_embedding_fields(entry: dict) -> None:
-    """In-place wipe of the embedding cache. Call from any path that
-    rewrites ``entry['text']`` so the next render/recall sees a clean
-    cache miss instead of a stale vector tied to the old text."""
-    if not isinstance(entry, dict):
-        return
-    entry["embedding"] = None
-    entry["embedding_text_sha256"] = None
-    entry["embedding_model_id"] = None
-
-
-def stamp_embedding_fields(
-    entry: dict, vector, text: str, model_id: str,
-) -> None:
-    """In-place write of an embedding triple onto an entry.
-
-    Stamping all three fields together (vector + text-sha + model-id)
-    in one helper prevents the half-written state where ``embedding`` is
-    set but the fingerprints aren't, which would otherwise look like a
-    legacy entry on the next read and trigger a recompute.
-
-    The vector is encoded to the canonical base64 fp16 form before
-    storage (see :func:`_encode_vector_fp16`). Callers pass the raw
-    fp32 list returned by :meth:`EmbeddingService.embed` — this helper
-    owns the on-disk encoding so the rest of the pipeline never sees
-    it.
-    """
-    if not isinstance(entry, dict):
-        return
-    entry["embedding"] = _encode_vector_fp16(vector)
-    entry["embedding_text_sha256"] = _embedding_text_sha256(text)
-    entry["embedding_model_id"] = model_id

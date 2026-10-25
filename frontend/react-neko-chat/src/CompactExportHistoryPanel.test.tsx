@@ -1,5 +1,5 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
-import CompactExportHistoryPanel from './CompactExportHistoryPanel';
+import CompactExportHistoryPanel, { isCompactExportMessageSelectable } from './CompactExportHistoryPanel';
 import { parseChatMessage } from './message-schema';
 
 const message = parseChatMessage({
@@ -45,6 +45,90 @@ function renderPanel(overrides: Partial<Parameters<typeof CompactExportHistoryPa
 }
 
 describe('CompactExportHistoryPanel', () => {
+  it('counts only visible recommendations while preserving dialogue and selection guards', () => {
+    const hidden = ['chat', 'news'].map(category => parseChatMessage({ ...message, id: `hidden-${category}`, blocks: [{
+      type: 'proactive_recommendation', recommendationId: '19f3bbca-a275-43d4-923d-1b2ceee91943',
+      category, state: 'pending', content: { title: '', source: '', url: '' },
+    }] }));
+    const visible = parseChatMessage({ ...message, id: 'visible-recommendation', blocks: [{
+      type: 'proactive_recommendation', recommendationId: '19f3bbca-a275-43d4-923d-1b2ceee91943',
+      category: 'vision', state: 'pending', content: { title: 'Look at the sky', source: '', url: '' },
+    }] });
+    const dialogue = parseChatMessage({ ...hidden[0], id: 'mixed-dialogue', blocks: [...hidden[0].blocks, ...message.blocks] });
+    const messages = [...hidden, visible, dialogue, message, { ...message, id: 'sending', status: 'sending' as const }];
+    const selectable = messages.filter(isCompactExportMessageSelectable);
+    expect(selectable.map(item => item.id)).toEqual(['visible-recommendation', 'mixed-dialogue', message.id]);
+    const { container } = renderPanel({ messages, selectedIds: new Set(selectable.map(item => item.id)),
+      selectedCount: selectable.length, selectableCount: selectable.length, previewOpen: false });
+    expect(container.querySelectorAll('.compact-export-history-bubble[role="button"]')).toHaveLength(3);
+    for (const item of hidden) expect(container.querySelector(`[data-message-id="${item.id}"]`)).toBeNull();
+  });
+  it('omits retired proactive placeholder rows while preserving actual dialogue', () => {
+    const placeholder = parseChatMessage({ ...message, id: 'retired-topic', blocks: [{
+      type: 'proactive_recommendation', recommendationId: '19f3bbca-a275-43d4-923d-1b2ceee91943',
+      category: 'chat', state: 'accepted', content: { title: '', source: '', url: '' },
+    }] });
+    const { container } = renderPanel({ messages: [placeholder, message], controlsOpen: false, previewOpen: false });
+    expect(container.querySelector('[data-message-id="retired-topic"]')).toBeNull();
+    expect(container.querySelector('.proactive-recommendation')).toBeNull();
+    expect(screen.getByText('Export me.')).toBeInTheDocument();
+  });
+  it('renders music recommendations inside the existing bubble and routes decisions only outside selection mode', () => {
+    const recommendation = parseChatMessage({ ...message, blocks: [{ type: 'music_recommendation',
+      recommendationId: '19f3bbca-a275-43d4-923d-1b2ceee91943', state: 'pending',
+      track: { name: 'Song', artist: 'Artist', url: '/music.wav', cover: '' } }] });
+    const props = createPanelProps({ messages: [recommendation], controlsOpen: false, previewOpen: false,
+      visibilityState: 'open', onAction: vi.fn() });
+    const view = render(<CompactExportHistoryPanel {...props} />);
+    expect(view.container.querySelector('.compact-export-history-bubble .music-recommendation-bubble')).toBeInTheDocument();
+    expect(view.container.querySelector('.music-recommendation-card,img')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /Listen/ }));
+    expect(props.onAction).toHaveBeenLastCalledWith(recommendation, expect.objectContaining({ payload: {
+      recommendationId: recommendation.blocks[0].type === 'music_recommendation' && recommendation.blocks[0].recommendationId,
+      kind: 'accepted' } }));
+    view.rerender(<CompactExportHistoryPanel {...props} controlsOpen />);
+    expect(screen.queryByRole('button', { name: /Listen/ })).not.toBeInTheDocument();
+  });
+  it('keeps image saving enabled in history and preserves message selection mode', () => {
+    const imageMessage = parseChatMessage({
+      ...message,
+      blocks: [{ type: 'image', url: '/media/selfie', alt: 'Selfie' }],
+    });
+    const props = createPanelProps({
+      messages: [imageMessage], previewOpen: false, visibilityState: 'open', controlsOpen: false,
+    });
+    const { container, rerender } = render(<CompactExportHistoryPanel {...props} />);
+    const bubble = container.querySelector('.compact-export-history-bubble');
+    expect(bubble).not.toHaveAttribute('aria-disabled', 'true');
+    expect(screen.getByRole('button', { name: 'Save image' })).toBeEnabled();
+
+    rerender(<CompactExportHistoryPanel {...props} controlsOpen />);
+    expect(screen.queryByRole('button', { name: 'Save image' })).not.toBeInTheDocument();
+    expect(bubble).toHaveAttribute('role', 'button');
+    expect(bubble).toHaveAttribute('aria-disabled', 'false');
+    fireEvent.click(bubble!);
+    expect(props.onToggleMessage).toHaveBeenCalledWith(imageMessage.id);
+  });
+
+  it('keeps nonselectable image messages accessible with selection controls open', () => {
+    const imageMessage = parseChatMessage({
+      ...message,
+      status: 'sending',
+      blocks: [{ type: 'image', url: '/media/selfie', alt: 'Selfie' }],
+    });
+    const props = createPanelProps({
+      messages: [imageMessage], previewOpen: false, visibilityState: 'open', controlsOpen: true,
+      selectedIds: new Set(), selectedCount: 0, selectableCount: 0,
+    });
+    const { container } = render(<CompactExportHistoryPanel {...props} />);
+    const bubble = container.querySelector('.compact-export-history-bubble');
+    expect(bubble).not.toHaveAttribute('role');
+    expect(bubble).not.toHaveAttribute('aria-disabled');
+    expect(screen.getByRole('button', { name: 'Save image' })).toHaveAttribute('aria-disabled', 'false');
+    fireEvent.click(bubble!);
+    expect(props.onToggleMessage).not.toHaveBeenCalled();
+  });
+
   it('shows the history height resize bar only outside preview and wires its hit-region', () => {
     const { container, rerender } = renderPanel({ previewOpen: false, visibilityState: 'open' });
     const bar = container.querySelector('.compact-export-history-resize-bar');
@@ -62,12 +146,95 @@ describe('CompactExportHistoryPanel', () => {
     expect(container.querySelector('.compact-export-history-resize-bar.is-active')).not.toBeNull();
   });
 
-  it('flags the anchor as resizing so content height locks to max (no reflow on shrink)', () => {
+  it('separates the active resize handle from the content height lock', () => {
     const { container, rerender } = renderPanel({ previewOpen: false, visibilityState: 'open', historyResizeActive: false });
     const anchor = container.querySelector('.compact-export-history-anchor');
     expect(anchor?.getAttribute('data-compact-export-history-resizing')).toBe('false');
+    expect(anchor?.getAttribute('data-compact-export-history-content-locked')).toBe('false');
     rerender(<CompactExportHistoryPanel {...createPanelProps({ previewOpen: false, visibilityState: 'open', historyResizeActive: true })} />);
     expect(anchor?.getAttribute('data-compact-export-history-resizing')).toBe('true');
+    expect(anchor?.getAttribute('data-compact-export-history-content-locked')).toBe('false');
+    rerender(<CompactExportHistoryPanel {...createPanelProps({
+      previewOpen: false,
+      visibilityState: 'open',
+      historyResizeActive: true,
+      historyResizeContentLocked: true,
+    })} />);
+    expect(anchor?.getAttribute('data-compact-export-history-resizing')).toBe('true');
+    expect(anchor?.getAttribute('data-compact-export-history-content-locked')).toBe('true');
+  });
+
+  it('does not repin scrollTop when releasing the history resize content lock', () => {
+    const scrollTopValues: number[] = [];
+    const scrollTopByElement = new WeakMap<HTMLElement, number>();
+    const scrollHeightDescriptor = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'scrollHeight');
+    const clientHeightDescriptor = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'clientHeight');
+    const scrollTopDescriptor = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'scrollTop');
+    const requestAnimationFrameSpy = vi
+      .spyOn(window, 'requestAnimationFrame')
+      .mockImplementation(() => 0);
+
+    Object.defineProperty(HTMLElement.prototype, 'scrollHeight', {
+      configurable: true,
+      get() {
+        return this.classList.contains('compact-export-history-scroll') ? 640 : 0;
+      },
+    });
+    Object.defineProperty(HTMLElement.prototype, 'clientHeight', {
+      configurable: true,
+      get() {
+        return this.classList.contains('compact-export-history-scroll') ? 300 : 0;
+      },
+    });
+    Object.defineProperty(HTMLElement.prototype, 'scrollTop', {
+      configurable: true,
+      get() {
+        return scrollTopByElement.get(this) ?? 0;
+      },
+      set(value: number) {
+        scrollTopByElement.set(this, value);
+        if (this.classList.contains('compact-export-history-scroll')) {
+          scrollTopValues.push(value);
+        }
+      },
+    });
+
+    try {
+      const props = createPanelProps({
+        previewOpen: false,
+        visibilityState: 'open',
+        autoScrollToBottom: true,
+        historyResizeActive: true,
+        historyResizeContentLocked: false,
+      });
+      const { rerender } = render(<CompactExportHistoryPanel {...props} />);
+      scrollTopValues.length = 0;
+      expect(scrollTopValues).toHaveLength(0);
+
+      rerender(<CompactExportHistoryPanel {...props} historyResizeContentLocked />);
+      expect(scrollTopValues).toEqual([340]);
+
+      scrollTopValues.length = 0;
+      rerender(<CompactExportHistoryPanel {...props} historyResizeContentLocked={false} />);
+      expect(scrollTopValues).toHaveLength(0);
+    } finally {
+      if (scrollHeightDescriptor) {
+        Object.defineProperty(HTMLElement.prototype, 'scrollHeight', scrollHeightDescriptor);
+      } else {
+        Reflect.deleteProperty(HTMLElement.prototype, 'scrollHeight');
+      }
+      if (clientHeightDescriptor) {
+        Object.defineProperty(HTMLElement.prototype, 'clientHeight', clientHeightDescriptor);
+      } else {
+        Reflect.deleteProperty(HTMLElement.prototype, 'clientHeight');
+      }
+      if (scrollTopDescriptor) {
+        Object.defineProperty(HTMLElement.prototype, 'scrollTop', scrollTopDescriptor);
+      } else {
+        Reflect.deleteProperty(HTMLElement.prototype, 'scrollTop');
+      }
+      requestAnimationFrameSpy.mockRestore();
+    }
   });
 
   it('re-pins the history list to the bottom on geometry refresh only while shrinking and auto-following', () => {
@@ -403,6 +570,8 @@ describe('CompactExportHistoryPanel', () => {
     await waitFor(() => {
       expect(screen.getByText('Failed to build the preview.')).toBeInTheDocument();
     });
+    // 降级预览的时间须带类名，styles.css 靠它锁住 nowrap，否则继承 anywhere 后会被拆行。
+    expect(document.querySelector('.compact-export-preview-meta .compact-export-preview-time')).toHaveTextContent('10:00');
   });
 
   it('handles rejected export actions without leaving the action pending', async () => {
@@ -415,6 +584,7 @@ describe('CompactExportHistoryPanel', () => {
       await waitFor(() => {
         expect(screen.getByTitle('Export Preview')).toBeInTheDocument();
       });
+      expect(screen.getByTitle('Export Preview')).toHaveAttribute('sandbox', 'allow-scripts');
 
       const copyButton = screen.getByRole('button', { name: 'Copy to Clipboard' });
       fireEvent.click(copyButton);
@@ -433,6 +603,58 @@ describe('CompactExportHistoryPanel', () => {
     } finally {
       consoleError.mockRestore();
     }
+  });
+
+  it('restores Markdown as an export format for preview, copy, and download', async () => {
+    const onBuildPreview = vi.fn().mockResolvedValue({
+      previewKind: 'document',
+      previewDocument: '<!doctype html><html><body>Markdown Preview</body></html>',
+    });
+    const onCopyExport = vi.fn();
+    const onDownloadExport = vi.fn();
+
+    renderPanel({ onBuildPreview, onCopyExport, onDownloadExport });
+
+    await waitFor(() => {
+      expect(onBuildPreview).toHaveBeenCalledWith({
+        messageIds: [message.id],
+        format: 'image',
+        imageStyle: 'neko',
+        imageFormat: 'png',
+      });
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Markdown' }));
+
+    await waitFor(() => {
+      expect(onBuildPreview).toHaveBeenCalledWith({
+        messageIds: [message.id],
+        format: 'markdown',
+        imageStyle: 'neko',
+        imageFormat: 'png',
+      });
+    });
+    expect(screen.queryByRole('button', { name: 'N.E.K.O' })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Copy to Clipboard' }));
+    await waitFor(() => {
+      expect(onCopyExport).toHaveBeenCalledWith({
+        messageIds: [message.id],
+        format: 'markdown',
+        imageStyle: 'neko',
+        imageFormat: 'png',
+      });
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Export' }));
+    await waitFor(() => {
+      expect(onDownloadExport).toHaveBeenCalledWith({
+        messageIds: [message.id],
+        format: 'markdown',
+        imageStyle: 'neko',
+        imageFormat: 'png',
+      });
+    });
   });
 
   it('clears rejected export action errors when the preview closes', async () => {
@@ -463,5 +685,15 @@ describe('CompactExportHistoryPanel', () => {
     } finally {
       consoleError.mockRestore();
     }
+  });
+
+  it('renders a 凝神 thinking-dots bubble at the tail only while thinking', () => {
+    const { container, rerender } = renderPanel({ previewOpen: false, visibilityState: 'open' });
+    expect(container.querySelector('.focus-thinking-history-row')).toBeNull();
+    rerender(<CompactExportHistoryPanel {...createPanelProps({ previewOpen: false, visibilityState: 'open', thinking: true })} />);
+    const row = container.querySelector('.focus-thinking-history-row');
+    expect(row).not.toBeNull();
+    expect(row?.getAttribute('data-focus-thinking')).toBe('true');
+    expect(row?.querySelectorAll('.focus-thinking-dot').length).toBe(3);
   });
 });

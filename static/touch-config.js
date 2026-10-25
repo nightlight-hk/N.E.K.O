@@ -241,8 +241,12 @@ function touchPage_open(){
     }
 }
 
-async function InitializationTouchSet(characterJson) {
-    
+// 并发刷新世代号：连续保存/保存+热切换会同时跑多个 InitializationTouchSet，
+// 较早发出的 /api/characters GET 可能较晚返回；提交前丢弃非最新世代的结果，
+// 防止旧快照覆盖新配置。
+let touchSetInitializationGeneration = 0
+
+async function InitializationTouchSet(characterJson, options = {}) {
     while(typeof window.t !== 'function'){
         await new Promise(resolve => setTimeout(resolve, 500));
     }
@@ -250,19 +254,31 @@ async function InitializationTouchSet(characterJson) {
     const modelType = localStorage.getItem('modelType') || 'live2d';
     const isVRMActive = window.vrmManager && window.vrmManager.currentModel;
     const isMMDActive = window.mmdManager && window.mmdManager.currentModel;
-    if (modelType !== 'live2d' || isVRMActive || isMMDActive) {
+    // allowLive2DReload：调用方刚完成 Live2D 模型加载/热切换时使用。此场景下
+    // localStorage.modelType 和 vrm/mmdManager.currentModel 可能还是切换前的
+    // 旧值（热切换只暂停 VRM/MMD 渲染、不清 currentModel），守卫会误拦刷新。
+    if (!options.allowLive2DReload && (modelType !== 'live2d' || isVRMActive || isMMDActive)) {
         console.log('[TouchSet] 当前模型类型不是 Live2D，跳过触摸配置初始化');
-        return;
+        return false;
     }
 
-            
+    // 世代号在类型守卫之后才递增：被守卫拦下的调用（如 VRM 残留状态下收到
+    // 保存广播）不得让更早在途的有效刷新（VRM→Live2D 切换窗口内的加载钩子
+    // 读）被判为过期丢弃。
+    const initializationGeneration = ++touchSetInitializationGeneration
+
     if (!characterJson){
         // // 获取角色名称
         // const lanlanName = await getLanlanName();
-        
-        // 优先从 URL 获取
+
+        // 解析优先级：显式指定（角色切换钩子传入新角色名）> 本页面当前角色
+        // （lanlan_config 会随原地切角色更新；URL 在切角色后是旧值）> URL >
+        // page_config。模型管理页没有 lanlan_config，按其 URL/服务端当前角色
+        // 解析，行为不变。
         const urlParams = new URLSearchParams(window.location.search);
-        let lanlanName = urlParams.get('lanlan_name') || '';
+        let lanlanName = String(options.lanlanName || '').trim()
+            || String(window.lanlan_config?.lanlan_name || '').trim()
+            || urlParams.get('lanlan_name') || '';
         // 如果 URL 中没有，从 API 获取（使用 RequestHelper）
         if (!lanlanName) {
             try {
@@ -278,17 +294,24 @@ async function InitializationTouchSet(characterJson) {
         }
 
         if (!lanlanName) {
-            return;
+            // 角色名解析失败（如 page_config 瞬时故障）：未提交任何数据。
+            // 返回 false 让调用方（待刷新标记）保留重试机会。
+            return false;
         }
 
 
         const response = await fetch('/api/characters');
         const charactersJson = await response.json();
         characterJson = charactersJson.猫娘[lanlanName]
+        if (!characterJson) {
+            // 角色不存在/数据缺失：同样视为未提交，避免 undefined 解引用。
+            console.warn('[TouchSet] 未找到角色的触摸配置数据:', lanlanName)
+            return false;
+        }
     }else{
         // 呃
     }
-    let model 
+    let model
     for(let i = 0;i<5;i++){
         model = window.live2dManager.getCurrentModel()
         if (model){
@@ -299,17 +322,39 @@ async function InitializationTouchSet(characterJson) {
         }
     }
 
+    const modelName = window.live2dManager.modelName || ''
     const touchSet = characterJson._reserved?.touch_set || {};
-    
-    if(!touchSet[window.live2dManager.modelName]){
-        touchSet[window.live2dManager.modelName] = {"default":{"motions": [], "expressions": []}}
+
+    // 过期响应丢弃：已有更新的刷新在途时，本次旧结果不得提交，
+    // 防止较晚完成的旧 GET 覆盖较新的触摸配置。返回 'superseded' 让调用方
+    // 区分：新调用接管提交与失败重试，旧调用不得安排重试（重试的世代号
+    // 递增会丢弃新调用的在途结果）。
+    if (initializationGeneration !== touchSetInitializationGeneration) {
+        console.log('[TouchSet] 有更新的触摸配置刷新在途，丢弃本次过期结果')
+        return 'superseded';
+    }
+
+    if(modelName && !touchSet[modelName]){
+        touchSet[modelName] = {"default":{"motions": [], "expressions": []}}
     }
     window.live2dManager.touchSet = touchSet;
+    window.live2dManager._touchSetLoadedAt = Date.now()
     window.live2dManager.touchSetFilter = {}
     window.live2dManager.touchSetHitEventLock = false
 
+    if (!model) {
+        // 模型就绪前不能把 undefined 交给 setupHitAreaInteraction：那会让原生
+        // HitArea 监听在本页面会话里一直处于未接线状态且无人补救。触摸数据
+        // 已提交（返回 true），接线由模型加载完成后的 nekoRefreshLive2DTouchSet() 补上。
+        console.warn('[TouchSet] 等待期内模型未就绪，触摸数据已生效，HitArea 接线待模型加载完成后补上')
+        return true;
+    }
+
     window.live2dManager.setupHitAreaInteraction(model)
+    return true;
 }
+
+const TOUCH_SET_SAVE_TIMEOUT_MS = 10000
 
 async function saveTouchSetToServer() {
     const modelName = window.live2dManager?.modelName;
@@ -322,12 +367,18 @@ async function saveTouchSetToServer() {
     
     const touchSetData = syncCurrentTouchSetConfigToManager();
     
+    const saveController = typeof AbortController !== 'undefined' ? new AbortController() : null
+    const saveTimeout = saveController
+        ? setTimeout(() => saveController.abort(), TOUCH_SET_SAVE_TIMEOUT_MS)
+        : null
+
     try {
         const response = await fetch(`/api/characters/catgirl/${encodeURIComponent(lanlanName)}/touch_set`, {
             method: 'PATCH',
             headers: {
                 'Content-Type': 'application/json'
             },
+            ...(saveController ? { signal: saveController.signal } : {}),
             body: JSON.stringify({
                 model_name: modelName,
                 touch_set: touchSetData
@@ -335,9 +386,10 @@ async function saveTouchSetToServer() {
         });
         
         const result = await response.json();
-        
+
         if (result.success) {
             syncTouchSetDataToManager(touchSetData);
+            broadcastTouchSetUpdated(modelName)
             console.log(`[TouchSet] 已保存模型 ${modelName} 的触摸配置到服务器`);
             return true;
         } else {
@@ -347,6 +399,8 @@ async function saveTouchSetToServer() {
     } catch (error) {
         console.error('[TouchSet] 保存请求失败:', error);
         return false;
+    } finally {
+        if (saveTimeout) clearTimeout(saveTimeout)
     }
 }
 
@@ -684,8 +738,7 @@ function createTouchAreaConfigItem(hitArea, options) {
 function openCustomTouchAreaWindow(options = {}) {
     const manager = window.live2dManager
     const model = manager?.getCurrentModel?.()
-    const sourceCanvas = manager?.pixi_app?.view || manager?.pixi_app?.renderer?.view || document.getElementById('live2d-canvas')
-    if (!manager || !model || !sourceCanvas) {
+    if (!manager || !model) {
         createTouchConfigFloatingWindow({ content: touchAnimText('previewUnavailable', '当前无法打开自定义区域预览') })
         return
     }
@@ -721,6 +774,10 @@ function openCustomTouchAreaWindow(options = {}) {
     const previewWrap = document.createElement('div')
     previewWrap.className = 'touch-custom-preview-wrap'
 
+    const previewLive2dCanvas = document.createElement('canvas')
+    previewLive2dCanvas.className = 'touch-custom-live2d-canvas'
+    previewWrap.appendChild(previewLive2dCanvas)
+
     const previewCanvas = document.createElement('canvas')
     previewCanvas.className = 'touch-custom-preview-canvas'
     previewWrap.appendChild(previewCanvas)
@@ -749,6 +806,18 @@ function openCustomTouchAreaWindow(options = {}) {
     status.className = 'touch-custom-status'
     status.setAttribute('aria-live', 'polite')
     content.appendChild(status)
+
+    let saveBeforeCloseInProgress = false
+    const closeFloatingWindow = floatingWindow.close.bind(floatingWindow)
+    floatingWindow.close = function(cleanup) {
+        if (saveBeforeCloseInProgress) {
+            status.textContent = window.t
+                ? window.t('live2d.savingSettings', '正在保存设置...')
+                : '正在保存设置...'
+            return
+        }
+        closeFloatingWindow(cleanup)
+    }
 
     const buttons = document.createElement('div')
     buttons.className = 'hitarea-buttons touch-custom-buttons'
@@ -787,6 +856,13 @@ function openCustomTouchAreaWindow(options = {}) {
     }
     let initialSelectionApplied = false
     let previewBaseBounds = null
+    let previewApp = null
+    let previewModel = null
+    let previewModelReady = false
+    let previewDisposed = false
+    let previewLoadStarted = false
+    let previewModelFitted = false
+    let previewRendererSize = { width: 0, height: 0 }
     const MIN_SELECTION_SIZE = 10
     const RESIZE_HIT_PADDING = 10
     const HOVER_LABEL_OFFSET_X = 16
@@ -795,17 +871,207 @@ function openCustomTouchAreaWindow(options = {}) {
     const previewBaseAreaRecords = getCustomTouchAreaRecordsFromSet(options.touchSet || {})
         .filter(record => record.area.id !== editingArea?.id)
 
-    function getSourceCssSize() {
-        const screen = manager.pixi_app?.renderer?.screen
-        const width = Number(screen?.width) || sourceCanvas.clientWidth || window.innerWidth || sourceCanvas.width
-        const height = Number(screen?.height) || sourceCanvas.clientHeight || window.innerHeight || sourceCanvas.height
-        return { width: Math.max(1, width), height: Math.max(1, height) }
+    function getPreviewWrapSize() {
+        return {
+            width: Math.max(1, previewWrap.clientWidth || previewWrap.offsetWidth || 1),
+            height: Math.max(1, previewWrap.clientHeight || previewWrap.offsetHeight || 1)
+        }
+    }
+
+    function getPreviewModelPath() {
+        const candidates = [
+            manager?._lastLoadedModelPath,
+            manager?.lastLoadedModelPath,
+            model?.internalModel?.settings?.url,
+            model?.internalModel?.settings?.json?.url,
+            model?.internalModel?.settings?.json?.Url,
+            model?.url
+        ]
+        return candidates.find(candidate => typeof candidate === 'string' && candidate.trim())
+    }
+
+    function getPreviewLive2DModelClass() {
+        return window.Live2DModel
+            || window.PIXI?.live2d?.Live2DModel
+            || window.PIXI?.live2d?.cubism4?.Live2DModel
+    }
+
+    function getCoreParameterId(coreModel, index) {
+        if (!coreModel || !Number.isInteger(index) || index < 0) return null
+        try {
+            const id = coreModel._parameterIds?.[index]
+                ?? coreModel._model?.parameters?.ids?.[index]
+                ?? coreModel.model?.parameters?.ids?.[index]
+                ?? coreModel.parameters?.ids?.[index]
+            if (id) return String(id)
+        } catch (_) {}
+        try {
+            if (typeof coreModel.getParameterId === 'function') {
+                const id = coreModel.getParameterId(index)
+                if (id) return String(id)
+            }
+        } catch (_) {}
+        return null
+    }
+
+    function copyCurrentModelParametersToPreview() {
+        const sourceCoreModel = model?.internalModel?.coreModel
+        const previewCoreModel = previewModel?.internalModel?.coreModel
+        if (!sourceCoreModel || !previewCoreModel) return
+
+        const sourceCount = typeof sourceCoreModel.getParameterCount === 'function'
+            ? Number(sourceCoreModel.getParameterCount())
+            : 0
+        const previewCount = typeof previewCoreModel.getParameterCount === 'function'
+            ? Number(previewCoreModel.getParameterCount())
+            : 0
+        if (!Number.isFinite(sourceCount) || sourceCount <= 0) return
+
+        for (let index = 0; index < sourceCount; index += 1) {
+            const paramId = getCoreParameterId(sourceCoreModel, index)
+            if (paramId && /(?:opacity|visibility)/i.test(paramId)) continue
+
+            let targetIndex = -1
+            if (paramId && typeof previewCoreModel.getParameterIndex === 'function') {
+                try {
+                    targetIndex = previewCoreModel.getParameterIndex(paramId)
+                } catch (_) {}
+            }
+            if (targetIndex < 0 && index < previewCount) targetIndex = index
+            if (targetIndex < 0) continue
+
+            try {
+                const value = Number(sourceCoreModel.getParameterValueByIndex(index))
+                if (!Number.isFinite(value)) continue
+                previewCoreModel.setParameterValueByIndex(targetIndex, value)
+            } catch (_) {}
+        }
+    }
+
+    function resizePreviewRenderer() {
+        if (!previewApp?.renderer) return false
+        const size = getPreviewWrapSize()
+        if (previewRendererSize.width === size.width && previewRendererSize.height === size.height) return false
+
+        previewRendererSize = size
+        try {
+            previewApp.renderer.resize(size.width, size.height)
+        } catch (_) {}
+        previewBaseBounds = null
+        previewModelFitted = false
+        return true
+    }
+
+    function fitPreviewModelToWrap() {
+        if (!previewModel || !previewApp?.renderer) return false
+        const size = getPreviewWrapSize()
+
+        try {
+            previewModel.x = 0
+            previewModel.y = 0
+            if (previewModel.scale && typeof previewModel.scale.set === 'function') {
+                previewModel.scale.set(1, 1)
+            } else if (previewModel.scale) {
+                previewModel.scale.x = 1
+                previewModel.scale.y = 1
+            }
+            previewApp.renderer.render(previewApp.stage)
+        } catch (_) {}
+
+        const bounds = normalizePixiBoundsRect(previewModel.getBounds?.())
+        if (!bounds || bounds.width <= 0 || bounds.height <= 0) return false
+
+        const paddedWidth = bounds.width * 1.18
+        const paddedHeight = bounds.height * 1.18
+        const scale = Math.min(size.width / paddedWidth, size.height / paddedHeight)
+        if (!Number.isFinite(scale) || scale <= 0) return false
+
+        if (previewModel.scale && typeof previewModel.scale.set === 'function') {
+            previewModel.scale.set(scale, scale)
+        } else if (previewModel.scale) {
+            previewModel.scale.x = scale
+            previewModel.scale.y = scale
+        }
+        previewModel.x = (size.width - bounds.width * scale) / 2 - bounds.left * scale
+        previewModel.y = (size.height - bounds.height * scale) / 2 - bounds.top * scale
+        previewBaseBounds = null
+
+        try {
+            previewApp.renderer.render(previewApp.stage)
+        } catch (_) {}
+        return true
+    }
+
+    async function loadPreviewModel() {
+        const modelPath = getPreviewModelPath()
+        const PixiApplication = window.PIXI?.Application
+        const Live2DModelClass = getPreviewLive2DModelClass()
+        if (!modelPath || !PixiApplication || !Live2DModelClass) {
+            throw new Error('Live2D preview dependencies are unavailable')
+        }
+
+        const size = getPreviewWrapSize()
+        previewApp = new PixiApplication({
+            view: previewLive2dCanvas,
+            width: size.width,
+            height: size.height,
+            transparent: true,
+            backgroundAlpha: 0,
+            autoDensity: true,
+            resolution: window.devicePixelRatio || 1
+        })
+        previewRendererSize = size
+        previewLoadStarted = true
+
+        const loadedModel = await Live2DModelClass.from(modelPath, { autoFocus: false })
+        if (previewDisposed) {
+            try {
+                loadedModel?.destroy?.({ children: true, texture: false, baseTexture: false })
+            } catch (_) {}
+            return
+        }
+
+        previewModel = loadedModel
+        previewApp.stage.addChild(previewModel)
+        copyCurrentModelParametersToPreview()
+        previewModelReady = true
+        previewLive2dCanvas.classList.add('is-ready')
+        resizePreviewRenderer()
+        previewModelFitted = fitPreviewModelToWrap()
+    }
+
+    function destroyPreviewModel() {
+        previewDisposed = true
+        previewModelReady = false
+        previewModelFitted = false
+        previewBaseBounds = null
+        previewLive2dCanvas.classList.remove('is-ready')
+
+        const modelToDestroy = previewModel
+        const appToDestroy = previewApp
+        previewModel = null
+        previewApp = null
+
+        try {
+            if (modelToDestroy?.parent) modelToDestroy.parent.removeChild(modelToDestroy)
+        } catch (_) {}
+        try {
+            modelToDestroy?.destroy?.({ children: true, texture: false, baseTexture: false })
+        } catch (_) {}
+        try {
+            appToDestroy?.destroy?.(false, { children: true, texture: false, baseTexture: false })
+        } catch (_) {
+            try {
+                appToDestroy?.destroy?.(false)
+            } catch (_) {}
+        }
     }
 
     function getPreviewBaseBounds() {
         if (previewBaseBounds) return previewBaseBounds
+        if (!previewModelReady || !previewModel) return null
         try {
-            const bounds = normalizePixiBoundsRect(model.getBounds())
+            const bounds = normalizePixiBoundsRect(previewModel.getBounds?.())
             if (!bounds) return null
             previewBaseBounds = {
                 left: bounds.left,
@@ -824,44 +1090,14 @@ function openCustomTouchAreaWindow(options = {}) {
     function updatePreviewMetrics() {
         const wrapWidth = previewWrap.clientWidth || 1
         const wrapHeight = previewWrap.clientHeight || 1
-        const sourceSize = getSourceCssSize()
         const bounds = getPreviewBaseBounds()
-        const previewAspect = wrapWidth / wrapHeight
-        const padding = bounds ? Math.max(bounds.width, bounds.height) * 0.18 : 0
-        let cropWidth = bounds ? bounds.width + padding * 2 : sourceSize.width
-        let cropHeight = bounds ? bounds.height + padding * 2 : sourceSize.height
-        if (cropWidth / cropHeight < previewAspect) {
-            cropWidth = cropHeight * previewAspect
-        } else {
-            cropHeight = cropWidth / previewAspect
-        }
-        const centerX = bounds ? bounds.left + bounds.width / 2 : sourceSize.width / 2
-        const centerY = bounds ? bounds.top + bounds.height / 2 : sourceSize.height / 2
-        const cropLeft = centerX - cropWidth / 2
-        const cropTop = centerY - cropHeight / 2
-        const scale = Math.min(wrapWidth / cropWidth, wrapHeight / cropHeight)
-        const drawWidth = cropWidth * scale
-        const drawHeight = cropHeight * scale
-        const offsetX = (wrapWidth - drawWidth) / 2
-        const offsetY = (wrapHeight - drawHeight) / 2
         const modelRect = bounds ? {
-            x: offsetX + (bounds.left - cropLeft) * scale,
-            y: offsetY + (bounds.top - cropTop) * scale,
-            width: bounds.width * scale,
-            height: bounds.height * scale
+            x: bounds.left,
+            y: bounds.top,
+            width: bounds.width,
+            height: bounds.height
         } : null
         previewMetrics = {
-            sourceWidth: sourceSize.width,
-            sourceHeight: sourceSize.height,
-            cropLeft,
-            cropTop,
-            cropWidth,
-            cropHeight,
-            scale,
-            drawWidth,
-            drawHeight,
-            offsetX,
-            offsetY,
             wrapWidth,
             wrapHeight,
             modelRect
@@ -1254,7 +1490,16 @@ function openCustomTouchAreaWindow(options = {}) {
     }
 
     function drawPreviewFrame() {
+        const selectionBeforeLayout = !drawing && selectionRect ? selectionToNormalizedRect() : null
+        const previewSizeChanged = resizePreviewRenderer()
+        if (previewModelReady && (!previewModelFitted || previewSizeChanged)) {
+            previewModelFitted = fitPreviewModelToWrap()
+        }
         const metrics = updatePreviewMetrics()
+        if (selectionBeforeLayout && metrics.modelRect) {
+            selectionRect = normalizedRectToPreviewRect(selectionBeforeLayout, metrics.modelRect)
+            applyBoxRect(selectionBox, selectionRect)
+        }
         const dpr = window.devicePixelRatio || 1
         const targetWidth = Math.max(1, Math.round(metrics.wrapWidth * dpr))
         const targetHeight = Math.max(1, Math.round(metrics.wrapHeight * dpr))
@@ -1266,29 +1511,6 @@ function openCustomTouchAreaWindow(options = {}) {
         if (ctx) {
             ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
             ctx.clearRect(0, 0, metrics.wrapWidth, metrics.wrapHeight)
-            try {
-                const sourceScaleX = sourceCanvas.width / metrics.sourceWidth
-                const sourceScaleY = sourceCanvas.height / metrics.sourceHeight
-                const sx = Math.max(0, metrics.cropLeft)
-                const sy = Math.max(0, metrics.cropTop)
-                const ex = Math.min(metrics.sourceWidth, metrics.cropLeft + metrics.cropWidth)
-                const ey = Math.min(metrics.sourceHeight, metrics.cropTop + metrics.cropHeight)
-                const sw = Math.max(0, ex - sx)
-                const sh = Math.max(0, ey - sy)
-                if (sw > 0 && sh > 0) {
-                    ctx.drawImage(
-                        sourceCanvas,
-                        sx * sourceScaleX,
-                        sy * sourceScaleY,
-                        sw * sourceScaleX,
-                        sh * sourceScaleY,
-                        metrics.offsetX + (sx - metrics.cropLeft) * metrics.scale,
-                        metrics.offsetY + (sy - metrics.cropTop) * metrics.scale,
-                        sw * metrics.scale,
-                        sh * metrics.scale
-                    )
-                }
-            } catch (_) {}
         }
 
         const modelPreviewRect = getModelPreviewRect()
@@ -1394,7 +1616,69 @@ function openCustomTouchAreaWindow(options = {}) {
         hideHoverLabel()
     })
 
-    saveButton.onclick = function() {
+    async function waitForActiveTouchSetSave() {
+        const startedAt = Date.now()
+        while (isSaving) {
+            if (Date.now() - startedAt >= TOUCH_SET_SAVE_TIMEOUT_MS) {
+                console.error('[TouchSet] Waiting for active save timed out')
+                return false
+            }
+            await new Promise(resolve => setTimeout(resolve, 50))
+        }
+        return true
+    }
+
+    async function flushTouchSetSaveBeforePreviewClose() {
+        if (autoSaveTimeout) {
+            clearTimeout(autoSaveTimeout)
+            autoSaveTimeout = null
+        }
+
+        const saveAvailable = await waitForActiveTouchSetSave()
+        if (!saveAvailable) return false
+        if (autoSaveTimeout) {
+            clearTimeout(autoSaveTimeout)
+            autoSaveTimeout = null
+        }
+
+        isSaving = true
+        try {
+            const success = await saveTouchSetToServer()
+            if (success) {
+                showSaveIndicator()
+            }
+            return success
+        } finally {
+            isSaving = false
+        }
+    }
+
+    async function drainTouchSetSaveBeforePreviewReload() {
+        let shouldFlushQueuedSave = !!autoSaveTimeout
+        if (shouldFlushQueuedSave) {
+            clearTimeout(autoSaveTimeout)
+            autoSaveTimeout = null
+        }
+
+        const saveAvailable = await waitForActiveTouchSetSave()
+        if (!saveAvailable) return false
+        if (autoSaveTimeout) {
+            clearTimeout(autoSaveTimeout)
+            autoSaveTimeout = null
+            shouldFlushQueuedSave = true
+        }
+        if (!shouldFlushQueuedSave) return true
+
+        isSaving = true
+        try {
+            return await saveTouchSetToServer()
+        } finally {
+            isSaving = false
+        }
+    }
+
+    saveButton.onclick = async function() {
+        if (saveButton.disabled) return
         const rect = selectionToNormalizedRect()
         if (!rect) {
             status.textContent = touchAnimText('selectAreaFirst', '请先框选一个有效区域')
@@ -1416,17 +1700,53 @@ function openCustomTouchAreaWindow(options = {}) {
                 rect
             })
         }
+        saveButton.disabled = true
+        cancelButton.disabled = true
+        saveBeforeCloseInProgress = true
+        try {
+            const saveSuccess = await flushTouchSetSaveBeforePreviewClose()
+            if (!saveSuccess) {
+                status.textContent = window.t
+                    ? window.t('live2d.saveFailedGeneral', '保存失败!')
+                    : '保存失败!'
+                return
+            }
+        } finally {
+            saveBeforeCloseInProgress = false
+            saveButton.disabled = false
+            cancelButton.disabled = false
+        }
         floatingWindow.close()
     }
 
-    floatingWindow.onClose = function() {
+    floatingWindow.onClose = async function() {
         if (animationFrameId) {
             cancelAnimationFrame(animationFrameId)
             animationFrameId = null
         }
+        const shouldReloadSourceModel = previewLoadStarted
+        const canReloadSourceModel = shouldReloadSourceModel
+            ? await drainTouchSetSaveBeforePreviewReload()
+            : true
+        destroyPreviewModel()
+        if (shouldReloadSourceModel && canReloadSourceModel && typeof window.reloadCurrentLive2DModelInModelManager === 'function') {
+            const reloadPromise = window.reloadCurrentLive2DModelInModelManager({
+                reason: 'custom-touch-area-preview-close'
+            })
+            if (reloadPromise && typeof reloadPromise.catch === 'function') {
+                reloadPromise.catch(error => {
+                    console.warn('[TouchConfig] Failed to reload model manager Live2D model:', error)
+                })
+            }
+        }
     }
 
-    requestAnimationFrame(drawPreviewFrame)
+    loadPreviewModel().catch(error => {
+        if (previewDisposed) return
+        console.warn('[TouchConfig] Failed to load custom touch area preview model:', error)
+        status.textContent = touchAnimText('previewUnavailable', '当前无法打开自定义区域预览')
+    })
+    animationFrameId = requestAnimationFrame(drawPreviewFrame)
 }
 
 function closeAllMultiselects(e){
@@ -1718,6 +2038,138 @@ async function touchPage_init(){
         touchPage_open(d)
     }
 
+}
+
+// ===== 模型加载完成 / 跨窗口保存后的触摸配置刷新 =====
+// 主页面只在启动时快照一次 touch_set（InitializationTouchSet）。模型管理页保存
+// 的自定义触摸区域只落盘不推送，运行中的主页面永远看不到，直到手动刷新页面。
+// 这里提供两个刷新入口：
+//   1. nekoRefreshLive2DTouchSet：给"模型加载完成"的钩子用——数据刚拉取过就只给
+//      新模型补上原生 HitArea 接线，过期则重新拉取；
+//   2. neko_touch_set_channel：给"模型管理页保存成功"用——广播一个轻量信号，
+//      主页面收到后强制重拉，保存后无需刷新主页面即生效。
+
+const TOUCH_SET_LOADED_REUSE_WINDOW_MS = 5000
+const TOUCH_SET_RETRY_DELAY_MS = 1500
+
+async function refreshTouchSetForLoadedModel(options = {}) {
+    const manager = window.live2dManager
+    if (!manager || typeof manager.getCurrentModel !== 'function') return false
+    const model = manager.getCurrentModel()
+    if (!model || model.destroyed) {
+        // 模型尚未就绪（如保存广播先于初始模型加载到达）：直接丢弃通知会让
+        // 启动初始化取走的保存前快照一直生效。记录待强制刷新标记，模型加载
+        // 完成钩子下次调用本函数时消费，保证本次保存最终生效。
+        manager._touchSetPendingForceRefetch = true
+        return false
+    }
+
+    const pendingForceRefetch = manager._touchSetPendingForceRefetch === true
+    manager._touchSetPendingForceRefetch = false
+    const loadedAt = Number(manager._touchSetLoadedAt || 0)
+    const shouldRefetch = options.forceRefetch === true || pendingForceRefetch
+        || (Date.now() - loadedAt) > TOUCH_SET_LOADED_REUSE_WINDOW_MS
+
+    // 未实际提交（角色名解析暂时失败、守卫拦截、被更新刷新世代取代等）时的
+    // 收尾：按既有规则恢复承载保存通知的标记，并安排一次有界重试——本刷新
+    // 可能抢占了仍在途的启动初始化（世代号已使其失效），若本刷新又瞬时失败，
+    // 页面会既无触摸数据也无原生接线，直到下次重载。
+    const handleUncommitted = () => {
+        if (pendingForceRefetch || options.forceRefetch === true) {
+            manager._touchSetPendingForceRefetch = true
+        }
+        if (!options.isRetry) {
+            // 重试绑定发起时的角色：1.5s 后若已再次切换角色，这条旧角色的
+            // 重试必须作废——否则它会以更新的世代号把旧角色的配置提交到
+            // 新角色的模型上。
+            const retryLanlanName = String(options.lanlanName || window.lanlan_config?.lanlan_name || '')
+            setTimeout(() => {
+                const currentName = String(window.lanlan_config?.lanlan_name || '')
+                if (retryLanlanName && currentName && retryLanlanName !== currentName) {
+                    console.log('[TouchSet] 已切换角色，丢弃过期角色的触摸配置重试:', retryLanlanName)
+                    return
+                }
+                refreshTouchSetForLoadedModel(Object.assign({}, options, { isRetry: true }))
+                    .catch((retryError) => {
+                        console.warn('[TouchSet] 触摸配置重取重试失败:', retryError)
+                    })
+            }, TOUCH_SET_RETRY_DELAY_MS)
+        }
+    }
+
+    if (shouldRefetch) {
+        try {
+            const committed = await InitializationTouchSet(undefined, {
+                allowLive2DReload: options.allowLive2DReload === true,
+                lanlanName: options.lanlanName
+            })
+            if (committed === 'superseded') {
+                // 被更新刷新取代：提交与失败重试均由新调用接管；此处安排重试
+                // 反而会以旧世代号丢弃新调用的在途结果。
+                return true
+            }
+            if (committed !== true) {
+                handleUncommitted()
+            }
+        } catch (error) {
+            handleUncommitted()
+            throw error
+        }
+        return true
+    }
+
+    // 数据是刚拉取的（启动初始化刚完成），只需要给新加载的模型补上原生 HitArea 接线。
+    manager.touchSetFilter = {}
+    manager.touchSetHitEventLock = false
+    manager.setupHitAreaInteraction(model)
+    return true
+}
+
+window.nekoRefreshLive2DTouchSet = refreshTouchSetForLoadedModel
+
+const TOUCH_SET_SYNC_CHANNEL_NAME = 'neko_touch_set_channel'
+let touchSetSyncChannel = null
+try {
+    if (typeof BroadcastChannel !== 'undefined') {
+        touchSetSyncChannel = new BroadcastChannel(TOUCH_SET_SYNC_CHANNEL_NAME)
+    }
+} catch (_) {
+    touchSetSyncChannel = null
+}
+
+function broadcastTouchSetUpdated(modelName) {
+    try {
+        if (touchSetSyncChannel) {
+            touchSetSyncChannel.postMessage({
+                model_name: modelName || '',
+                timestamp: Date.now()
+            })
+        }
+    } catch (_) {}
+}
+
+if (touchSetSyncChannel) {
+    touchSetSyncChannel.onmessage = (event) => {
+        const message = event && event.data
+        if (!message || typeof message !== 'object') return
+        const manager = window.live2dManager
+        if (!manager) return
+        const incomingModel = String(message.model_name || '')
+        const currentModelName = String(manager.modelName || '')
+        // 消息指向别的模型时跳过：那个模型的配置会在 reload_model 完成后的
+        // 刷新钩子里生效，这里不提前把别模型的配置拉进来。
+        if (incomingModel && currentModelName && incomingModel !== currentModelName) return
+        // 绕过守卫与否按真实启用的渲染器定：lanlan_config.model_type 由热切换
+        // Live2D 分支回写，比 localStorage/vrmManager 的残留指针可靠。Live2D
+        // 真正在用时才旁路；VRM/PNGTuber 在用时保留守卫（触摸配置无需生效）。
+        const activeType = String(window.lanlan_config?.model_type || 'live2d').toLowerCase()
+        refreshTouchSetForLoadedModel({
+            forceRefetch: true,
+            allowLive2DReload: activeType === 'live2d'
+        }).catch((error) => {
+            console.warn('[TouchSet] 响应保存通知刷新触摸配置失败:', error)
+        })
+    }
 }
 
 async function startTouchConfigAfterStorageBarrier() {

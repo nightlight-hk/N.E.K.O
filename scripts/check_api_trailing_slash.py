@@ -1,4 +1,18 @@
 #!/usr/bin/env python3
+# Copyright 2025-2026 Project N.E.K.O. Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Static check: forbid trailing-slash route paths on FastAPI router/app decorators.
 
 Why this exists
@@ -16,7 +30,7 @@ production failure under reverse proxies:
   points at the internal ``127.0.0.1:<port>`` and the browser dies with
   ``ERR_CONNECTION_REFUSED``.
 * PR #938 (chara_manager regression on LAN reverse proxies) was exactly this
-  bug. See ``.agent/rules/neko-guide.md`` (§"API URL 末尾不带斜杠") and
+  bug. See ``.agent/rules/neko-guide.md`` (§\"API URL 末尾不带斜杠\" — \"no trailing slash on API URLs\") and
   ``main_routers/characters_router.py`` docstring for the full write-up.
 
 Avoiding the redirect entirely (= never declaring a trailing slash) makes
@@ -26,25 +40,25 @@ What it flags
 -------------
 Any decorator call of the form:
 
-    @router.get("/foo/")           # trailing-slash literal
-    @router.post("/foo/bar/")
-    @router.websocket("/ws/foo/")
-    @app.put("/api/v1/foo/")
+    @router.get(\"/foo/\")           # trailing-slash literal
+    @router.post(\"/foo/bar/\")
+    @router.websocket(\"/ws/foo/\")
+    @app.put(\"/api/v1/foo/\")
 
 where ``router`` is any name and the HTTP method comes from
 ``METHOD_NAMES``. Path is the first positional argument or ``path=...``.
 
 Allowed exceptions
 ------------------
-* ``@router.get("/")`` on a router whose declared ``APIRouter(prefix=...)``
+* ``@router.get(\"/\")`` on a router whose declared ``APIRouter(prefix=...)``
   is empty — the literal root page. We have exactly one of these:
   ``main_routers/pages_router.py`` serving ``index.html``. Routers with a
-  non-empty prefix are NOT exempt because ``prefix="/api/foo"`` +
-  ``@router.get("/")`` registers ``/api/foo/`` which IS a trailing-slash
+  non-empty prefix are NOT exempt because ``prefix=\"/api/foo\"`` +
+  ``@router.get(\"/\")`` registers ``/api/foo/`` which IS a trailing-slash
   route (and triggers the same 307 hazard). Reported by CodeRabbit on
   PR #1082.
 * **Explicit alias pair** — when the same function carries BOTH
-  ``@router.get("/foo")`` and ``@router.get("/foo/")``, the trailing-slash
+  ``@router.get(\"/foo\")`` and ``@router.get(\"/foo/\")``, the trailing-slash
   one is a deliberate alias. The 307-redirect attack vector is gone (the
   slash form returns 200 directly), so the convention's safety property is
   preserved. SPA entry points (``/ui`` + ``/ui/``) use this pattern. The
@@ -72,7 +86,7 @@ Exit status is 1 when any violation is found, 0 otherwise.
 Usage::
 
     uv run python scripts/check_api_trailing_slash.py [paths...]
-"""
+"""  # noqa: DOCSTRING_CJK
 from __future__ import annotations
 
 import argparse
@@ -85,9 +99,9 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 DEFAULT_PATHS: list[str] = [
     "main_routers",
-    "app/main_server.py",
-    "app/memory_server.py",
-    "app/agent_server.py",
+    "app/main_server",
+    "app/memory_server",
+    "app/agent_server",
     "plugin/server/routes",
 ]
 

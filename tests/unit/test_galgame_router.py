@@ -30,6 +30,9 @@ class FakeConfigManager:
     async def aget_character_data(self):
         return "主人", "猫娘", None, None
 
+    async def aget_model_api_config(self, model_type, *, core_config=None):
+        return self.get_model_api_config(model_type)
+
     def get_model_api_config(self, model_type):
         self.calls.append(model_type)
         if model_type == "summary":
@@ -48,6 +51,7 @@ def _option_texts(data):
 def _expected_llm_kwargs():
     return {
         "max_completion_tokens": galgame_router.GALGAME_OPTION_MAX_TOKENS,
+        "provider_type": None,
         "timeout": galgame_router.GALGAME_OPTION_TIMEOUT_SECONDS,
     }
 
@@ -98,7 +102,7 @@ async def test_galgame_uses_summary_model_without_temperature(monkeypatch):
         "get_config_manager",
         lambda: config_manager,
     )
-    monkeypatch.setattr(galgame_router, "create_chat_llm", fake_create_chat_llm)
+    monkeypatch.setattr("utils.llm_client.create_chat_llm", fake_create_chat_llm)
 
     response = await galgame_router.generate_galgame_options(
         FakeRequest(
@@ -151,7 +155,7 @@ async def test_galgame_option_generation_timeout_returns_fallback(monkeypatch):
 
     monkeypatch.setattr(galgame_router, "GALGAME_OPTION_TIMEOUT_SECONDS", 0.01)
     monkeypatch.setattr(galgame_router, "get_config_manager", lambda: config_manager)
-    monkeypatch.setattr(galgame_router, "create_chat_llm", fake_create_chat_llm)
+    monkeypatch.setattr("utils.llm_client.create_chat_llm", fake_create_chat_llm)
 
     response = await galgame_router.generate_galgame_options(
         FakeRequest(
@@ -169,8 +173,42 @@ async def test_galgame_option_generation_timeout_returns_fallback(monkeypatch):
     assert _option_texts(data) == list(get_galgame_fallback_options("en"))
     assert captured["kwargs"] == {
         "max_completion_tokens": galgame_router.GALGAME_OPTION_MAX_TOKENS,
+        "provider_type": None,
         "timeout": 0.01,
     }
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_galgame_option_generation_init_error_returns_fallback(monkeypatch):
+    config_manager = FakeConfigManager(
+        {
+            "model": "local-summary",
+            "base_url": "http://127.0.0.1:11434/v1",
+            "api_key": "",
+        }
+    )
+
+    def fake_create_chat_llm(*_args, **_kwargs):
+        raise RuntimeError("client init failed")
+
+    monkeypatch.setattr(galgame_router, "get_config_manager", lambda: config_manager)
+    monkeypatch.setattr("utils.llm_client.create_chat_llm", fake_create_chat_llm)
+
+    response = await galgame_router.generate_galgame_options(
+        FakeRequest(
+            {
+                "messages": [{"role": "assistant", "text": "What do you think?"}],
+                "language": "en",
+            }
+        )
+    )
+
+    data = _decode_response(response)
+    assert data["success"] is True
+    assert data["fallback"] is True
+    assert data["error"] == "client init failed"
+    assert _option_texts(data) == list(get_galgame_fallback_options("en"))
 
 
 @pytest.mark.parametrize(
@@ -241,7 +279,7 @@ async def test_galgame_accepts_dict_shaped_options(model_output, expected, monke
             return SimpleNamespace(content=json.dumps(model_output, ensure_ascii=False))
 
     monkeypatch.setattr(galgame_router, "get_config_manager", lambda: config_manager)
-    monkeypatch.setattr(galgame_router, "create_chat_llm", lambda *a, **kw: MapLLM())
+    monkeypatch.setattr("utils.llm_client.create_chat_llm", lambda *a, **kw: MapLLM())
 
     response = await galgame_router.generate_galgame_options(
         FakeRequest(
@@ -292,7 +330,7 @@ async def test_galgame_duplicate_labeled_entry_does_not_leak_to_other_labels(mon
             )
 
     monkeypatch.setattr(galgame_router, "get_config_manager", lambda: config_manager)
-    monkeypatch.setattr(galgame_router, "create_chat_llm", lambda *a, **kw: DupLLM())
+    monkeypatch.setattr("utils.llm_client.create_chat_llm", lambda *a, **kw: DupLLM())
 
     response = await galgame_router.generate_galgame_options(
         FakeRequest(
@@ -351,7 +389,7 @@ async def test_galgame_partial_options_filled_from_fallback(monkeypatch):
             )
 
     monkeypatch.setattr(galgame_router, "get_config_manager", lambda: config_manager)
-    monkeypatch.setattr(galgame_router, "create_chat_llm", lambda *a, **kw: PartialLLM())
+    monkeypatch.setattr("utils.llm_client.create_chat_llm", lambda *a, **kw: PartialLLM())
 
     response = await galgame_router.generate_galgame_options(
         FakeRequest(
@@ -397,7 +435,7 @@ async def test_galgame_unparseable_output_returns_fallback(monkeypatch, caplog):
             return SimpleNamespace(content=raw_content)
 
     monkeypatch.setattr(galgame_router, "get_config_manager", lambda: config_manager)
-    monkeypatch.setattr(galgame_router, "create_chat_llm", lambda *a, **kw: GarbageLLM())
+    monkeypatch.setattr("utils.llm_client.create_chat_llm", lambda *a, **kw: GarbageLLM())
 
     # galgame_router.logger is a get_module_logger child whose N.E.K.O ancestor
     # gets configured with propagate=False once any service initializes logging
@@ -453,8 +491,7 @@ async def test_galgame_missing_model_base_url_returns_fallback(monkeypatch):
         lambda: FakeConfigManager({"model": "local-summary", "base_url": "", "api_key": ""}),
     )
     monkeypatch.setattr(
-        galgame_router,
-        "create_chat_llm",
+        "utils.llm_client.create_chat_llm",
         lambda *args, **kwargs: pytest.fail("LLM should not be created without a base_url"),
     )
 
@@ -477,10 +514,10 @@ async def test_galgame_missing_model_base_url_returns_fallback(monkeypatch):
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_galgame_options_skipped_when_session_takeover_active(monkeypatch):
-    """game route 接管会话期间（语音输入被改路由进游戏逻辑），React composer
-    的 galgame 面板不是当前活动界面。此时生成选项只会白烧 summary 档 token，
-    所以端点必须短路到 fallback 且**不调用 LLM** —— 与 core.py 里 voice-proactive
-    的 `_takeover_active` 守卫对称。"""
+    """While the game route owns the session (voice input is routed into game logic), the React composer's
+    galgame panel is not active. Generating options merely wastes summary-tier tokens,
+    so the endpoint must short-circuit to fallback without calling the LLM, symmetrically with the voice-proactive
+    `_takeover_active` guard in core.py."""
     config_manager = FakeConfigManager(
         {
             "model": "local-summary",
@@ -490,8 +527,7 @@ async def test_galgame_options_skipped_when_session_takeover_active(monkeypatch)
     )
     monkeypatch.setattr(galgame_router, "get_config_manager", lambda: config_manager)
     monkeypatch.setattr(
-        galgame_router,
-        "create_chat_llm",
+        "utils.llm_client.create_chat_llm",
         lambda *args, **kwargs: pytest.fail(
             "LLM must not be called while the session is taken over"
         ),
@@ -517,16 +553,16 @@ async def test_galgame_options_skipped_when_session_takeover_active(monkeypatch)
     assert data["fallback"] is True
     assert data["reason"] == "session_takeover"
     assert _option_texts(data) == list(get_galgame_fallback_options("zh"))
-    # 守卫必须在解析 summary 模型配置之前短路，summary 档配置不应被读取。
+    # The guard must short-circuit before resolving summary model config; do not read that tier's config.
     assert "summary" not in config_manager.calls
 
 
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_galgame_options_generated_when_session_not_taken_over(monkeypatch):
-    """守卫只在接管期间短路 —— mgr 存在但未接管时必须照常生成选项。不能因为
-    「有活跃（语音）会话」就一刀切拦掉：用户开着聊天窗口用文字选项插话是合法
-    用法。"""
+    """Short-circuit only during takeover; when mgr exists without takeover, generate options normally. An active
+    voice session alone must not block this: users may legitimately interject with text options
+    from the chat window."""
     config_manager = FakeConfigManager(
         {
             "model": "local-summary",
@@ -553,7 +589,7 @@ async def test_galgame_options_generated_when_session_not_taken_over(monkeypatch
             )
 
     monkeypatch.setattr(galgame_router, "get_config_manager", lambda: config_manager)
-    monkeypatch.setattr(galgame_router, "create_chat_llm", lambda *a, **k: FakeLLM())
+    monkeypatch.setattr("utils.llm_client.create_chat_llm", lambda *a, **k: FakeLLM())
     monkeypatch.setattr(
         galgame_router,
         "get_session_manager",

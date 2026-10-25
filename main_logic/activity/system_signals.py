@@ -1,3 +1,17 @@
+# Copyright 2025-2026 Project N.E.K.O. Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """System-wide signal collector for the user-activity tracker.
 
 A single process-wide singleton ``SystemSignalCollector`` polls
@@ -37,6 +51,8 @@ import time
 from collections import deque
 from dataclasses import dataclass
 
+from utils.deployment import is_remote_backend_deployment as _deployment_is_remote
+
 logger = logging.getLogger(__name__)
 
 _IS_WINDOWS = platform.system() == 'Windows'
@@ -72,11 +88,7 @@ def is_remote_backend_deployment() -> bool:
     Default off — most users run backend on their own PC where local
     OS signals / screenshots / computer_use are correct.
     """
-    for key in ('NEKO_ACTIVITY_TRACKER_REMOTE', 'ACTIVITY_TRACKER_REMOTE'):
-        raw = os.getenv(key, '').strip().lower()
-        if raw in ('1', 'true', 'yes', 'on'):
-            return True
-    return False
+    return _deployment_is_remote()
 
 
 # Legacy private alias — keeps in-flight callers (and tests that patch

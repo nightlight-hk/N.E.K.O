@@ -1,24 +1,24 @@
-"""主动搭话相关 prompt 文案的反 AI 物化称呼护栏。
+"""Guard proactive-chat prompts against objectifying forms of address for AI.
 
-PR #1041 修复了 PROACTIVE_ACTION_NOTE_* 和 _AVATAR_INTERACTION_MEMORY_NOTE_TEMPLATES
-的物化称呼字面量。本文件覆盖剩下三块还在 prompts_proactive.py 里的本地化文案：
+PR #1041 fixed objectifying literals in PROACTIVE_ACTION_NOTE_* and _AVATAR_INTERACTION_MEMORY_NOTE_TEMPLATES.
+This covers three remaining localized copy groups in prompts_proactive.py:
 
-1. ``_P2_MEME_INSTRUCTION``：表情包行为指令，由 ``get_proactive_generate_prompt``
-   注入 Phase 2 system prompt。
-2. ``SCREEN_SECTION_HEADER`` / ``SCREEN_IMG_HINT``：vision 通道的屏幕区块标题
-   和截图说明，由 ``get_screen_section_header`` / ``get_screen_img_hint`` 输出。
-3. ``PROACTIVE_MUSIC_PLAYING_HINT`` / ``PROACTIVE_MUSIC_FAILSAFE_HINTS``：放歌时的
-   行为约束 + 模糊匹配兜底，由 ``get_proactive_music_playing_hint`` /
-   ``get_proactive_music_failsafe_hint`` 输出。
+1. ``_P2_MEME_INSTRUCTION``: meme-action instructions injected by ``get_proactive_generate_prompt``
+   into Phase 2 system prompts.
+2. ``SCREEN_SECTION_HEADER`` / ``SCREEN_IMG_HINT``: vision-channel screen headings
+   and screenshot descriptions from ``get_screen_section_header`` / ``get_screen_img_hint``.
+3. ``PROACTIVE_MUSIC_PLAYING_HINT`` / ``PROACTIVE_MUSIC_FAILSAFE_HINTS``: playback
+   constraints + fuzzy-match fallbacks from ``get_proactive_music_playing_hint`` /
+   ``get_proactive_music_failsafe_hint``.
 
-每个 helper 都过一遍：
-- 实名传入（``MASTER = "小明"``）→ 名字应原样出现，且禁词字面量都不在结果里。
-- 空名传入 → 应回退到 PROACTIVE_ACTION_NOTE_PLACEHOLDERS 的本地化中性词
-  ("对方" / "them" / "相手" / "상대" / "собеседника")，禁词仍不在结果里。
+Exercise every helper:
+- Real name (``MASTER = \"小明\"``) → retain the exact name with no prohibited literals.
+- Empty name → use localized neutral terms from PROACTIVE_ACTION_NOTE_PLACEHOLDERS
+  (\"对方\" / \"them\" / \"相手\" / \"상대\" / \"собеседника\"), still without prohibited words.
 
-禁词列表覆盖五种语言的常见物化变体——这是项目核心价值观，下次有人想再悄悄
-把"主人"加回模板会被这层挡住。
-"""
+The prohibited list covers common objectifying variants in five languages, a core project value;
+this guard prevents silently reintroducing 'master' into templates.
+"""  # noqa: DOCSTRING_CJK
 from __future__ import annotations
 
 import os
@@ -41,14 +41,14 @@ from config.prompts.prompts_proactive import (
 LOCALES = ('zh', 'en', 'ja', 'ko', 'ru')
 MASTER = "小明"
 
-# master 的物化变体（含 #1041 PROACTIVE_ACTION_NOTE 测试同款，再加上"Master"
-# 大写——SCREEN_SECTION_HEADER en 旧文案是 "Master's Screen"，要专门把这种
-# 句首大写挡住）
+# Objectifying master variants, including #1041 PROACTIVE_ACTION_NOTE cases plus capitalized "Master";
+# SCREEN_SECTION_HEADER's old English copy was "Master's Screen", requiring explicit coverage of this
+# sentence-initial capitalization
 FORBIDDEN_TERMS = ('主人', 'master', 'Master', 'ご主人', '주인', 'хозяин', 'Хозяин')
 
-# 剥掉 ``{xxx}`` 形式的未展开占位符，避免诸如 ``{master_name}`` / ``{MASTER_NAME}``
-# 这种合法的 Python format placeholder 名字误命中 "master" 禁词。仅匹配安全字符
-# （字母/数字/下划线），保留模板里的实际文案不动。
+# Strip unexpanded ``{xxx}`` placeholders so valid Python format names like ``{master_name}`` / ``{MASTER_NAME}``
+# do not falsely match prohibited "master". Match only safe characters
+# (letters/digits/underscores), leaving actual template copy unchanged.
 _PLACEHOLDER_RE = re.compile(r'\{[A-Za-z_][A-Za-z0-9_]*\}')
 
 
@@ -59,7 +59,7 @@ def _assert_no_forbidden(text: str, *, ctx: str) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 屏幕区块（vision 通道）
+# Screen section in the vision channel
 # ─────────────────────────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize('lang', LOCALES)
@@ -94,15 +94,15 @@ def test_screen_img_hint_falls_back_when_master_empty(lang: str) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 音乐相关（放歌中 + 模糊匹配兜底）
+# Music-related copy: playback + fuzzy-match fallback
 # ─────────────────────────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize('lang', LOCALES)
 def test_music_playing_hint_no_dehumanize_with_master(lang: str) -> None:
-    # track_name 含 {} 字面量，验证 helper 的转义路径仍然工作。
+    # track_name contains literal {}, verifying the helper's escaping path still works.
     out = get_proactive_music_playing_hint('Bohemian {Rhapsody}', MASTER, lang)
     _assert_no_forbidden(out, ctx=f"music_playing_hint lang={lang}")
-    # zh 模板含 {master}，应注入实名；其它 locale 模板无 {master}，不强求。
+    # Chinese templates contain {master} and must inject the real name; other locales lack it and need not inject.
     if lang == 'zh':
         assert MASTER in out
 
@@ -129,20 +129,20 @@ def test_music_failsafe_hint_falls_back_when_master_empty(lang: str) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Phase 2 generate prompt（表情包行为指令注入）
+# Phase 2 generate prompt with injected meme-action instructions
 # ─────────────────────────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize('lang', LOCALES)
 def test_meme_instruction_expanded_inside_generate_prompt(lang: str) -> None:
-    """当 has_meme=True，generate_prompt 必须把 _P2_MEME_INSTRUCTION 里的 {master}
-    占位符在返回前展开，避免外层 .format(master_name=...) 因不知道 master 报 KeyError。
+    """With has_meme=True, generate_prompt must expand _P2_MEME_INSTRUCTION's {master}
+    placeholder before returning, avoiding KeyError when outer .format(master_name=...) lacks master.
     """
     prompt = get_proactive_generate_prompt(
         lang, music_playing_hint='', has_music=False, has_meme=True, master_name=MASTER,
     )
-    # 必须没有未展开的 {master}
+    # No unexpanded {master} may remain
     assert '{master}' not in prompt, f"lang={lang} 残留未展开占位符: {prompt!r}"
-    # 必须把名字注入了
+    # The name must be injected
     assert MASTER in prompt, f"lang={lang} 名字未出现"
     _assert_no_forbidden(prompt, ctx=f"generate_prompt lang={lang} has_meme=True")
 
@@ -159,8 +159,8 @@ def test_meme_instruction_falls_back_when_master_empty(lang: str) -> None:
 
 
 def test_generate_prompt_does_not_dehumanize_when_no_meme() -> None:
-    """has_meme=False 路径里 _P2_MEME_INSTRUCTION 不会被注入，但 generate prompt 里
-    其它本地化文本也不应混进物化称呼。"""
+    """With has_meme=False, _P2_MEME_INSTRUCTION is not injected, but other localized generate-prompt
+    copy must still avoid objectifying address."""
     for lang in LOCALES:
         prompt = get_proactive_generate_prompt(
             lang, music_playing_hint='', has_music=False, has_meme=False, master_name=MASTER,
@@ -169,20 +169,20 @@ def test_generate_prompt_does_not_dehumanize_when_no_meme() -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 大括号转义 —— 防御 master_name 含 ``{`` / ``}`` 的边界 case
+# Brace escaping guards master_name containing literal ``{`` / ``}``
 #
-# generate_prompt 和 music_playing_hint 走的是"helper 内先 .format(master=...)、
-# 拼回 prompt 后 system_router 再整体 .format()"的双层路径。helper 第一次 format
-# 时把 master_name 字面量原样注入，**不会** escape 它含的花括号；外层第二次
-# .format() 看到 ``{B}`` 这种残留就会 KeyError，proactive 直接 abort。Codex
-# review #1043 (r3164599879 / r3164599885) 抓的就是这两条 P1。
+# generate_prompt and music_playing_hint use two formatting layers: helper .format(master=...),
+# then system_router .format() over the reassembled whole prompt. The helper's first formatting
+# injects literal master_name without automatically escaping braces; the outer second
+# .format() sees leftovers such as ``{B}``, raises KeyError, and aborts proactive chat. Codex
+# review #1043 (r3164599879 / r3164599885) caught these two P1 issues.
 # ─────────────────────────────────────────────────────────────────────────────
 
-WEIRD_MASTER = 'A{B}'  # 含双括号的"用户起的怪名字"
+WEIRD_MASTER = 'A{B}'  # Unusual user-chosen name containing double braces
 
 
 def _simulate_outer_format(generate_prompt: str, music_playing_hint: str = '') -> str:
-    """模拟 system_router.py L4485 的整体 .format(...)，验证不会 KeyError。"""
+    """Simulate system_router.py L4485's whole-prompt .format(...) and verify no KeyError."""
     return generate_prompt.format(
         character_prompt='<char>',
         inner_thoughts='<inner>',
@@ -201,8 +201,8 @@ def _simulate_outer_format(generate_prompt: str, music_playing_hint: str = '') -
 
 @pytest.mark.parametrize('lang', LOCALES)
 def test_generate_prompt_with_braced_master_survives_outer_format(lang: str) -> None:
-    """master_name='A{B}' 时 helper 必须把 master 值的花括号 escape，外层 .format
-    才不会把残留 ``{B}`` 当占位符 KeyError。修完后最终字符串里应该有字面量 ``A{B}``。"""
+    """For master_name='A{B}', the helper must escape braces in master values so outer .format
+    does not interpret leftover ``{B}`` as a placeholder. Final output must retain literal ``A{B}``."""
     prompt = get_proactive_generate_prompt(
         lang, music_playing_hint='', has_music=False, has_meme=True,
         master_name=WEIRD_MASTER,
@@ -213,9 +213,9 @@ def test_generate_prompt_with_braced_master_survives_outer_format(lang: str) -> 
 
 @pytest.mark.parametrize('lang', LOCALES)
 def test_music_playing_hint_with_braced_master_survives_outer_format(lang: str) -> None:
-    """zh 模板含 {master} 占位符，master_name='A{B}' 时 helper 要 escape；
-    其它 locale 模板没 {master}，但传同样的 master_name 也不应 raise。
-    music_playing_hint 在 system_router 里被拼回 generate_prompt 内层、走整体 .format()。"""
+    """Chinese templates contain {master}, requiring escaping for master_name='A{B}';
+    other locales lack {master}, but passing the same name still must not raise.
+    system_router inserts music_playing_hint into generate_prompt before whole-prompt .format()."""
     hint = get_proactive_music_playing_hint('Some Track', WEIRD_MASTER, lang)
     prompt = get_proactive_generate_prompt(
         lang, music_playing_hint=hint, has_music=False, has_meme=False,
@@ -228,8 +228,8 @@ def test_music_playing_hint_with_braced_master_survives_outer_format(lang: str) 
 
 @pytest.mark.parametrize('lang', LOCALES)
 def test_music_playing_hint_with_braced_track_name_survives_outer_format(lang: str) -> None:
-    """歌名带 ``{`` / ``}``（如 'Bohemian {Rhapsody}'）时 helper 也要 escape，
-    否则同样会让外层 .format() KeyError。这是 master 修法的对照回归。"""
+    """Track names containing ``{`` / ``}`` (such as 'Bohemian {Rhapsody}') also require helper escaping,
+    or outer .format() raises KeyError too; this is the corresponding regression for the master-name fix."""
     weird_track = 'Bohemian {Rhapsody}'
     hint = get_proactive_music_playing_hint(weird_track, MASTER, lang)
     prompt = get_proactive_generate_prompt(
@@ -240,17 +240,24 @@ def test_music_playing_hint_with_braced_track_name_survives_outer_format(lang: s
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 猫咪专属问候（从猫咪形态变回猫娘 / 请她回来时触发）—— 同样过反物化护栏。
-# 与 trigger_cat_greeting 一致：模板含 {reason_hint}/{elapsed}/{time_hint}/{master}，
-# reason_hint 先 .format(master=...) 再注入主模板，整体再 .format()。
+# Cat-specific greetings after returning from cat form or being invited back also obey anti-objectification guards.
+# Match trigger_cat_greeting: old templates contain {reason_hint}/{elapsed}/{time_hint}/{master};
+# episode scene templates additionally contain {cat_form_scene}. First format reason_hint
+# with .format(master=...), then inject into the main template and format the whole again.
 # ─────────────────────────────────────────────────────────────────────────────
 
 from config.prompts.prompts_proactive import (  # noqa: E402
+    _CAT_GREETING_EPISODE_PROMPTS,
+    _CAT_GREETING_EPISODE_RETURN_TONES,
+    _CAT_GREETING_EPISODE_SCENES,
+    _CAT_GREETING_TABLES,
+    get_cat_greeting_episode_prompt,
+    get_cat_greeting_episode_scene,
     get_cat_greeting_prompt,
     get_cat_greeting_reason_hint,
 )
 
-# (behavior, duration_seconds) 覆盖清醒/打盹/熟睡三行为 × 短/久两档（> 3min 门槛）
+# (behavior, duration_seconds) covers awake/dozing/asleep × short/long durations.
 _CAT_GREETING_CASES = [
     ('awake', 300), ('awake', 1000),
     ('nap', 300), ('nap', 2000),
@@ -278,8 +285,226 @@ def test_cat_greeting_no_dehumanize_and_expands_master(lang, behavior, duration,
     _assert_no_forbidden(out, ctx=f"cat_greeting {behavior}/{duration}/{lang}/auto={was_auto}")
 
 
-def test_cat_greeting_silent_below_threshold() -> None:
-    """猫咪时长 < 3min 应静默（返回 None），不触发问候。"""
+def test_cat_greeting_silences_short_returns() -> None:
+    """Production cat return keeps the established three-minute silence gate."""
     for lang in LOCALES:
         assert get_cat_greeting_prompt('awake', 179, lang) is None
         assert get_cat_greeting_prompt('nap', 0, lang) is None
+        assert get_cat_greeting_prompt('awake', 180, lang) is not None
+
+
+# 'zh-TW' joined the tables with the issue #2500 backfill. The module's
+# normalizer still collapses Traditional to 'zh' (keep_traditional=False), so the
+# new rows are not reachable through get_cat_greeting_* yet — see
+# test_cat_greeting_episode_scene_rejects_invalid_combinations_and_uses_english_fallback,
+# which pins that collapse. This tuple is the table-coverage list, not the
+# resolver's input domain.
+_CAT_EPISODE_LOCALES = ('zh', 'zh-TW', 'en', 'ja', 'ko', 'ru', 'es', 'pt')
+_CAT_EPISODE_CASES = [
+    {'kind': 'activity'},
+    {'kind': 'activity', 'highlight': 'played_yarn'},
+    {'kind': 'activity', 'highlight': 'ate_snack'},
+    {'kind': 'activity', 'highlight': 'small_move'},
+    {'kind': 'activity', 'highlight': 'social_ping'},
+    {'kind': 'rest_after_activity'},
+    {'kind': 'rest_after_activity', 'highlight': 'played_yarn'},
+    {'kind': 'rest_after_activity', 'highlight': 'ate_snack'},
+    {'kind': 'rest_after_activity', 'highlight': 'small_move'},
+    {'kind': 'rest_after_activity', 'highlight': 'social_ping'},
+    {'kind': 'rested'},
+]
+
+
+def test_cat_greeting_episode_prompt_tables_cover_all_normalized_locales() -> None:
+    expected_locales = set(_CAT_EPISODE_LOCALES)
+    expected_behavior_bands = {
+        ('awake', 'short'), ('awake', 'long'),
+        ('nap', 'short'), ('nap', 'long'),
+        ('sleep', 'short'), ('sleep', 'long'),
+    }
+    assert set(_CAT_GREETING_EPISODE_SCENES) == expected_locales
+    assert set(_CAT_GREETING_EPISODE_PROMPTS) == expected_locales
+    assert set(_CAT_GREETING_EPISODE_RETURN_TONES) == expected_locales
+    for lang in expected_locales:
+        assert set(_CAT_GREETING_EPISODE_SCENES[lang]) == {
+            'activity', 'rest_after_activity', 'rested',
+        }
+        assert set(_CAT_GREETING_EPISODE_RETURN_TONES[lang]) == expected_behavior_bands
+
+
+@pytest.mark.parametrize('lang', _CAT_EPISODE_LOCALES)
+@pytest.mark.parametrize('episode', _CAT_EPISODE_CASES)
+def test_cat_greeting_episode_scene_is_localized_and_contains_no_transport_detail(lang, episode) -> None:
+    scene = get_cat_greeting_episode_scene(episode, lang)
+    assert scene, f'lang={lang} episode={episode} missing localized scene'
+    assert '{' not in scene and '}' not in scene, f'lang={lang} leaked format placeholder: {scene!r}'
+    _assert_no_forbidden(scene, ctx=f'cat_episode_scene lang={lang} episode={episode}')
+    for forbidden_transport in (
+        'cat1_', 'cat2_', 'cat3_', 'actionId', 'requestId', 'runId',
+        'appetite', 'sleepiness', 'energy', 'social_need', 'stimulation_need',
+    ):
+        assert forbidden_transport not in scene, f'lang={lang} leaked {forbidden_transport}: {scene!r}'
+
+
+def test_cat_greeting_episode_scene_rejects_invalid_combinations_and_uses_english_fallback() -> None:
+    for episode in (
+        None,
+        [],
+        {'kind': 'unknown'},
+        {'kind': 'rested', 'highlight': 'played_yarn'},
+        {'kind': 'activity', 'highlight': 'raw text'},
+        {'kind': 'activity', 'highlight': None},
+    ):
+        assert get_cat_greeting_episode_scene(episode, 'zh') == ''
+
+    english = get_cat_greeting_episode_scene({'kind': 'rested'}, 'en')
+    assert get_cat_greeting_episode_scene({'kind': 'rested'}, 'fr-FR') == english
+    zh = get_cat_greeting_episode_scene({'kind': 'rested'}, 'zh')
+    assert get_cat_greeting_episode_scene({'kind': 'rested'}, 'zh-CN') == zh
+    # Since #2500 C2, traditional Chinese uses its own entry instead of collapsing to simplified Chinese.
+    traditional = get_cat_greeting_episode_scene({'kind': 'rested'}, 'zh-TW')
+    # Vacuous-assertion trap: unknown kinds return '', satisfying both '' != zh and '' == '',
+    # giving traditional-Chinese users empty copy while tests pass. Assert nonempty first.
+    assert traditional, 'zh-TW 缺少 rested 场景行，繁中会拿到空文案'
+    assert traditional != zh
+    assert get_cat_greeting_episode_scene({'kind': 'rested'}, 'zh-Hant') == traditional
+
+
+def test_cat_greeting_episode_scene_is_not_labeled_as_optional_background() -> None:
+    assert '补充经历' not in get_cat_greeting_episode_scene(
+        {'kind': 'activity', 'highlight': 'played_yarn'}, 'zh',
+    )
+    assert 'Additional episode background' not in get_cat_greeting_episode_scene(
+        {'kind': 'activity', 'highlight': 'played_yarn'}, 'en',
+    )
+
+
+def test_cat_greeting_episode_social_ping_does_not_claim_a_count() -> None:
+    for episode in (
+        {'kind': 'activity', 'highlight': 'social_ping'},
+        {'kind': 'rest_after_activity', 'highlight': 'social_ping'},
+    ):
+        assert '几声' not in get_cat_greeting_episode_scene(episode, 'zh')
+
+
+@pytest.mark.parametrize(
+    ('episode', 'included', 'excluded'),
+    [
+        ({'kind': 'activity', 'highlight': 'played_yarn'}, 'playing with yarn', 'quiet rest'),
+        ({'kind': 'activity'}, 'moving about', 'quiet rest'),
+        ({'kind': 'rest_after_activity', 'highlight': 'ate_snack'}, 'had a small snack', ''),
+        ({'kind': 'rested'}, 'quiet rest', 'moving about'),
+    ],
+)
+def test_cat_greeting_episode_scene_distinguishes_only_the_last_bounded_chapter(
+    episode, included, excluded,
+) -> None:
+    scene = get_cat_greeting_episode_scene(episode, 'en')
+    assert included in scene
+    if excluded:
+        assert excluded not in scene
+    if episode['kind'] == 'rest_after_activity':
+        assert scene.index('had a small snack') < scene.index('quiet rest')
+
+
+def test_cat_greeting_episode_rest_scenes_do_not_claim_duration_or_deep_sleep() -> None:
+    for lang in _CAT_EPISODE_LOCALES:
+        for episode in (
+            {'kind': 'rested'},
+            {'kind': 'rest_after_activity', 'highlight': 'played_yarn'},
+        ):
+            scene = get_cat_greeting_episode_scene(episode, lang)
+            assert not any(char.isdigit() for char in scene), f'lang={lang} duration leaked: {scene!r}'
+    english = get_cat_greeting_episode_scene(
+        {'kind': 'rest_after_activity', 'highlight': 'played_yarn'}, 'en',
+    )
+    assert english.index('played with yarn') < english.index('quiet rest')
+    assert 'deep' not in english.lower()
+
+
+@pytest.mark.parametrize('lang', _CAT_EPISODE_LOCALES)
+@pytest.mark.parametrize('behavior,duration', _CAT_GREETING_CASES)
+def test_cat_greeting_episode_scene_formats_inside_dedicated_prompt(lang, behavior, duration) -> None:
+    episode = {'kind': 'rest_after_activity', 'highlight': 'played_yarn'}
+    template = get_cat_greeting_episode_prompt(behavior, duration, lang)
+    assert template is not None
+    scene = get_cat_greeting_episode_scene(episode, lang)
+    rendered = template.format(
+        reason_hint=get_cat_greeting_reason_hint(False, lang).format(master=MASTER),
+        elapsed='10 分钟',
+        name='奈々',
+        master=MASTER,
+        time_hint='(time hint)',
+        cat_form_scene=scene,
+    )
+    assert scene in rendered
+    assert '{' not in rendered and '}' not in rendered
+    _assert_no_forbidden(
+        rendered,
+        ctx=f'cat_episode_prompt {behavior}/{duration}/{lang}',
+    )
+
+
+def test_cat_greeting_episode_prompt_does_not_keep_a_conflicting_sleep_fact() -> None:
+    episode = {'kind': 'activity', 'highlight': 'social_ping'}
+    template = get_cat_greeting_episode_prompt('nap', 300, 'en')
+    assert template is not None
+    rendered = template.format(
+        reason_hint=get_cat_greeting_reason_hint(False, 'en').format(master=MASTER),
+        elapsed='5 minutes',
+        name='奈々',
+        master=MASTER,
+        time_hint='(time hint)',
+        cat_form_scene=get_cat_greeting_episode_scene(episode, 'en'),
+    )
+    assert 'You gave a soft little response as a cat.' in rendered
+    assert 'dozed for 5 minutes' not in rendered
+
+
+_CAT_SHORT_RETURN_INPUT_LOCALES = ('zh-CN', 'zh-TW', 'en', 'ja', 'ko', 'ru', 'es', 'pt')
+_CAT_GREETING_END_MARKER = '======以上为环境提示======'
+
+
+def test_cat_greeting_source_templates_embed_chinese_environment_end_marker() -> None:
+    tables = (
+        *_CAT_GREETING_TABLES.values(),
+        _CAT_GREETING_EPISODE_PROMPTS,
+    )
+    for table in tables:
+        assert set(table) == set(_CAT_EPISODE_LOCALES)
+        for prompt in table.values():
+            marker_lines = [
+                line for line in prompt.splitlines() if line.startswith('======')
+            ]
+            assert len(marker_lines) == 2
+            assert marker_lines[-1] == _CAT_GREETING_END_MARKER
+            assert prompt.endswith(_CAT_GREETING_END_MARKER)
+            assert prompt.count(_CAT_GREETING_END_MARKER) == 1
+
+
+@pytest.mark.parametrize('lang', _CAT_SHORT_RETURN_INPUT_LOCALES)
+def test_cat_greeting_all_prompt_paths_preserve_embedded_environment_end_marker(lang) -> None:
+    prompts = (
+        get_cat_greeting_prompt('awake', 300, lang),
+        get_cat_greeting_episode_prompt('nap', 300, lang),
+    )
+    for prompt in prompts:
+        assert prompt is not None
+        marker_lines = [line for line in prompt.splitlines() if line.startswith('======')]
+        assert len(marker_lines) == 2
+        assert marker_lines[-1] == _CAT_GREETING_END_MARKER
+        assert prompt.endswith(_CAT_GREETING_END_MARKER)
+        assert prompt.count(_CAT_GREETING_END_MARKER) == 1
+        assert '猫形态返回系统提示' not in prompt
+
+
+@pytest.mark.parametrize('lang', _CAT_SHORT_RETURN_INPUT_LOCALES)
+@pytest.mark.parametrize('behavior', ('awake', 'nap', 'sleep'))
+def test_cat_greeting_episode_prompt_cannot_bypass_minimum_dwell_time(lang, behavior) -> None:
+    template = get_cat_greeting_episode_prompt(behavior, 10, lang)
+    assert template is None
+
+
+def test_cat_greeting_episode_prompt_keeps_unified_silence_boundary() -> None:
+    assert get_cat_greeting_episode_prompt('awake', 179, 'en') is None
+    assert get_cat_greeting_episode_prompt('awake', 180, 'en') is not None

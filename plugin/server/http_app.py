@@ -10,25 +10,34 @@ import threading
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from urllib.parse import urlsplit, urlunsplit
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.responses import Response
+from starlette.responses import RedirectResponse, Response
 
 from plugin.logging_config import get_logger
+from utils.host_origin_guard import HostOriginGuardMiddleware
 from utils.logger_config import get_module_logger
 from plugin.server.infrastructure.exceptions import register_exception_handlers
 from plugin.server.lifecycle import shutdown as lifecycle_shutdown
 from plugin.server.lifecycle import startup as lifecycle_startup
 from plugin.server.routes import (
     config_router,
+    documents_router,
     frontend_router,
     health_router,
     llm_tools_router,
     logs_router,
     market_bridge_router,
+    knowledge_bridge_router,
+    knowledge_market_router,
+    media_router,
     messages_router,
     metrics_router,
+    model_config_router,
+    model_gateway_router,
+    model_usage_router,
     plugin_cli_router,
     plugin_ui_router,
     plugins_router,
@@ -36,6 +45,7 @@ from plugin.server.routes import (
     websocket_router,
 )
 from plugin.server.routes.frontend import mount_static_files
+from plugin.server.routes.security import router as security_router
 
 _EMBEDDED_BY_AGENT = os.getenv("NEKO_PLUGIN_HOSTED_BY_AGENT", "").strip().lower() == "true"
 
@@ -47,6 +57,50 @@ else:
 
 def _can_register_faulthandler_signal() -> bool:
     return hasattr(faulthandler, "register") and hasattr(signal, "SIGUSR1")
+
+
+def _model_settings_url(request: Request, main_server_port: int) -> str:
+    public_origin = os.getenv("NEKO_MAIN_SERVER_PUBLIC_ORIGIN", "").strip()
+    if public_origin:
+        try:
+            parsed = urlsplit(public_origin)
+            _ = parsed.port
+            valid_origin = (
+                parsed.scheme in {"http", "https"}
+                and bool(parsed.hostname)
+                and parsed.username is None
+                and parsed.password is None
+                and parsed.path in {"", "/"}
+                and not parsed.query
+                and not parsed.fragment
+            )
+            if valid_origin:
+                return urlunsplit(
+                    (
+                        parsed.scheme,
+                        parsed.netloc,
+                        "/api_key",
+                        "",
+                        "",
+                    )
+                )
+        except ValueError:
+            pass
+        logger.warning(
+            "Ignoring invalid NEKO_MAIN_SERVER_PUBLIC_ORIGIN: {}", public_origin
+        )
+
+    # The plugin server and main server use different ports in a direct/LAN
+    # deployment, but they are reached through the same client-visible host.
+    # Keep loopback only when the request itself was loopback. Reverse proxies
+    # with mapped ports or TLS can provide the explicit public origin above.
+    hostname = request.url.hostname or "127.0.0.1"
+    if ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
+    scheme = request.url.scheme if request.url.scheme in {"http", "https"} else "http"
+    return urlunsplit(
+        (scheme, f"{hostname}:{int(main_server_port)}", "/api_key", "", "")
+    )
 
 
 def _include_optional_router(
@@ -81,7 +135,10 @@ def _include_optional_router(
 
 @asynccontextmanager
 async def plugin_server_lifespan(app: FastAPI) -> AsyncIterator[None]:
-    _ = app
+    # Plugin lifecycle ownership belongs to the app's creator; see
+    # build_plugin_server_app's manage_lifecycle. Default False: do not start unless explicitly requested.
+    # An incorrect default in this direction merely leaves standalone-server plugins stopped, visibly and harmlessly.
+    manage_lifecycle = bool(getattr(app.state, "manage_plugin_lifecycle", False))
 
     if _can_register_faulthandler_signal():
         try:
@@ -127,9 +184,15 @@ async def plugin_server_lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     heartbeat_task = asyncio.create_task(_heartbeat(), name="server-heartbeat")
 
-    # When embedded inside agent_server, lifecycle is managed externally
-    # via the user_plugin_enabled flag — do NOT auto-start here.
-    if not _EMBEDDED_BY_AGENT:
+    # When embedded in agent_server, external code manages lifecycle through user_plugin_enabled;
+    # never autostart here, which would move the full plugin metadata scan back before port binding.
+    #
+    # Previously this checked module-level _EMBEDDED_BY_AGENT, freezing NEKO_PLUGIN_HOSTED_BY_AGENT
+    # at import time. It works today only because agent_server sets that environment variable before
+    # this module's first import, two distant operations with no guaranteed ordering. If anyone
+    # imports plugin.server.http_app earlier, the constant freezes as False and the full scan
+    # silently returns to startup without any failure signal.
+    if manage_lifecycle:
         await lifecycle_startup()
 
     # Install-source lock subsystem: tracks plugin provenance (builtin/manual/
@@ -164,6 +227,15 @@ async def plugin_server_lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        from plugin.core.model_gateway_access import model_gateway_access
+
+        model_gateway_access.revoke_all()
+        from plugin.server.routes.model_gateway import close_model_executor
+
+        await close_model_executor(app)
+        from plugin.server.infrastructure.package_download import aclose_package_http_client
+
+        await aclose_package_http_client()
         stop_event.set()
         heartbeat_task.cancel()
         try:
@@ -176,14 +248,55 @@ async def plugin_server_lifespan(app: FastAPI) -> AsyncIterator[None]:
                 type(exc).__name__,
                 str(exc),
             )
-        if not _EMBEDDED_BY_AGENT:
-            await lifecycle_shutdown()
+        if manage_lifecycle:
+            try:
+                await lifecycle_shutdown()
+            finally:
+                # The knowledge bridge uses the shared loopback client; a
+                # standalone plugin server owns its process, so it closes it.
+                # Embedded in another server, that server does.
+                try:
+                    from utils.http.internal_client import aclose_internal_http_client
+
+                    await aclose_internal_http_client()
+                except Exception as exc:
+                    logger.warning(
+                        "internal http client close failed: err_type={}, err={}",
+                        type(exc).__name__,
+                        str(exc),
+                    )
 
 
-def build_plugin_server_app(title: str = "N.E.K.O User Plugin Server") -> FastAPI:
+def build_plugin_server_app(
+    title: str = "N.E.K.O User Plugin Server",
+    *,
+    manage_lifecycle: bool = False,
+) -> FastAPI:
+    """Build the plugin HTTP app.
+
+    ``manage_lifecycle`` says whether this app owns the plugin lifecycle — the
+    full metadata refresh plus autostart. Only the standalone entry point does;
+    when embedded in agent_server the lifecycle is driven externally by the
+    ``user_plugin_enabled`` flag.
+
+    It defaults to ``False`` on purpose. Getting it wrong in that direction means
+    "plugins do not autostart in the standalone server", which is visible the
+    moment anyone looks. The other direction puts a full plugin scan back on the
+    startup path before any port binds, and nothing reports it.
+    """
     app = FastAPI(title=title, lifespan=plugin_server_lifespan)
+    app.state.manage_plugin_lifecycle = manage_lifecycle
 
-    # Market 域名通过 settings 配置，支持自部署
+    @app.get("/api_key", include_in_schema=False)
+    async def redirect_model_settings(request: Request) -> RedirectResponse:
+        import config
+
+        return RedirectResponse(
+            url=_model_settings_url(request, int(config.MAIN_SERVER_PORT)),
+            status_code=307,
+        )
+
+    # Configure the Market domain through settings to support self-hosting.
     from plugin.settings import MARKET_ORIGINS as _market_origins
 
     app.add_middleware(
@@ -199,6 +312,7 @@ def build_plugin_server_app(title: str = "N.E.K.O User Plugin Server") -> FastAP
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
+        expose_headers=["X-Error-Code"],
     )
 
     register_exception_handlers(app)
@@ -225,13 +339,19 @@ def build_plugin_server_app(title: str = "N.E.K.O User Plugin Server") -> FastAP
         return response
 
     app.include_router(health_router)
+    app.include_router(documents_router)
     app.include_router(plugins_router)
     app.include_router(runs_router)
     app.include_router(messages_router)
     app.include_router(metrics_router)
     app.include_router(config_router)
+    app.include_router(model_config_router)
+    app.include_router(model_gateway_router)
+    app.include_router(model_usage_router)
     app.include_router(logs_router)
+    app.include_router(media_router)
     app.include_router(frontend_router)
+    app.include_router(security_router)
     app.include_router(websocket_router)
     app.include_router(plugin_ui_router)
     # Built-in plugin routes are optional. In AppImage/Nuitka builds,
@@ -244,5 +364,14 @@ def build_plugin_server_app(title: str = "N.E.K.O User Plugin Server") -> FastAP
     )
     app.include_router(plugin_cli_router)
     app.include_router(llm_tools_router)
+    # Before the bridge: its /market/knowledge/{path} catch-all would
+    # otherwise answer the subscription routes with 404.
+    app.include_router(knowledge_market_router)
+    app.include_router(knowledge_bridge_router)
     app.include_router(market_bridge_router)
+    # Keep the Host/Origin guard outside CORS and the cache-header middleware;
+    # untrusted requests must not be short-circuited before the guard runs.
+    from utils.instance_access import InstanceAccessMiddleware
+    app.add_middleware(InstanceAccessMiddleware)
+    app.add_middleware(HostOriginGuardMiddleware)
     return app

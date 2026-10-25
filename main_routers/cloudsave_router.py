@@ -1,4 +1,18 @@
 # -*- coding: utf-8 -*-
+# Copyright 2025-2026 Project N.E.K.O. Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 Cloudsave Router
 
@@ -7,18 +21,20 @@ and safety checks around runtime reload.
 
 URL convention: routes declared WITHOUT trailing slash (no ``@router.get('/')``).
 See ``main_routers/characters_router.py`` docstring or
-``.agent/rules/neko-guide.md`` (§"API URL 末尾不带斜杠") for the rationale;
+``.agent/rules/neko-guide.md`` (API URLs omit trailing slashes) for the rationale;
 enforced by ``scripts/check_api_trailing_slash.py``.
 """
 
 import asyncio
 import logging
+from contextlib import suppress
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from .shared_state import ensure_steamworks, get_config_manager, get_initialize_character_data, get_role_state, get_session_manager
 from .characters_router import (
+    create_derived_task_claim_token,
     notify_memory_server_reload,
     release_memory_server_character,
     send_reload_page_notice,
@@ -31,18 +47,47 @@ from utils.cloudsave_autocloud import (
 from utils.cloudsave_runtime import (
     CloudsaveOperationError,
     MaintenanceModeError,
+    ROOT_MODE_BOOTSTRAP_IMPORTING,
     build_cloudsave_character_detail,
     build_cloudsave_summary,
+    async_cloud_apply_fence,
     export_cloudsave_character_unit,
+    finalize_cloudsave_character_import,
     import_cloudsave_character_unit,
     is_cloudsave_provider_available,
     restore_cloudsave_operation_backup,
+    rollback_cloudsave_character_import_registry,
 )
 
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/cloudsave", tags=["cloudsave"])
+_character_download_apply_lock = asyncio.Lock()
+
+
+async def _await_thread_call_to_completion(func, *args, **kwargs):
+    """Return a worker result and whether cancellation arrived while it ran."""
+    operation = asyncio.create_task(asyncio.to_thread(func, *args, **kwargs))
+    try:
+        return await asyncio.shield(operation), False
+    except asyncio.CancelledError:
+        while not operation.done():
+            with suppress(asyncio.CancelledError):
+                await asyncio.wait({operation})
+        return operation.result(), True
+
+
+async def _await_coroutine_to_completion(coro):
+    """Finish an async transaction despite cancellation and report that cancellation."""
+    operation = asyncio.create_task(coro)
+    try:
+        return await asyncio.shield(operation), False
+    except asyncio.CancelledError:
+        while not operation.done():
+            with suppress(asyncio.CancelledError):
+                await asyncio.wait({operation})
+        return operation.result(), True
 
 
 CLOUDSAVE_ERROR_I18N_KEYS = {
@@ -54,6 +99,8 @@ CLOUDSAVE_ERROR_I18N_KEYS = {
     "CLOUD_CHARACTER_NOT_FOUND": "cloudsave.error.cloudCharacterNotFound",
     "CLOUDSAVE_CHARACTER_NOT_FOUND": "cloudsave.error.cloudCharacterNotFound",
     "LOCAL_CHARACTER_EXISTS": "cloudsave.error.localCharacterExists",
+    "VISIT_DATA_BUSY": "cloudsave.error.visitDataBusy",
+    "VISIT_DATA_AMBIGUOUS": "cloudsave.error.visitDataAmbiguous",
     "CLOUD_CHARACTER_EXISTS": "cloudsave.error.cloudCharacterExists",
     "CLOUDSAVE_WRITE_FENCE_ACTIVE": "cloudsave.error.writeFenceActive",
     "NAME_AUDIT_FAILED": "cloudsave.error.nameAuditFailed",
@@ -273,6 +320,54 @@ async def _force_terminate_session(character_name: str) -> tuple[bool, str]:
         return False, str(exc)
 
 
+def _character_config_lock():
+    # Late binding: tests replace this module-level lock.
+    from utils import character_memory
+
+    return character_memory.character_config_mutation_lock
+
+
+async def _visit_name_refusal(config_manager, name: str):
+    """409 ``VISIT_DATA_BUSY`` while a pending visit retirement / rename holds ``name``.
+
+    Called under the character-config lock right before the import publishes
+    the character, so no delete or rename can slip in between. Same rule as
+    every other path creating a character: the roster keys entries by name.
+    An overwrite of a local character is checked too: when that character's
+    own rename is still unreconciled, the import would replace its profile
+    (and uid) first, and recovery could then no longer tell where its
+    entries belong. A rename that can never be reconciled answers
+    ``VISIT_DATA_AMBIGUOUS`` (delete one of the two characters) rather than
+    ``VISIT_DATA_BUSY`` (try again later).
+    """
+    from main_routers.visit_router import character_hooks
+
+    blocked = await character_hooks.name_block_reason(config_manager, name)
+    if blocked is None:
+        return None
+    reason, names = blocked
+    if reason == character_hooks.NAME_AMBIGUOUS:
+        # Chained rename markers contain more than two names; report the character actually present locally, not an alphabetically earlier intermediate name that no longer exists.
+        configured = set((await config_manager.aload_characters()).get("猫娘") or {})
+        others = sorted(n for n in names if n != name)
+        other = next((n for n in others if n in configured), others[0] if others else name)
+        return _cloudsave_error_response(
+            "VISIT_DATA_AMBIGUOUS",
+            "An unfinished rename between this character and another one left their visit data impossible to "
+            "separate automatically. Delete one of the two characters, then download again.",
+            status_code=409,
+            character_name=name,
+            message_params={"first": name, "second": other},
+        )
+    return _cloudsave_error_response(
+        "VISIT_DATA_BUSY",
+        "Visit data under this name is still being sorted out (a character with this name was just "
+        "deleted or renamed). Please try again later.",
+        status_code=409,
+        character_name=name,
+    )
+
+
 def _local_character_exists(config_manager, character_name: str) -> bool:
     characters_payload = config_manager.load_characters()
     return character_name in (characters_payload.get("猫娘") or {})
@@ -299,11 +394,20 @@ def _maintenance_mode_error_response(exc: MaintenanceModeError, *, character_nam
     )
 
 
-async def _reload_after_character_download(character_name: str) -> tuple[bool, str]:
+async def _reload_after_character_download(
+    character_name: str,
+    release_claim_token: str | None = None,
+) -> tuple[bool, str]:
     initialize_character_data = get_initialize_character_data()
     await initialize_character_data()
     memory_server_reloaded = await notify_memory_server_reload(
         reason=f"云存档下载角色: {character_name}",
+        resume_derived_task_names=(character_name,),
+        release_derived_task_claims=(
+            {character_name: (release_claim_token,)}
+            if release_claim_token
+            else None
+        ),
     )
     if not memory_server_reloaded:
         return False, "memory_server reload failed"
@@ -382,7 +486,12 @@ async def post_cloudsave_character_upload(name: str, request: Request):
     overwrite = overwrite_val
 
     try:
-        result = export_cloudsave_character_unit(config_manager, name, overwrite=overwrite)
+        result, export_cancelled = await _await_thread_call_to_completion(
+            export_cloudsave_character_unit,
+            config_manager,
+            name,
+            overwrite=overwrite,
+        )
     except MaintenanceModeError as exc:
         return _maintenance_mode_error_response(exc, character_name=name)
     except CloudsaveOperationError as exc:
@@ -401,6 +510,9 @@ async def post_cloudsave_character_upload(name: str, request: Request):
             character_name=name,
         )
 
+    if export_cancelled:
+        raise asyncio.CancelledError
+
     return {
         "success": True,
         "character_name": name,
@@ -410,6 +522,78 @@ async def post_cloudsave_character_upload(name: str, request: Request):
         "sync_backend": STEAM_AUTO_CLOUD_SYNC_BACKEND,
         "steam_autocloud": _build_steam_autocloud_payload(config_manager),
     }
+
+
+async def _rollback_failed_character_download(
+    config_manager, name: str, result: dict, exc: BaseException,
+):
+    """Roll back one applied character download and report the reload failure."""
+    backup_path = str(result.get("backup_path") or "")
+    rollback_attempted = False
+    rollback_error = ""
+    rollback_notify_ok = False
+    try:
+        if backup_path:
+            rollback_attempted = True
+            try:
+                restore_cloudsave_operation_backup(
+                    config_manager, backup_path, recent_locks_held=True,
+                )
+            finally:
+                # Even failed disk recovery must revoke import-time recent identity;
+                # otherwise releasing file locks in finally exposes partially committed redirects/generations.
+                rollback_cloudsave_character_import_registry(result)
+            initialize_character_data = get_initialize_character_data()
+            await initialize_character_data()
+            rollback_notify_ok = await notify_memory_server_reload(
+                reason=f"云存档下载回滚: {name}",
+            )
+            if not rollback_notify_ok:
+                rollback_error = "notify_memory_server_reload returned False"
+    except Exception as rollback_exc:
+        rollback_error = str(rollback_exc)
+    return _cloudsave_error_response(
+        "LOCAL_RELOAD_FAILED_ROLLED_BACK",
+        f"The download was applied, but local reload failed: {exc}",
+        status_code=500,
+        character_name=name,
+        message_params={"message": str(exc)},
+        extra={
+            "rolled_back": rollback_attempted and rollback_error == "" and rollback_notify_ok,
+            "rollback_error": rollback_error,
+        },
+    )
+
+
+async def _complete_cloudsave_character_download(
+    config_manager,
+    name: str,
+    result: dict,
+    release_claim_token: str | None = None,
+):
+    """Reload an applied import or roll it back, then release its retained lock."""
+    try:
+        try:
+            reload_ok, reload_error = await _reload_after_character_download(
+                name,
+                release_claim_token,
+            )
+            if not reload_ok:
+                raise RuntimeError(reload_error or "reload failed")
+        except asyncio.CancelledError as exc:
+            # Shutdown may directly cancel the completion task itself; still roll back disk and registry
+            # under retained recent locks before propagating cancellation.
+            await _rollback_failed_character_download(
+                config_manager, name, result, exc,
+            )
+            raise
+        except Exception as exc:
+            return await _rollback_failed_character_download(
+                config_manager, name, result, exc,
+            )
+        return None
+    finally:
+        finalize_cloudsave_character_import(result)
 
 
 @router.post("/character/{name}/download")
@@ -454,6 +638,61 @@ async def post_cloudsave_character_download(name: str, request: Request):
     overwrite = overwrite_val
     backup_before_overwrite = backup_val
     force_val = (body or {}).get("force", False)
+    released_memory_handle = False
+    release_needs_resume = False
+    release_claim_token = create_derived_task_claim_token()
+
+    async def _release_local_handle(reason: str) -> bool:
+        nonlocal release_needs_resume
+        # The token is client-owned before the request starts. If cancellation
+        # arrives while HTTP is in flight, wait for its terminal result and
+        # withdraw this exact claim before propagating cancellation.
+        release_needs_resume = True
+        released, release_cancelled = await _await_coroutine_to_completion(
+            release_memory_server_character(
+                name,
+                reason=reason,
+                derived_task_claim_token=release_claim_token,
+            )
+        )
+        if released and not release_cancelled:
+            return True
+        _, resume_cancelled = await _await_coroutine_to_completion(
+            notify_memory_server_reload(
+                reason=f"{reason}（release 失败或取消补偿）",
+                release_derived_task_claims={
+                    name: (release_claim_token,),
+                },
+            )
+        )
+        release_needs_resume = False
+        if release_cancelled or resume_cancelled:
+            raise asyncio.CancelledError
+        return False
+
+    local_exists = _local_character_exists(config_manager, name)
+    if local_exists and not overwrite:
+        cloud_detail = build_cloudsave_character_detail(config_manager, name)
+        if cloud_detail is None:
+            return _cloudsave_error_response(
+                "CLOUD_CHARACTER_NOT_FOUND",
+                f"cloud character not found: {name}",
+                status_code=404,
+                character_name=name,
+            )
+        return _cloudsave_error_response(
+            "LOCAL_CHARACTER_EXISTS",
+            f"local character already exists: {name}",
+            status_code=409,
+            character_name=name,
+        )
+
+    # Check before irreversible steps such as forcibly ending sessions / releasing handles: a visit marker reserving the name
+    # still causes 409 below, so do not disconnect the user first. Recheck under lock before publishing.
+    async with _character_config_lock():
+        visit_refusal = await _visit_name_refusal(config_manager, name)
+    if visit_refusal is not None:
+        return visit_refusal
 
     block_reason = _active_session_block_reason(name)
     if block_reason:
@@ -474,9 +713,8 @@ async def post_cloudsave_character_download(name: str, request: Request):
                 character_name=name,
                 message_params={"message": terminate_msg},
             )
-        released_memory_handle = await release_memory_server_character(
-            name,
-            reason=f"云存档强制下载前释放 SQLite 句柄: {name}",
+        released_memory_handle = await _release_local_handle(
+            f"云存档强制下载前释放 SQLite 句柄: {name}",
         )
         if not released_memory_handle:
             return _cloudsave_error_response(
@@ -485,28 +723,9 @@ async def post_cloudsave_character_download(name: str, request: Request):
                 status_code=503,
                 character_name=name,
             )
-
-    local_exists = _local_character_exists(config_manager, name)
-    if local_exists and not overwrite:
-        cloud_detail = build_cloudsave_character_detail(config_manager, name)
-        if cloud_detail is None:
-            return _cloudsave_error_response(
-                "CLOUD_CHARACTER_NOT_FOUND",
-                f"cloud character not found: {name}",
-                status_code=404,
-                character_name=name,
-            )
-        return _cloudsave_error_response(
-            "LOCAL_CHARACTER_EXISTS",
-            f"local character already exists: {name}",
-            status_code=409,
-            character_name=name,
-        )
-
     if local_exists and overwrite and not force_val:
-        released_memory_handle = await release_memory_server_character(
-            name,
-            reason=f"云存档下载前释放 SQLite 句柄: {name}",
+        released_memory_handle = await _release_local_handle(
+            f"云存档下载前释放 SQLite 句柄: {name}",
         )
         if not released_memory_handle:
             return _cloudsave_error_response(
@@ -517,12 +736,43 @@ async def post_cloudsave_character_download(name: str, request: Request):
             )
 
     try:
-        result = import_cloudsave_character_unit(
-            config_manager,
-            name,
-            overwrite=overwrite,
-            backup_before_overwrite=backup_before_overwrite,
-        )
+        # Serialize same-process apply work task-wise. Cross-process contention
+        # is polled without blocking the event loop; Windows mutex ownership
+        # still stays on this thread for both acquire and release.
+        async with _character_download_apply_lock:
+            async with async_cloud_apply_fence(
+                config_manager,
+                mode=ROOT_MODE_BOOTSTRAP_IMPORTING,
+                reason=f"single_character_download:{name}",
+            ):
+                # Evaluate and publish under the character-configuration mutation lock; otherwise concurrent deletion can retire
+                # and commit the name between evaluation and publication, after which this path recreates it.
+                async with _character_config_lock():
+                    visit_refusal = await _visit_name_refusal(config_manager, name)
+                    if visit_refusal is None:
+                        result, import_cancelled = await _await_thread_call_to_completion(
+                            import_cloudsave_character_unit,
+                            config_manager,
+                            name,
+                            overwrite=overwrite,
+                            backup_before_overwrite=backup_before_overwrite,
+                            retain_recent_locks=True,
+                            use_cloud_apply_fence=False,
+                        )
+                if visit_refusal is not None:
+                    return visit_refusal
+                reload_error_response, completion_cancelled = (
+                    await _await_coroutine_to_completion(
+                        _complete_cloudsave_character_download(
+                            config_manager,
+                            name,
+                            result,
+                            release_claim_token,
+                        ),
+                    )
+                )
+                if reload_error_response is None:
+                    release_needs_resume = False
     except MaintenanceModeError as exc:
         return _maintenance_mode_error_response(exc, character_name=name)
     except CloudsaveOperationError as exc:
@@ -540,39 +790,25 @@ async def post_cloudsave_character_download(name: str, request: Request):
             status_code=500,
             character_name=name,
         )
+    finally:
+        if release_needs_resume:
+            _, resume_cancelled = await _await_coroutine_to_completion(
+                notify_memory_server_reload(
+                    reason=f"云存档下载中止，恢复角色派生任务: {name}",
+                    release_derived_task_claims={
+                        name: (release_claim_token,),
+                    },
+                )
+            )
+            if resume_cancelled:
+                raise asyncio.CancelledError
+
+    if import_cancelled or completion_cancelled:
+        raise asyncio.CancelledError
+    if reload_error_response is not None:
+        return reload_error_response
 
     backup_path = str(result.get("backup_path") or "")
-    try:
-        reload_ok, reload_error = await _reload_after_character_download(name)
-        if not reload_ok:
-            raise RuntimeError(reload_error or "reload failed")
-    except Exception as exc:
-        rollback_attempted = False
-        rollback_error = ""
-        rollback_notify_ok = False
-        try:
-            if backup_path:
-                rollback_attempted = True
-                restore_cloudsave_operation_backup(config_manager, backup_path)
-                initialize_character_data = get_initialize_character_data()
-                await initialize_character_data()
-                rollback_notify_ok = await notify_memory_server_reload(reason=f"云存档下载回滚: {name}")
-                if not rollback_notify_ok:
-                    rollback_error = "notify_memory_server_reload returned False"
-        except Exception as rollback_exc:
-            rollback_error = str(rollback_exc)
-        return _cloudsave_error_response(
-            "LOCAL_RELOAD_FAILED_ROLLED_BACK",
-            f"The download was applied, but local reload failed: {exc}",
-            status_code=500,
-            character_name=name,
-            message_params={"message": str(exc)},
-            extra={
-                "rolled_back": rollback_attempted and rollback_error == "" and rollback_notify_ok,
-                "rollback_error": rollback_error,
-            },
-        )
-
     refreshed_detail = build_cloudsave_character_detail(config_manager, name) or result.get("detail")
     return {
         "success": True,

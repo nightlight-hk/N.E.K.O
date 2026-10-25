@@ -1,3 +1,17 @@
+# Copyright 2025-2026 Project N.E.K.O. Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Public holiday cache & greeting consumption tracker.
 
 Fetches yearly holiday data from https://date.nager.at/api/v3 at startup,
@@ -7,17 +21,17 @@ with a per-period consumption budget.  Consumption state is persisted to disk.
 Key concepts
 ------------
 - **HolidayPeriod**: consecutive rest days grouped into one period, containing
-  both 法定假日 (statutory holidays) and 调休 (adjusted rest days).
+  both statutory holidays and adjusted rest days (tiaoxiu).
 - **CN supplement**: patches the Nager API with correct statutory day counts
-  and approximate 调休 extensions.
+  and approximate adjusted-rest-day extensions.
 
 Consumption rules (per character, per period)
 ---------------------------------------------
-- 假日当天 (any statutory holiday day within the period) : budget 3 (shared)
-- 假期非假日 (调休 rest days within the period)           : budget 3 (shared)
-- Single-day holiday (no 调休)                           : total 3
-- Multi-day holiday (with 调休)                          : total 6  (3+3)
-- Weekend (no holiday)                                   : budget 2 per day
+- Holiday day proper (any statutory holiday day within the period) : budget 3 (shared)
+- Non-holiday rest day (adjusted rest days within the period)      : budget 3 (shared)
+- Single-day holiday (no adjusted rest days)                       : total 3
+- Multi-day holiday (with adjusted rest days)                      : total 6  (3+3)
+- Weekend (no holiday)                                             : budget 2 per day
 - When budget is exhausted, the hint is omitted entirely.
 """
 
@@ -45,11 +59,22 @@ logger = logging.getLogger(__name__)
 # ── language → country code mapping ──────────────────────────────────
 _LANG_TO_COUNTRY: dict[str, str] = {
     'zh': 'CN',
+    'zh-CN': 'CN',
+    'zh-TW': 'TW',
     'en': 'US',
     'ja': 'JP',
     'ko': 'KR',
     'ru': 'RU',
 }
+
+
+def _holiday_hint_language_key(lang: str, table: dict[str, str]) -> str:
+    """Select a template locale while keeping Chinese-family fallback."""
+    if lang in table:
+        return lang
+    if str(lang).lower().startswith('zh') and 'zh' in table:
+        return 'zh'
+    return 'en'
 
 # ── types ────────────────────────────────────────────────────────────
 
@@ -64,9 +89,10 @@ class HolidayPeriod:
 
     Attributes:
         start / end      — inclusive boundaries of the full rest period
-        nominal_date     — the single "名义日期" of the holiday (e.g. 10/1 for
-                           国庆节, 初一 for 春节).  Only THIS day qualifies as
-                           "假日当天" with an independent 3-use budget.
+        nominal_date     — the single "nominal date" of the holiday (e.g. 10/1 for
+                           National Day, Lunar New Year's Day for Spring Festival).
+                           Only THIS day qualifies as the "holiday day proper" with
+                           an independent 3-use budget.
         name / local_name — display names
     """
     __slots__ = ("name", "local_name", "start", "end", "nominal_date")
@@ -92,7 +118,7 @@ class HolidayPeriod:
         return self.start <= d <= self.end
 
     def is_nominal_day(self, d: date) -> bool:
-        """Is *d* the holiday's nominal date (假日当天)?"""
+        """Is *d* the holiday's nominal date (the holiday day proper)?"""
         return d == (self.nominal_date or self.start)
 
     def __repr__(self) -> str:
@@ -110,18 +136,20 @@ _NAGER_API = "https://date.nager.at/api/v3"
 _TIMOR_API = "http://timor.tech/api/holiday/year"
 _FETCH_TIMEOUT = 10.0
 
-# ── 全局补充节日（所有国家共享，固定日期，API 可能不含） ──────────
-# 格式: (month, day, localName_dict)
+# -- Additional global holidays (shared across countries, fixed dates, possibly absent from APIs). --
+# Format: (month, day, localName_dict).
 # Holiday display names below are *data*, not LLM prompts — they're returned
 # as HolidayEntry.localName for display. The dict-shape happens to match the
 # i18n-leak detector but the project convention exempts pure localized data.
 _GLOBAL_EXTRA_HOLIDAYS: list[tuple[int, int, dict[str, str]]] = [
     (2, 14, {  # noqa: I18N_NOT_IN_CONFIG  # holiday display data, not LLM prompt
-        'zh': '情人节', 'en': "Valentine's Day", 'ja': 'バレンタインデー',
+        'zh': '情人节', 'zh-TW': '情人節',
+        'en': "Valentine's Day", 'ja': 'バレンタインデー',
         'ko': '발렌타인데이', 'ru': 'День святого Валентина',
     }),
     (12, 25, {  # noqa: I18N_NOT_IN_CONFIG  # holiday display data, not LLM prompt
-        'zh': '圣诞节', 'en': 'Christmas', 'ja': 'クリスマス',
+        'zh': '圣诞节', 'zh-TW': '聖誕節',
+        'en': 'Christmas', 'ja': 'クリスマス',
         'ko': '크리스마스', 'ru': 'Рождество',
     }),
 ]
@@ -146,9 +174,9 @@ def _inject_global_extras(entries: list[HolidayEntry], year: int,
     return result
 
 
-# 已知的中国法定节日名（用于从 timor API 的每日条目中归并 period 的展示名）
+# Known Chinese statutory holiday names, used to combine timor API daily entries into period display names.
 _CN_KNOWN_HOLIDAYS = {'元旦', '春节', '清明节', '劳动节', '端午节', '中秋节', '国庆节'}
-# 春节 period 里初一~初七等条目需要映射回 "春节"；名义日期用初一
+# Map lunar days 1-7 in Spring Festival periods back to Spring Festival; use lunar day 1 as the nominal date.
 _CN_SPRING_NOMINAL = '初一'
 
 
@@ -216,8 +244,8 @@ def _build_periods(entries: list[HolidayEntry]) -> list[HolidayPeriod]:
 async def _fetch_nager(country: str, year: int) -> list[HolidayEntry]:
     """Fetch from Nager.Date API (JP / KR / RU / US etc.)."""
     url = f"{_NAGER_API}/PublicHolidays/{year}/{country}"
-    # per-call AsyncClient: 每年每国家只拉一次（lazy warmup），且刻意 trust_env=False
-    # 绕开本地代理 —— 与 external_http_client（trust_env=True）配置不一致
+    # Per-call AsyncClient: fetch once per country/year (lazy warmup), deliberately trust_env=False
+    # to bypass local proxies, unlike external_http_client's trust_env=True configuration.
     async with httpx.AsyncClient(timeout=_FETCH_TIMEOUT, proxy=None, trust_env=False) as client:
         resp = await client.get(url)
         resp.raise_for_status()
@@ -225,9 +253,9 @@ async def _fetch_nager(country: str, year: int) -> list[HolidayEntry]:
 
 
 async def _fetch_cn(year: int) -> list[HolidayEntry]:
-    """Fetch from timor.tech API for China — complete with 调休."""
+    """Fetch from timor.tech API for China — complete with adjusted rest days."""
     url = f"{_TIMOR_API}/{year}"
-    # per-call AsyncClient: 同上，每年一次，trust_env=False 绕开代理
+    # Per-call AsyncClient: likewise once per year, trust_env=False to bypass proxies.
     async with httpx.AsyncClient(timeout=_FETCH_TIMEOUT, proxy=None, trust_env=False) as client:
         resp = await client.get(url)
         resp.raise_for_status()
@@ -242,12 +270,12 @@ async def _fetch_cn(year: int) -> list[HolidayEntry]:
     result: list[HolidayEntry] = []
     for _key, info in sorted(raw.items()):
         if not info.get("holiday"):
-            continue  # 补班日，跳过
+            continue  # Make-up workday: skip.
         entry_name: str = info.get("name", "")
         entry_date: str = info.get("date", "")
         wage: int = info.get("wage", 1)
 
-        # Determine display name: map 除夕/初一~初七 → "春节"
+        # Determine display name: map 除夕/初一~初七 -> "春节".
         if entry_name in _CN_KNOWN_HOLIDAYS:
             display = entry_name
         elif entry_name in ('除夕', '初一', '初二', '初三', '初四', '初五', '初六', '初七'):
@@ -256,8 +284,8 @@ async def _fetch_cn(year: int) -> list[HolidayEntry]:
             display = entry_name
 
         # Nominal date: the canonical day of the holiday.
-        # wage=3 entry whose display==holiday name, AND for 春节 specifically
-        # the nominal is 初一 (not 除夕).
+        # wage=3 entry whose display==holiday name, AND for Spring Festival specifically
+        # the nominal date is lunar day 1, not New Year's Eve.
         is_nominal = False
         if wage == 3:
             if display == '春节':
@@ -304,7 +332,13 @@ async def _warm_all_once() -> None:
         except Exception as e:
             logger.info("Holiday cache fetch skipped for %s/%d: %s", country, year, e)
 
-    await asyncio.gather(*[_fetch_one(l, c) for l, c in _LANG_TO_COUNTRY.items()])
+    country_locales: dict[str, str] = {}
+    for lang, country in _LANG_TO_COUNTRY.items():
+        country_locales.setdefault(country, lang)
+    await asyncio.gather(*[
+        _fetch_one(lang, country)
+        for country, lang in country_locales.items()
+    ])
 
 
 async def _ensure_periods(country: str, year: int) -> list[HolidayPeriod]:
@@ -353,7 +387,7 @@ async def get_nearest_holiday(lang: str) -> HolidayProximity | None:
     - "Today" matches if today falls *anywhere* inside a period.
     - Advance reminders (≤3 / 7 days) are based on the period's *start*.
     - In late December, also checks next year's periods so that early-
-      January holidays (e.g. 元旦) are not missed near year boundaries.
+      January holidays (e.g. New Year's Day) are not missed near year boundaries.
     """
     country = _LANG_TO_COUNTRY.get(lang)
     if not country:
@@ -397,7 +431,7 @@ async def get_nearest_holiday(lang: str) -> HolidayProximity | None:
 #     "periods": {
 #       "<period_start_iso>": {
 #         "holiday": <remaining>,    // statutory day budget (3)
-#         "period": <remaining>      // 调休 day budget (3)
+#         "period": <remaining>      // Adjusted-holiday day budget (3)
 #       }
 #     },
 #     "weekend_date": "YYYY-MM-DD",
@@ -414,8 +448,8 @@ _consumption_path: Path | None = None
 # concurrent writers in worker threads.
 _consumption_lock = threading.Lock()
 
-_BUDGET_HOLIDAY = 3   # statutory day budget (shared across all 假日 days)
-_BUDGET_PERIOD = 3    # 调休 day budget (shared across all 调休 days)
+_BUDGET_HOLIDAY = 3   # Statutory day budget shared across all statutory holiday days.
+_BUDGET_PERIOD = 3    # Adjusted-holiday day budget shared across all adjusted days off.
 _BUDGET_WEEKEND = 2   # weekend budget (daily)
 
 
@@ -502,8 +536,8 @@ def try_consume_holiday(character: str, proximity: HolidayProximity) -> bool:
     """Try to consume 1 hint use for a holiday.
 
     Budget logic:
-    - 假日当天 (nominal date, e.g. 10/1) → "holiday" bucket (3, independent)
-    - 假期中非假日当天 (all other days in period) → "period" bucket (3, shared)
+    - Holiday day proper (nominal date, e.g. 10/1) → "holiday" bucket (3, independent)
+    - Non-holiday days within the period (all other days) → "period" bucket (3, shared)
     - Advance reminder (≤3 / 7 days) → "period" bucket (3)
     """
     period = proximity.period
@@ -571,7 +605,7 @@ async def get_holiday_or_weekend_hint(lang: str, character: str) -> str | None:
             return None
 
         name = proximity.period.display_name
-        lang_key = lang if lang in HOLIDAY_HINT_TODAY else 'en'
+        lang_key = _holiday_hint_language_key(lang, HOLIDAY_HINT_TODAY)
 
         if proximity.is_today:
             tpl = HOLIDAY_HINT_TODAY.get(lang_key, HOLIDAY_HINT_TODAY['en'])
@@ -587,7 +621,8 @@ async def get_holiday_or_weekend_hint(lang: str, character: str) -> str | None:
     if datetime.now().weekday() >= 5:
         if not try_consume_weekend(character):
             return None
-        return WEEKEND_HINT.get(lang, WEEKEND_HINT.get('en', ''))
+        lang_key = _holiday_hint_language_key(lang, WEEKEND_HINT)
+        return WEEKEND_HINT.get(lang_key, WEEKEND_HINT.get('en', ''))
 
     return None
 
@@ -625,7 +660,7 @@ def _has_weekend_budget(character: str) -> bool:
 def _build_holiday_hint_text(lang: str, proximity: HolidayProximity) -> str:
     """Build hint text from a proximity object (no side effects)."""
     name = proximity.period.display_name
-    lang_key = lang if lang in HOLIDAY_HINT_TODAY else 'en'
+    lang_key = _holiday_hint_language_key(lang, HOLIDAY_HINT_TODAY)
     if proximity.is_today:
         tpl = HOLIDAY_HINT_TODAY.get(lang_key, HOLIDAY_HINT_TODAY['en'])
         return tpl.format(name=name)
@@ -659,7 +694,8 @@ async def preview_holiday_or_weekend_hint(
     if datetime.now().weekday() >= 5:
         if not _has_weekend_budget(character):
             return None, None
-        text = WEEKEND_HINT.get(lang, WEEKEND_HINT.get('en', ''))
+        lang_key = _holiday_hint_language_key(lang, WEEKEND_HINT)
+        text = WEEKEND_HINT.get(lang_key, WEEKEND_HINT.get('en', ''))
         return text, ("weekend",)
 
     return None, None

@@ -1,14 +1,9 @@
-from urllib.parse import quote, unquote
+"""Compatibility alias for :mod:`utils.http.url`."""
 
+from __future__ import annotations
 
-def encode_url_path(path: str) -> str:
-    """
-    对 URL 路径段做安全编码,避免空格/特殊字符导致静态资源加载失败.
-    仅编码路径段本身,保留 '/' 分隔结构.
-    """
-    if not path:
-        return path
+import sys
 
-    parts = path.split('/')
-    encoded_parts = [quote(unquote(part), safe='') for part in parts]
-    return '/'.join(encoded_parts)
+from utils.http import url as _implementation
+
+sys.modules[__name__] = _implementation

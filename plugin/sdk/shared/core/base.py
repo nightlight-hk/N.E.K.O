@@ -37,9 +37,9 @@ class PluginMeta:
     version: str = DEFAULT_PLUGIN_VERSION
     sdk_version: str = SDK_VERSION
     description: str = ""
-    short_description: str = ""  # 简短描述（<300字符），用于 agent 两阶段插件筛选
-    keywords: list[str] = field(default_factory=list)  # 关键词正则表达式列表
-    passive: bool = False  # 被动插件，不参与 agent 主动分派
+    short_description: str = ""  # Short description (<300 characters), used by the agent's two-stage plugin selection.
+    keywords: list[str] = field(default_factory=list)  # List of keyword regular expressions.
+    passive: bool = False  # Passive plugin; excluded from proactive agent dispatch.
     sdk_recommended: str | None = None
     sdk_supported: str | None = None
     sdk_untested: str | None = None
@@ -83,6 +83,25 @@ class NekoPluginBase:
         self.db = PluginDatabase(plugin_id=plugin_id, plugin_dir=plugin_dir, logger=self.logger, enabled=db_enabled, db_name=db_name)
         self.state = PluginStatePersistence(plugin_id=plugin_id, plugin_dir=plugin_dir, logger=self.logger, backend=state_backend)
         self._state_persistence = self.state
+
+    def refresh_runtime_config(self, effective_config: dict[str, object] | None = None) -> None:
+        """Refresh SDK runtime helpers after the host effective config changes."""
+        cfg = effective_config if isinstance(effective_config, dict) else resolve_effective_config(self.ctx)
+        store_enabled = resolve_store_enabled(cfg)
+        db_enabled, db_name = resolve_db_config(cfg)
+        state_backend = resolve_state_backend(cfg)
+        configure_db_name = getattr(self.db, "configure_database_name", None)
+        normalize_state_backend = getattr(type(self.state), "normalize_backend", None)
+        if callable(normalize_state_backend):
+            state_backend = normalize_state_backend(state_backend)
+
+        if callable(configure_db_name):
+            configure_db_name(db_name)
+        elif hasattr(self.db, "db_name"):
+            self.db.db_name = db_name
+        self.store.enabled = store_enabled
+        self.db.enabled = db_enabled
+        self.state.backend = state_backend
 
     def get_input_schema(self) -> InputSchema:
         schema = getattr(self, "input_schema", None)

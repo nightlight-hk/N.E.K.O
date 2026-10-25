@@ -1,4 +1,4 @@
-"""Gemini TTS voice 目录的规范化、识别与 UI shape 行为。"""
+"""Normalization, recognition, and UI-shape behavior of the Gemini TTS voice catalog."""
 import os
 import sys
 
@@ -16,6 +16,7 @@ from utils.gemini_tts_voices import (
     normalize_gemini_tts_voice,
 )
 from utils.native_voice_registry import get_native_voice_catalog_for_ui
+from utils.tts.providers import gemini as gemini_provider
 
 
 @pytest.mark.parametrize(
@@ -69,8 +70,8 @@ def test_aliases_resolve_to_default_per_gender(alias, expected):
 
 @pytest.mark.parametrize("voice_id", ["", "   ", None])
 def test_empty_input_is_unrecognized(voice_id):
-    """空输入用 default 兜底，但 recognized=False —— 调用方据此区分
-    "用户显式选了 voice" 与 "我们替他默认选了一个"。"""
+    """Empty input falls back to default with recognized=False, letting callers distinguish
+    'the user explicitly selected a voice' from 'we selected a default for them'."""
     name, recognized = normalize_gemini_tts_voice(voice_id)
     assert name == GEMINI_TTS_DEFAULT_VOICE
     assert recognized is False
@@ -114,9 +115,69 @@ def test_gemini_provider_registered_with_expected_metadata():
 
 
 def test_default_voices_are_in_catalog():
-    """default voice 必须真的在 catalog 里 —— 否则 fallback 会撞上
-    Gemini API 报 voice 不存在。"""
+    """The default voice must actually exist in the catalog; otherwise fallback causes
+    the Gemini API to report a nonexistent voice."""
     assert GEMINI_TTS_DEFAULT_VOICE in GEMINI_TTS_VOICE_GENDERS
     assert GEMINI_TTS_DEFAULT_MALE_VOICE in GEMINI_TTS_VOICE_GENDERS
     assert GEMINI_TTS_VOICE_GENDERS[GEMINI_TTS_DEFAULT_MALE_VOICE] == "Male"
     assert GEMINI_TTS_VOICE_GENDERS[GEMINI_TTS_DEFAULT_VOICE] == "Female"
+
+
+def test_partial_config_defaults_drive_gemini_fallback_aliases(monkeypatch):
+    catalog = {"ConfiguredFemale": "Female", "ConfiguredMale": "Male"}
+    monkeypatch.setattr(gemini_provider, "_CFG", {"voices": catalog})
+    monkeypatch.setattr(gemini_provider, "GEMINI_TTS_VOICE_GENDERS", catalog)
+    monkeypatch.setattr(
+        gemini_provider, "GEMINI_TTS_DEFAULT_VOICE", "ConfiguredFemale"
+    )
+    monkeypatch.setattr(
+        gemini_provider, "GEMINI_TTS_DEFAULT_MALE_VOICE", "ConfiguredMale"
+    )
+
+    provider = gemini_provider._create_provider()
+
+    assert provider.normalize("female") == ("ConfiguredFemale", True)
+    assert provider.normalize("male") == ("ConfiguredMale", True)
+
+
+def test_partial_free_intl_config_defaults_drive_fallback_aliases(monkeypatch):
+    cfg = {
+        "voices": {"IntlFemale": "Female", "IntlMale": "Male"},
+        "default_voice": "IntlFemale",
+        "default_male_voice": "IntlMale",
+    }
+    monkeypatch.setattr(
+        gemini_provider,
+        "get_native_tts_voice_provider_config",
+        lambda provider_key: cfg if provider_key == "free_intl" else {},
+    )
+
+    provider = gemini_provider._create_free_intl_provider()
+
+    assert provider.normalize("female") == ("IntlFemale", True)
+    assert provider.normalize("male") == ("IntlMale", True)
+    assert provider.normalize("default") == ("IntlFemale", True)
+
+
+def test_missing_free_intl_config_preserves_gemini_fallback_aliases(monkeypatch):
+    monkeypatch.setattr(
+        gemini_provider,
+        "get_native_tts_voice_provider_config",
+        lambda _provider_key: {},
+    )
+
+    provider = gemini_provider._create_free_intl_provider()
+
+    assert provider.default_voice == "yui"
+    assert provider.normalize("default") == (
+        gemini_provider.FALLBACK_GEMINI_TTS_DEFAULT_VOICE,
+        True,
+    )
+    assert provider.normalize("female") == (
+        gemini_provider.FALLBACK_GEMINI_TTS_DEFAULT_VOICE,
+        True,
+    )
+    assert provider.normalize("male") == (
+        gemini_provider.FALLBACK_GEMINI_TTS_DEFAULT_MALE_VOICE,
+        True,
+    )

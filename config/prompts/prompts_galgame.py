@@ -1,12 +1,44 @@
+# Copyright 2025-2026 Project N.E.K.O. Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """GalGame-mode prompt templates.
 
 Used by /api/galgame/options to generate three reply options (A/B/C) for the
 user, given the recent dialogue turn. The summary-tier model produces a JSON
 payload of style-typed candidates the user can click to send.
+
+GalGame is a dialogue/story mode, not a minigame, so it does not share the
+minigame prompt infrastructure (prompts_minigame_common / prompts_minigame_route).
+It localizes directly through prompts_sys._loc instead.
 """
 from __future__ import annotations
 
+from config.prompts._locale import normalize_prompt_locale
 from config.prompts.prompts_sys import _loc
+
+
+def normalize_galgame_locale(lang: str | None) -> str:
+    """Normalize a locale to a key of this module's prompt dicts, which include zh-TW.
+
+    Public on purpose, same reason as ``prompts_proactive.normalize_mini_game_invite_locale``:
+    the consumer is ``main_routers.galgame_router`` and the tables live here.
+
+    Every dict below carries all eight NEKO_CORE_LOCALES with Simplified Chinese
+    keyed as ``zh``, so this is the plain full-locale scheme -- ``keep_traditional``
+    stays on and nothing is filtered out.
+    """
+    return normalize_prompt_locale(lang, default='en', simplified='zh', keep_traditional=True)
 
 
 # {lanlan_name} = catgirl display name; {master_name} = chat partner display name.
@@ -22,6 +54,18 @@ GALGAME_OPTION_GENERATION_PROMPT = {
 
 输出严格为 JSON，格式：{{"options":[{{"label":"A","text":"..."}},{{"label":"B","text":"..."}},{{"label":"C","text":"..."}}]}}。
 不要输出 JSON 之外的任何字符，不要使用代码块包裹。""",
+
+    'zh-TW': """你是一個遊戲劇本助手，正在為一名玩家（{master_name}）生成三個不同風格的回覆候選，讓玩家在跟角色（{lanlan_name}）的對話裡挑一個送出。
+
+下面會給你一段最近的對話紀錄，最後一條是 {lanlan_name} 的發言。請站在 {master_name} 的視角，寫出三個能自然銜接 {lanlan_name} 最新發言的回覆，每個不超過 30 個字，保持口語，不要用括號描寫動作或心理。
+
+三個回覆必須嚴格照下面的風格區分：
+- A：正經嚴肅。聚焦事實、提問或就事論事的回應，不賣萌、不告白。
+- B：溫馨滿是愛意。語氣甜軟、關心對方、表達喜歡與陪伴感，但要保持自然，不要肉麻到出戲。
+- C：天馬行空、充滿想像力。可以腦洞跳躍、奇幻設定、調皮玩梗，但仍然要回應對方剛才的話題。
+
+輸出嚴格為 JSON，格式：{{"options":[{{"label":"A","text":"..."}},{{"label":"B","text":"..."}},{{"label":"C","text":"..."}}]}}。
+不要輸出 JSON 以外的任何字元，不要用程式碼區塊包起來。""",
 
     'en': """You are writing three reply candidates for the player ({master_name}) to send to the character ({lanlan_name}) in an ongoing conversation.
 
@@ -100,6 +144,9 @@ Não retorne nada fora do JSON. Não envolva em bloco de código.""",
 # Headers used to format the dialogue context block sent to the model.
 GALGAME_DIALOGUE_HEADER = {
     'zh': "======以下为最近的对话======",
+    # The watermark frames "以下为 / 以上为" (following/preceding content) are invariant literals across locales in this table (also copied verbatim
+    # in English, Japanese, Korean, Russian, Spanish, and Portuguese). Traditional Chinese keeps the same frames and translates only descriptions so paired watermarks remain comparable.
+    'zh-TW': "======以下为最近的對話======",
     'en': "======以下为 the recent dialogue======",
     'ja': "======以下为 直近の会話======",
     'ko': "======以下为 최근 대화======",
@@ -110,6 +157,7 @@ GALGAME_DIALOGUE_HEADER = {
 
 GALGAME_DIALOGUE_FOOTER = {
     'zh': "======以上为最近的对话。请按系统消息约定的格式输出三个回复候选======",
+    'zh-TW': "======以上为最近的對話。請照系統訊息約定的格式輸出三個回覆候選======",
     'en': "======以上为 the recent dialogue. Produce the three reply candidates in the format required by the system message======",
     'ja': "======以上为 直近の会話。システムメッセージで指定した形式で 3 つの返信候補を出力してください======",
     'ko': "======以上为 최근 대화. 시스템 메시지에서 요구한 형식으로 세 개의 답장 후보를 출력하세요======",
@@ -124,12 +172,12 @@ GALGAME_DIALOGUE_FOOTER = {
 # the prompt readable in the model's native language instead of an English
 # "her/you" residue mixing into ja/ko/ru output).
 GALGAME_DEFAULT_LANLAN_PLACEHOLDER = {
-    'zh': '猫娘', 'en': 'Catgirl', 'ja': '猫娘', 'ko': '캣걸', 'ru': 'Кошкодевочка',
-    'es': 'Chica gato', 'pt': 'Garota gato',
+    'zh': '猫娘', 'zh-TW': '貓娘', 'en': 'Catgirl', 'ja': '猫娘', 'ko': '캣걸',
+    'ru': 'Кошкодевочка', 'es': 'Chica gato', 'pt': 'Garota gato',
 }
 GALGAME_DEFAULT_MASTER_PLACEHOLDER = {
-    'zh': '玩家', 'en': 'Player', 'ja': 'プレイヤー', 'ko': '플레이어', 'ru': 'Игрок',
-    'es': 'Jugador', 'pt': 'Jogador',
+    'zh': '玩家', 'zh-TW': '玩家', 'en': 'Player', 'ja': 'プレイヤー', 'ko': '플레이어',
+    'ru': 'Игрок', 'es': 'Jugador', 'pt': 'Jogador',
 }
 
 GALGAME_FALLBACK_OPTIONS = {
@@ -137,6 +185,11 @@ GALGAME_FALLBACK_OPTIONS = {
         '我有点没听清，可以再说一次吗？',
         '嗯嗯，我都在听，慢慢说就好。',
         '如果我们现在掉进童话书里会怎样？',
+    ),
+    'zh-TW': (
+        '我有點沒聽清楚，可以再說一次嗎？',
+        '嗯嗯，我都在聽，慢慢說就好。',
+        '如果我們現在掉進童話書裡會怎樣？',
     ),
     'en': (
         'Could you walk me through that again?',

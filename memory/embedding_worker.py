@@ -1,4 +1,18 @@
 # -*- coding: utf-8 -*-
+# Copyright 2025-2026 Project N.E.K.O. Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 Background warmup + batch-fill loop for vector embeddings.
 
@@ -66,13 +80,13 @@ except ImportError:
 # unresolved at runtime. Static analyzers that need the resolved types
 # can import the modules themselves; we don't pay an extra import here.
 
-# 同 embeddings.py：归到 N.E.K.O.Memory.* 才能进 Memory 日志文件，否则
+# As in embeddings.py, use N.E.K.O.Memory.* so these messages reach the Memory log file; otherwise
 # "[EmbeddingWorker] service disabled at construction (reason); worker exiting"
-# 这类退出原因落在 root（无 handler）上，线上不可见。
+# these exit reasons go to root (which has no handler) and are invisible in production.
 try:
     from utils.logger_config import get_module_logger
     logger = get_module_logger(__name__, "Memory")
-except Exception:  # noqa: BLE001 — 退回裸 logger，保持 worker 可导入
+except Exception:  # noqa: BLE001 — fall back to the bare logger to keep the worker importable.
     logger = logging.getLogger(__name__)
 
 
@@ -108,6 +122,7 @@ class EmbeddingWarmupWorker:
         get_character_names,         # callable returning list[str]
         warmup_delay_seconds: float,
         get_dedup_resolver=None,     # callable returning current FactDedupResolver, or None to disable
+        get_sweep_barrier=None,      # callable returning the reload/forget lock
     ) -> None:
         # All store/manager accesses go through getters so /reload (which
         # rebinds the memory_server module globals) is observed on the next
@@ -129,6 +144,10 @@ class EmbeddingWarmupWorker:
         # installations that prefer pure hash + FTS5 dedup until they
         # have evaluated LLM cost).
         self._get_dedup_resolver = get_dedup_resolver
+        # A getter keeps this worker independent of memory_server while letting
+        # production drain a sweep that captured pre-reload managers before a
+        # reload + scoped forget can erase through their replacements.
+        self._get_sweep_barrier = get_sweep_barrier
 
         self._service = get_embedding_service()
         self._first_process_event = asyncio.Event()
@@ -256,6 +275,17 @@ class EmbeddingWarmupWorker:
         starve the rest of memory_server. Remaining work picks up on
         the next sweep — eventual consistency is fine here.
         """
+        barrier = (
+            self._get_sweep_barrier()
+            if self._get_sweep_barrier is not None else None
+        )
+        if barrier is None:
+            return await self._sweep_once_under_barrier()
+        async with barrier:
+            return await self._sweep_once_under_barrier()
+
+    async def _sweep_once_under_barrier(self) -> int:
+        """Run one sweep while the caller keeps component generation stable."""
         try:
             names = list(self._get_character_names())
         except Exception as e:  # noqa: BLE001
@@ -395,8 +425,10 @@ class EmbeddingWarmupWorker:
         if dedup_resolver is not None:
             try:
                 from memory.fact_dedup import FactDedupResolver  # local import keeps the worker importable when dedup module isn't loaded
+                from memory.facts import _fact_scoped_identity
                 only_for_ids = {
-                    e.get("id") for e in targets if e.get("id")
+                    identity for e in targets
+                    if (identity := _fact_scoped_identity(e)) is not None
                 }
                 pairs = FactDedupResolver.detect_candidates(
                     facts, only_for_ids=only_for_ids,

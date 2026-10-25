@@ -1,32 +1,30 @@
 """
-插件系统统一类型定义
+Unified type definitions for the plugin system
 
-提供所有公共类型、异常、Result 类型的统一导出。
-这是 types/ 层的入口，所有类型定义都应该从这里导入。
+Provides common types and exceptions used by the plugin core.
+This is the types/ layer entry point; import all type definitions from here.
 
 Usage:
     from plugin._types import (
-        # 错误码
+        # Error codes
         ErrorCode, ERROR_NAMES, get_error_name, get_http_status,
-        # Result 类型
-        Ok, Err, Result, ResultError, safe, async_safe,
-        # 异常
+        # Exceptions
         PluginError, PluginNotFoundError, PluginTimeoutError,
-        # 事件
+        # Events
         EventMeta, EventHandler, EventType, EVENT_META_ATTR,
         # Protocol
         PluginContextProtocol,
-        # 模型
+        # Models
         PluginMeta, PluginAuthor, PluginDependency,
-        # 版本
+        # Version
         SDK_VERSION,
     )
 """
 
-# 版本
+# Version
 from .version import SDK_VERSION
 
-# 错误码
+# Error codes
 from .errors import (
     ErrorCode,
     ERROR_NAMES,
@@ -34,21 +32,7 @@ from .errors import (
     get_http_status,
 )
 
-# Result 类型
-from .result import (
-    Ok,
-    Err,
-    Result,
-    ResultError,
-    safe,
-    async_safe,
-    try_call,
-    try_call_async,
-    from_optional,
-    collect_results,
-)
-
-# 异常
+# Exceptions
 from .exceptions import (
     PluginError,
     PluginNotFoundError,
@@ -65,7 +49,7 @@ from .exceptions import (
     PluginQueueError,
 )
 
-# 事件
+# Events
 from .events import (
     EVENT_META_ATTR,
     STANDARD_EVENT_TYPES,
@@ -80,41 +64,51 @@ from .protocols import (
     PluginContextProtocol,
 )
 
-# 模型
-from .models import (
-    RunStatus,
-    RunCreateRequest,
-    RunCreateResponse,
-    PluginAuthor,
-    PluginDependency,
+# Models
+from .plugin_types import (
     PluginType,
-    PluginMeta,
-    HealthCheckResponse,
-    PluginPushMessageRequest,
-    PluginPushMessage,
-    PluginPushMessageResponse,
+    SCAFFOLDABLE_PLUGIN_TYPES,
+    SUPPORTED_PLUGIN_TYPES,
 )
 
+# .models contains server-API pydantic models and takes over 200 ms to import; plugin subprocesses entering
+# through lightweight plugin._types submodules (such as bus_sort) do not need it, so import on demand.
+_LAZY_MODEL_EXPORTS = frozenset({
+    "RunStatus",
+    "RunCreateRequest",
+    "RunCreateResponse",
+    "PluginAuthor",
+    "PluginDependency",
+    "PluginMeta",
+    "HealthCheckResponse",
+    "PluginPushMessageRequest",
+    "PluginPushMessage",
+    "PluginPushMessageResponse",
+})
+
+
+def __getattr__(name):
+    if name in _LAZY_MODEL_EXPORTS:
+        from . import models
+
+        value = getattr(models, name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    return sorted(set(globals()) | _LAZY_MODEL_EXPORTS)
+
 __all__ = [
-    # 版本
+    # Version
     "SDK_VERSION",
-    # 错误码
+    # Error codes
     "ErrorCode",
     "ERROR_NAMES",
     "get_error_name",
     "get_http_status",
-    # Result 类型
-    "Ok",
-    "Err",
-    "Result",
-    "ResultError",
-    "safe",
-    "async_safe",
-    "try_call",
-    "try_call_async",
-    "from_optional",
-    "collect_results",
-    # 异常
+    # Exceptions
     "PluginError",
     "PluginNotFoundError",
     "PluginNotRunningError",
@@ -128,7 +122,7 @@ __all__ = [
     "PluginEntryNotFoundError",
     "PluginMetadataError",
     "PluginQueueError",
-    # 事件
+    # Events
     "EVENT_META_ATTR",
     "STANDARD_EVENT_TYPES",
     "StandardEventType",
@@ -137,13 +131,15 @@ __all__ = [
     "EventHandler",
     # Protocol
     "PluginContextProtocol",
-    # 模型
+    # Models
     "RunStatus",
     "RunCreateRequest",
     "RunCreateResponse",
     "PluginAuthor",
     "PluginDependency",
     "PluginType",
+    "SUPPORTED_PLUGIN_TYPES",
+    "SCAFFOLDABLE_PLUGIN_TYPES",
     "PluginMeta",
     "HealthCheckResponse",
     "PluginPushMessageRequest",

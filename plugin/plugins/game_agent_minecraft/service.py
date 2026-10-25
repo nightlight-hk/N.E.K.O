@@ -34,6 +34,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import collections
+import json
 import re
 import time
 import uuid
@@ -41,11 +42,93 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Optional
 
 from . import prompts
-from .client import GameAgentClient
+from .client import GameAgentClient, IngameChatMessage
 
 # Strip ANSI colour escapes from agent log lines before relaying to the
 # LLM — we don't want VT100 noise in the model's context window.
 _ANSI_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
+
+# [ANTI-PARROT] mc-agent emits internal action/telemetry logs that contain
+# executable command syntax — function calls like ``goToCoordinates(118,64,-115,1)``
+# or ``attackEntity(spider)``, ``!command`` prefixes, and "admin movement request"
+# lines. Forwarded verbatim to the dialog LLM, these get copied back as new
+# minecraft_task dispatches (observed: Neko spamming goToCoordinates/attackEntity
+# instead of the user's actual request), a self-reinforcing loop. These lines are
+# internal mechanics, not narration the character should see, so we drop them
+# before they ever reach the dialog LLM (both inline push and the nudge digest).
+_INJECTION_LOG_RE = re.compile(
+    r"""(?xi)
+      [A-Za-z_][A-Za-z0-9_]*\([^)]*\)   # function-call syntax: goToCoordinates(...), attackEntity(...)
+    | (?:^|\s)![A-Za-z_]\w*             # !command prefix
+    | admin\s+movement                  # "admin movement request"
+    | latest\s+admin                    # "Continuing with latest admin ... request"
+    | forced\s+interrupt                # stack-kick / interrupt mechanics
+    | kicking\s+the\s+stack
+    | pinned\s+\d+\s*min                # "Pinned 15min+ — ..."
+    """
+)
+
+# English "the action was actually blocked" markers. mc-agent's chat-loop
+# sometimes returns status="ok" while the real in-game action was blocked
+# (target not found, no path, missing tool, needs more info…), burying the
+# failure in the free-text feedback. Both the live completion cue
+# (``_format_completion_cue`` in the facade) and the retroactive cue
+# (``_push_retroactive_completion_cue`` below) sniff these so a blocked
+# action is never narrated as a success (user report: "she thought finding the doctor succeeded"
+# bug). Kept in ONE place so the two consumers can't drift apart.
+_BLOCKED_TEXT_MARKERS = (
+    "obstacle", "obstructed", "not found", "could not", "couldn't",
+    "unable", "failed", "no path", "blocked", "missing",
+    "cannot", "can't",
+    # status=ok without a target / requiring more information also means blocked: mc-agent answers commands
+    # such as "come here" or "follow me" without a player name/coordinates with status=ok + "Target unavailable. Please
+    # provide the exact player name or coordinates."
+    "unavailable", "please provide", "provide the exact",
+    "no target", "target not",
+)
+
+
+# How long an already-sent log line keeps riding along in later state
+# bursts. Matched to the host delivery manager's cue TTL (90s): a queued
+# cue older than that is dropped there, so a line past it was never going
+# to arrive as news. See ``GameAgentService._fire_system_prompt``.
+_LOG_CARRY_TTL_SECONDS = 90.0
+
+
+def text_signals_blocked(text: str) -> bool:
+    """True when free-text feedback indicates the action was actually
+    blocked / unsuccessful despite a status that claims otherwise. Shared
+    by the live and retroactive completion cues (see ``_BLOCKED_TEXT_MARKERS``)."""
+    if not text:
+        return False
+    low = text.lower()
+    return any(m in low for m in _BLOCKED_TEXT_MARKERS)
+
+
+# [ANTI-PARROT] A task that is a bare identifier rather than a sentence.
+# Observed 2026-09-07: the dialog LLM dispatched ``query_inventory`` (an entry
+# name it saw in the tool description) and ``mine_block`` (invented) as the
+# task text. mc-agent runs them literally, the in-progress cue echoes
+# ``You're doing: "mine_block"`` back, and the model re-sends the same token
+# forever. Three shapes cover every leak seen so far: snake_case, camelCase,
+# and single-token function-call syntax. A plain word ("stop", "mine") or any
+# text with a space / CJK stays allowed — those are real instructions.
+_IDENTIFIER_TASK_RE = re.compile(
+    r"^(?:"
+    r"[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+"          # mine_block, GET_DIAMOND
+    r"|[a-z]+(?:[A-Z][a-z0-9]*)+"                       # mineDiamonds, goToCoordinates
+    r"|[A-Za-z_][A-Za-z0-9_]*[(][^)]*[)]"               # goToCoordinates(1,2,3)
+    r")$"
+)
+
+
+def task_looks_like_identifier(text: str) -> bool:
+    """True when ``text`` is an internal identifier / command token rather
+    than a plain-language instruction. Shared by the facade handler and
+    ``execute_minecraft_task`` so both entry points refuse the same shapes."""
+    if not text:
+        return False
+    return bool(_IDENTIFIER_TASK_RE.match(text.strip()))
 
 
 @dataclass
@@ -66,6 +149,12 @@ class PendingTask:
     # pending slot (normal wake), a known previously-dispatched task
     # (emit retroactive completion cue), or unknown (FIFO fallback).
     task_id: str = ""
+    # Set when mc-agent answered this dispatch with ``status=duplicate``
+    # ("same instruction already running"): the id of the earlier dispatch
+    # of the same text that is actually running. The eventual
+    # ``task_finished`` arrives under THAT id, so ``_on_task_finished``
+    # treats a frame echoing ``alias_task_id`` as this slot's completion.
+    alias_task_id: str = ""
     # Filled in by the WebSocket callback (or by overwrite/timeout
     # paths) right before ``event`` is set.
     result: Dict[str, Any] = field(default_factory=dict)
@@ -104,7 +193,7 @@ class GameAgentService:
         self._ws_url: str = "ws://localhost:48909"
         self._reconnect_interval: float = 5.0
         self._task_timeout: float = 90.0
-        self._system_prompt_interval: float = 5.0
+        self._system_prompt_interval: float = 15.0
         self._skip_when_busy: bool = True
         self._stream_screenshots: bool = True
         self._screenshot_cache_size: int = 3
@@ -132,6 +221,10 @@ class GameAgentService:
         # Cross-callback state
         self._pending: Optional[PendingTask] = None
         self._pending_lock = asyncio.Lock()
+        # ``push_message`` ultimately performs a synchronous ZMQ send. Chat
+        # callbacks are dispatched in the background by the client, and this
+        # fair lock keeps their thread-offloaded pushes in WebSocket order.
+        self._ingame_chat_push_lock = asyncio.Lock()
         # Bounded history of dispatched task_id → task_text. Used by
         # ``_on_task_finished`` to recognize completion frames for tasks
         # that are no longer the active ``_pending`` (typical case:
@@ -144,6 +237,12 @@ class GameAgentService:
         # overwrites.
         self._dispatched_history: "collections.OrderedDict[str, str]" = collections.OrderedDict()
         self._dispatched_history_max: int = 32
+        # task_id → root task_id for dispatches mc-agent answered with
+        # ``duplicate`` (they never ran; the root is the one executing).
+        # ``_find_prior_dispatch_id`` resolves through this so a chain of
+        # re-dispatches of one long task all alias the root, never a sibling
+        # duplicate whose id no completion frame will ever carry.
+        self._duplicate_root: Dict[str, str] = {}
         # One-way latch: flips True the first time mc-agent echoes a
         # task_id on task_finished. Used by ``_on_task_finished`` to
         # disable the FIFO fallback once we know the agent is modern —
@@ -160,6 +259,11 @@ class GameAgentService:
         # and we'd never drain. ``deque(maxlen=...)`` drops oldest on
         # overflow which is fine — the LLM only needs recent context.
         self._log_cache: collections.deque[str] = collections.deque(maxlen=200)
+        # ``(timestamp, line)`` for lines already sent in a recent state burst.
+        # Re-sent while inside ``_LOG_CARRY_TTL_SECONDS`` so a burst that
+        # coalesces away does not take the game's recent events with it.
+        # Bounded by both that window and ``maxlen``. See ``_fire_system_prompt``.
+        self._log_carry: collections.deque[tuple[float, str]] = collections.deque(maxlen=200)
         # Bounded ring buffer of (image_bytes, mime). We carry the mime
         # alongside the bytes because the JPEG→PNG conversion in
         # ``_on_screenshot`` can fall through to "ship as-is" on Pillow
@@ -182,6 +286,25 @@ class GameAgentService:
         # dialog LLM always gets present-state, not minutes-old cache.
         self._last_inventory: Dict[str, int] = {}
         self._last_inventory_at: float = 0.0
+        # [INV-DEDUP] snapshot of the inventory we last SURFACED to the dialog
+        # (in a nudge/cue). The bag line is only re-stated when this changes, so
+        # she stops robotically reciting the same inventory every nudge. None =
+        # never surfaced yet (first mention always allowed).
+        self._last_pushed_inventory: Optional[tuple] = None
+        # [AGENT-BUSY] mc-agent's self-reported activity, parsed from its
+        # bot_status_nl frames. When it's actively executing (a skill/command),
+        # the autonomous nudge loop must NOT tell her to dispatch a new task —
+        # that interrupts what the agent is already doing. Refreshed per frame;
+        # treated as stale (idle) after ``_agent_busy_ttl`` with no update.
+        self._agent_busy: bool = False
+        self._agent_busy_at: float = 0.0
+        self._agent_activity: str = ""
+        # TTL sized against the observed bot_status_nl cadence (~6s): 20s
+        # tolerates three missed frames and still self-heals fast. It used to be
+        # 60s, which meant one mis-read frame suppressed the keep-going nudge —
+        # and made ``_fire_system_prompt`` claim she was mid-action — for a full
+        # minute (~4 state bursts) while she stood still and the user waited.
+        self._agent_busy_ttl: float = 20.0
         # On-demand inventory refresh plumbing. ``_inventory_waiters`` are
         # asyncio.Futures that resolve when the next ``inventory`` frame
         # lands; multiple concurrent ``query_inventory`` calls can all
@@ -222,10 +345,19 @@ class GameAgentService:
         # ``_inline_log_min_interval`` is the minimum spacing between
         # consecutive inline pushes; bursts within that window are batched
         # and delivered as one combined push when the window expires.
-        self._inline_log_min_interval: float = 1.5
+        self._inline_log_min_interval: float = 12.0  # [THROTTLE] was 1.5
         self._last_inline_log_time: float = 0.0
         self._inline_log_pending: list[str] = []
         self._inline_log_flush_task: Optional[asyncio.Task] = None
+        # [DEDUP] mc-agent repeats identical status lines (e.g. "Nightfall —
+        # securing till dawn", "Picking up item!") every few seconds while it's
+        # stuck in a loop. Without dedup each one becomes a push and the dialog
+        # LLM re-narrates the same thing forever. Suppress a log line that was
+        # already seen within this window; refresh its timestamp on every
+        # repeat so a persistently-looping line stays muted after being said
+        # once, and only resurfaces once it's been quiet for the full window.
+        self._log_dedup_window: float = 120.0
+        self._recent_log_times: dict[str, float] = {}
 
         # Pacing state for inline screenshot push. mc-agent broadcasts at
         # 1Hz (configurable on its side via NEKO_AGENT_SCREENSHOT_INTERVAL_MS).
@@ -236,7 +368,7 @@ class GameAgentService:
         # collapsed (we keep only the latest pending and deliver it when
         # the window opens, so the dialog LLM always sees the most recent
         # visual rather than a stale one).
-        self._screenshot_stream_min_interval: float = 1.0
+        self._screenshot_stream_min_interval: float = 6.0  # [THROTTLE] was 1.0
         self._last_screenshot_push_time: float = 0.0
         self._pending_screenshot: Optional[tuple[bytes, str]] = None
         self._screenshot_flush_task: Optional[asyncio.Task] = None
@@ -258,6 +390,7 @@ class GameAgentService:
     # thrashing mc-agent between goals. A genuine {MASTER_NAME} correction of a
     # <2s-old task is implausible; sub-2s overwrites are the runaway signature.
     _OVERWRITE_MIN_SURVIVAL_S = 2.0
+
 
     def set_lang(self, lang: str) -> None:
         """Set the locale used for every push_message cue + result
@@ -310,14 +443,14 @@ class GameAgentService:
         # ``{status: "timeout"}`` shape — the LLM would see the cancel
         # error path instead of the clean timeout result.
         self._task_timeout = max(1.0, min(295.0, _f("task_timeout_seconds", 90.0)))
-        self._system_prompt_interval = max(1.0, _f("system_prompt_interval_seconds", 5.0))
+        self._system_prompt_interval = max(1.0, _f("system_prompt_interval_seconds", 15.0))
         self._skip_when_busy = _b("skip_system_prompt_if_busy", True)
         self._stream_screenshots = _b("stream_screenshots_to_llm", True)
         # Floor at 0.2s (i.e. 5 fps cap) — below that we're letting the
         # dialog LLM's context burn at the wire rate of mc-agent and the
         # rate-limit ceases to function as a throttle.
         self._screenshot_stream_min_interval = max(
-            0.2, _f("screenshot_stream_min_interval_seconds", 1.0)
+            0.2, _f("screenshot_stream_min_interval_seconds", 6.0)
         )
         size = max(1, _i("screenshot_cache_size", 3))
         self._screenshot_cache_size = size
@@ -384,6 +517,8 @@ class GameAgentService:
             on_task_finished=self._on_task_finished,
             on_alert=self._on_alert,
             on_inventory=self._on_inventory,
+            on_bot_status=self._on_bot_status,
+            on_ingame_chat=self._on_ingame_chat,
             reconnect_interval=self._reconnect_interval,
             logger=self.logger,
         )
@@ -486,14 +621,23 @@ class GameAgentService:
         self._pending_screenshot = None
 
         self._log_cache.clear()
+        # Same session boundary as the cache above: carrying a dead session's
+        # lines into the next world would narrate events that never happened there.
+        self._log_carry.clear()
         self._screenshot_cache.clear()
         # Inventory snapshot belongs to the WS session that just ended.
-        # game_agent_reload_config（ws_url 切换）/ 重启场景下，下一个 WS
-        # 可能连到完全不同的世界，沿用旧 ``_last_inventory`` 会让
-        # query_inventory 把旧世界的库存当新世界 ground truth 上报。
-        # 清空 = "回到 inv_at==0 未知"分支，由下一个 task_finished 重建。
+        # After game_agent_reload_config (ws_url switch) or restart, the next WS
+        # may connect to a wholly different world. Reusing _last_inventory would let
+        # query_inventory report the old world's inventory as the new world's ground truth.
+        # Clearing restores the inv_at==0 unknown branch; the next task_finished rebuilds it.
         self._last_inventory = {}
         self._last_inventory_at = 0.0
+        # New session may be a different world — let its first inventory and
+        # activity surface fresh instead of being deduped against the old one.
+        self._last_pushed_inventory = None
+        self._mark_agent_idle()
+        self._agent_busy_at = 0.0
+        self._agent_activity = ""
         # ``_dispatched_history`` belongs to the just-ended session too —
         # next session's task_id space is independent, holding onto these
         # would only cause spurious "retroactive completion" cues if a
@@ -588,11 +732,78 @@ class GameAgentService:
             if not w.done():
                 w.set_result(None)
 
+    async def _on_bot_status(self, data: Dict[str, Any]) -> None:
+        """Track the mc-agent's activity from a ``bot_status_nl`` frame.
+
+        The agent tags its status text with 🎯[按指令] (executing a dispatched
+        command) or 🤖[自主] (doing its own autonomous thing), and carries a
+        ``skill``/``kind`` when it's mid-action. We collapse that to a single
+        ``_agent_busy`` flag: busy unless it explicitly says it's idle/thinking
+        (or reports no skill and no kind). The autonomous nudge loop reads this
+        so it won't tell her to dispatch a fresh task over a running one.
+        """
+        text = str(data.get("text") or "")
+        skill = data.get("skill")
+        kind = data.get("kind")
+        idle_markers = ("空闲", "在想下一步", "空閒", "idle", "thinking", "nothing to do")
+        is_idle = ((not skill) and (not kind)) or any(m in text for m in idle_markers)
+        # [BUSY-RACE] Re-arm the busy latch only when the frame correlates to real
+        # ongoing work: a pending dispatched task, or an explicitly autonomous
+        # (autonomous) frame. The agent tags each status 🎯[按指令] (a DISPATCHED command)
+        # or 🤖[自主] (autonomous). With no pending task AND no autonomous tag, a busy
+        # frame is either a stale trailing report of the just-finished dispatch
+        # (dispatched) or untagged frame cannot be attributed, so we do NOT re-arm.
+        # Conservative on purpose: a wrong "not busy" costs at most one extra
+        # nudge, but a wrong "busy" strands recovery for the full TTL while the
+        # agent is idle. (A precise call on untagged frames would need the mc-agent
+        # to stamp bot_status_nl with a run-id/seq — a protocol change on that
+        # side, out of scope here.)
+        if (not is_idle) and self._pending is None:
+            autonomous_tag = ("自主" in text) or ("🤖" in text)
+            if not autonomous_tag:
+                return
+        self._agent_busy = not is_idle
+        self._agent_busy_at = time.time()
+        self._agent_activity = text[:120]
+
+    def _mc_agent_busy(self) -> bool:
+        """True when the mc-agent recently reported it's actively executing.
+        Fresh within ``_agent_busy_ttl`` — a stale flag (no bot_status_nl for a
+        while) is treated as not-busy so the loop can resume nudging."""
+        return bool(self._agent_busy) and (time.time() - self._agent_busy_at) < self._agent_busy_ttl
+
+    def _mark_agent_idle(self) -> None:
+        """Drop the busy latch on a task-terminal path. Centralized so every
+        terminal clears it uniformly; ``_on_bot_status`` then won't re-arm from an
+        uncorrelated (no pending, non-autonomous) post-terminal frame."""
+        self._agent_busy = False
+
+    def _inventory_section_if_changed(self, top_n: int = 20) -> Optional[str]:
+        """Return the localized bag line ONLY when the inventory changed since
+        we last surfaced it, so the dialog LLM stops reciting the same bag every
+        nudge (the "有点人机" complaint). Returns ``None`` to omit the line."""
+        inv = self._last_inventory
+        if inv:
+            snapshot = tuple(sorted(
+                (str(k), int(v)) for k, v in inv.items() if int(v) > 0
+            ))
+            if snapshot == self._last_pushed_inventory:
+                return None
+            self._last_pushed_inventory = snapshot
+            items = sorted(inv.items(), key=lambda kv: -kv[1])
+            inv_str = "、".join(f"{n}×{c}" for n, c in items[:top_n])
+            return prompts.t("BAG_LINE", lang=self._lang, items=inv_str)
+        # inventory known-empty: mention "empty" once, only on the transition.
+        if self._last_inventory_at > 0 and self._last_pushed_inventory != ():
+            self._last_pushed_inventory = ()
+            return prompts.t("BAG_EMPTY_LINE", lang=self._lang)
+        return None
+
     def current_task_text(self) -> Optional[str]:
         """Return the text of the currently-pending task, or ``None`` if idle.
         Lock-free snapshot read for the facade's "busy" reply — the facade
-        needs to tell the dialog LLM what task is in flight so the猫娘 can
-        narrate it correctly instead of派 a new conflicting task.
+        needs to tell the dialog LLM what task is in flight so the catgirl can
+        narrate it correctly instead of dispatching a new conflicting task.
         """
         pending = self._pending
         return pending.task_text if pending is not None else None
@@ -607,7 +818,22 @@ class GameAgentService:
             return
         self._dispatched_history[task_id] = task_text
         while len(self._dispatched_history) > self._dispatched_history_max:
-            self._dispatched_history.popitem(last=False)
+            evicted, _ = self._dispatched_history.popitem(last=False)
+            self._duplicate_root.pop(evicted, None)
+
+    def _find_prior_dispatch_id(self, task_text: str, *, exclude: str) -> str:
+        """Id of the dispatch really running ``task_text``, other than
+        ``exclude`` (the current slot's own id). Walks history newest-first
+        and resolves any dispatch that itself got ``duplicate`` to its root,
+        so a chain of re-dispatches never aliases a sibling that never ran."""
+        for task_id, text in reversed(self._dispatched_history.items()):
+            if task_id == exclude or text != task_text:
+                continue
+            root = self._duplicate_root.get(task_id, task_id)
+            if root == exclude:
+                continue
+            return root
+        return ""
 
     async def try_claim_pending(
         self, task: str, *, overwrite: bool
@@ -628,6 +854,17 @@ class GameAgentService:
         async with self._pending_lock:
             if self._pending is not None:
                 if not overwrite:
+                    # Logged, not silent: this is the one refusal path that used
+                    # to leave no trace anywhere. With the happy path also silent
+                    # (registry + callback route only log failures), a log read
+                    # afterwards could not tell "the model never called the tool"
+                    # apart from "it called and we turned it away" — which is
+                    # exactly the question a stalled dispatch raises.
+                    self._log_info(
+                        "claim refused (busy, overwrite=False): running {!r}, "
+                        "refusing {!r}",
+                        self._pending.task_text[:40], task[:40],
+                    )
                     return None
                 # [ISSUE4c] Anti-thrash guard: even with overwrite=True, refuse
                 # to interrupt a task that has barely started (< _OVERWRITE_MIN_
@@ -674,6 +911,9 @@ class GameAgentService:
             )
             self._pending = my_pending
             self._task_finished = False
+            self._log_info(
+                "claim accepted (overwrite={}): {!r}", overwrite, task[:80],
+            )
             return my_pending
 
     async def run_claimed_task(self, my_pending: PendingTask) -> Dict[str, Any]:
@@ -694,6 +934,7 @@ class GameAgentService:
                 if self._pending is my_pending:
                     self._pending = None
                     self._task_finished = True
+                    self._mark_agent_idle()  # [BUSY] local terminal — drop stale latch
             return {
                 "output": {
                     "error": "plugin is not started yet",
@@ -730,6 +971,7 @@ class GameAgentService:
                 if self._pending is my_pending:
                     self._pending = None
                     self._task_finished = True
+                    self._mark_agent_idle()  # [BUSY] local terminal — drop stale latch
                     # Send failure is functionally "task ended" from the
                     # autonomous loop's perspective — anchor so the
                     # keep_going nudge can prod the dialog LLM to retry
@@ -758,6 +1000,7 @@ class GameAgentService:
                     # falls completely silent until the user prods her.
                     self._task_finished = True
                     self._last_task_finished_at = time.time()
+                    self._mark_agent_idle()  # [BUSY] local terminal — drop stale latch
             self._log_info("task timed out: {}", task[:80])
             return {
                 "status": "timeout",
@@ -788,6 +1031,12 @@ class GameAgentService:
         if not isinstance(task, str) or not task.strip():
             return {
                 "output": {"error": "task must be a non-empty string"},
+                "is_error": True,
+                "error": "INVALID_TASK",
+            }
+        if task_looks_like_identifier(task):
+            return {
+                "output": {"error": "task must be a plain-language instruction, not an identifier"},
                 "is_error": True,
                 "error": "INVALID_TASK",
             }
@@ -865,6 +1114,10 @@ class GameAgentService:
                 ai_behavior="read",
                 parts=[{"type": "text", "text": text}],
                 priority=4,
+                # [COALESCE] agent narration is superseding — while the dialog
+                # LLM is busy, older queued log pushes collapse so it only ever
+                # reads the LATEST one, not a backlog it would recite in order.
+                coalesce_key="mc_log",
             )
         except Exception as exc:
             self._log_error(
@@ -928,6 +1181,10 @@ class GameAgentService:
                 ai_behavior="read",
                 parts=[{"type": "image", "data": img_bytes, "mime": mime}],
                 priority=3,
+                # [COALESCE] older frames are obsolete the moment a newer one
+                # exists — collapse queued screenshots so the LLM only sees the
+                # freshest view.
+                coalesce_key="mc_screenshot",
             )
         except Exception as exc:
             self._log_error(
@@ -939,20 +1196,59 @@ class GameAgentService:
     # WebSocket inbound callbacks — invoked from the WS listener task
     # ------------------------------------------------------------------
 
+    async def _on_ingame_chat(
+        self,
+        messages: tuple[IngameChatMessage, ...],
+    ) -> None:
+        """Inject one ordinary-player chat batch into the dialog LLM.
+
+        This is deliberately a conversational ``respond`` event, not the
+        ``@neko`` admin-mission path. The service emits one hidden context part
+        per WebSocket batch and never sends anything back over the game-agent
+        socket, avoiding both duplicate injection and a chat echo loop.
+        """
+        if not messages:
+            return
+
+        serialized = "\n".join(
+            json.dumps(
+                {"player": message.player, "text": message.text},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            for message in messages
+        )
+        body = (
+            "Ordinary Minecraft player chat (not a privileged @neko admin mission):\n"
+            f"{serialized}\n"
+            "Reply naturally. Use minecraft_task only when it is appropriate under "
+            "the existing tool rules."
+        )
+        try:
+            async with self._ingame_chat_push_lock:
+                await asyncio.to_thread(
+                    self._push_message,
+                    source="game_agent_minecraft",
+                    visibility=[],
+                    ai_behavior="respond",
+                    parts=[{"type": "text", "text": body}],
+                    priority=5,
+                )
+        except Exception as exc:
+            self._log_error(
+                "in-game chat push failed: {}: {}", type(exc).__name__, exc,
+            )
+
     async def _on_log(self, text: str) -> None:
         text_strip = text.strip() if isinstance(text, str) else ""
         if not text_strip:
             return
-        self._log_cache.append(text_strip)
-
-        # Inline push to the dialog LLM, rate-limited. The 5s autonomous
-        # nudge loop is still authoritative for "burst the full state
-        # alongside screenshots when nothing else is happening"; this
-        # inline path is for "agent just said something, get it in front
-        # of the dialog LLM now so it can weave into ongoing conversation
-        # without 5s of staleness".
-        self._schedule_inline_log_push(text_strip)
-
+        # [CONTROL-LOG] Agent state transitions (task-ended latch, "action
+        # selection" reset, connection-bounce → wake pending) must run on EVERY
+        # frame, ahead of the anti-parrot/dedup early-returns below. Otherwise a
+        # repeated control log — e.g. a second "Connection lost and re-established."
+        # inside the dedup window — would be dropped before it could wake a
+        # pending task, stranding the handler until ``task_timeout_seconds``.
         # The original integration sniffed log strings to track agent
         # state because some agent server implementations emit logs
         # before / instead of explicit ``task_finished`` frames. Keep
@@ -966,10 +1262,21 @@ class GameAgentService:
         if "task run ended" in text_strip:
             if self._pending is None:
                 self._task_finished = True
+                self._mark_agent_idle()  # [BUSY] local terminal — drop stale latch
         elif "action selection" in text_strip:
-            # Setting False unconditionally is safe — at worst it
-            # confirms what's already true (a task is in flight).
-            self._task_finished = False
+            if self._pending is not None:
+                # A task WE dispatched is in flight; the log just confirms it.
+                self._task_finished = False
+            else:
+                # Autonomous action selection — mc-agent picked this itself.
+                # It must NOT land on ``_task_finished``: nothing would ever
+                # reset that flag (``task run ended`` needs a real task run,
+                # the terminal paths need a pending slot), so the keep-going
+                # branch — gated on ``_task_finished`` — would be dead for the
+                # rest of the session. Route it to the busy latch instead,
+                # which is TTL-bounded and self-heals.
+                self._agent_busy = True
+                self._agent_busy_at = time.time()
         elif text_strip == "Connection lost and re-established.":
             # Connection bounce wipes the agent's task queue: any
             # pending task's ``task_finished`` will never arrive, so
@@ -980,6 +1287,11 @@ class GameAgentService:
             # surprises us with a late frame for a known task after the
             # bounce, the retroactive cue path will still surface it.
             async with self._pending_lock:
+                # [BUSY] a bounce wiped the agent's queue — any prior busy
+                # bot_status_nl is stale; clear the latch (both branches) so the
+                # recovery keep-going nudge this path anchors isn't suppressed for
+                # the full _agent_busy_ttl, matching the task_finished/timeout paths.
+                self._mark_agent_idle()
                 pending = self._pending
                 if pending is None:
                     self._task_finished = True
@@ -998,6 +1310,37 @@ class GameAgentService:
                     # interrupted cue with no follow-up to push her into
                     # a new dispatch.
                     self._last_task_finished_at = time.time()
+        # [ANTI-PARROT] drop internal command/telemetry lines entirely (no cache,
+        # no push) so the dialog LLM never sees command syntax it would echo back
+        # as a task. This is what stops the goToCoordinates/attackEntity dispatch
+        # loop that was overriding the user's actual request.
+        if _INJECTION_LOG_RE.search(text_strip):
+            self._log_debug("[anti-parrot] dropped injection-shaped log: {}", text_strip[:80])
+            return
+        # [DEDUP] drop a line already seen within the dedup window so the
+        # dialog LLM doesn't re-narrate the mc-agent's repeated status spam.
+        # Refresh-on-hit keeps a persistently-looping line muted; prune the
+        # map when it grows so it can't leak memory over a long session.
+        _now = time.time()
+        _seen_at = self._recent_log_times.get(text_strip)
+        if _seen_at is not None and (_now - _seen_at) < self._log_dedup_window:
+            self._recent_log_times[text_strip] = _now
+            return
+        self._recent_log_times[text_strip] = _now
+        if len(self._recent_log_times) > 256:
+            _cutoff = _now - self._log_dedup_window
+            self._recent_log_times = {
+                k: v for k, v in self._recent_log_times.items() if v >= _cutoff
+            }
+        self._log_cache.append(text_strip)
+
+        # Inline push to the dialog LLM, rate-limited. The 5s autonomous
+        # nudge loop is still authoritative for "burst the full state
+        # alongside screenshots when nothing else is happening"; this
+        # inline path is for "agent just said something, get it in front
+        # of the dialog LLM now so it can weave into ongoing conversation
+        # without 5s of staleness".
+        self._schedule_inline_log_push(text_strip)
 
     def _normalize_screenshot_bytes(self, img_bytes: bytes, src_mime: str) -> tuple[bytes, str]:
         """Downscale + re-encode to JPEG under a *raw-bytes budget* so the pushed
@@ -1137,14 +1480,30 @@ class GameAgentService:
         nudge tick. ``cause`` (when mc-agent could infer one — nearby
         hostile, lava, fall, etc.) is rendered as a hint inside the cue
         so the character can narrate the actual reason instead of
-        inventing one (the historical UX problem: 猫娘 saw HP drop and
-        made up "被怪物打了" with no evidence).
+        inventing one (the historical UX problem: the catgirl saw HP drop and
+        made up "a monster hit me" with no evidence).
         """
-        text = str(data.get("text") or "").strip()
-        if not text:
-            return
         severity = str(data.get("severity") or "warn").lower()
         cause_hint = self._format_alert_cause(data.get("cause"))
+        text = str(data.get("text") or "").strip()
+        if not text:
+            # An alert with no prose is still an alert. mc-agent populates
+            # ``text`` best-effort, and dropping the frame threw away a ``cause``
+            # we had already rendered into a usable phrase -- for a death, the
+            # single most important thing that can happen to her. Fall back to the
+            # cause; only a frame carrying literally nothing is dropped, and that
+            # one gets logged rather than vanishing (this is the highest-severity
+            # channel there is, so a silent return here is never acceptable).
+            if not cause_hint:
+                self._log_warning(
+                    "alert dropped: no text and no usable cause (severity={}, keys={})",
+                    severity, sorted(data.keys()),
+                )
+                return
+            text = cause_hint
+            # Already the headline; a "Cause hint:" line repeating it verbatim
+            # just invites her to say the same thing twice.
+            cause_hint = ""
 
         sections = [prompts.t(
             "CUE_PREFIX_ALERT", lang=self._lang, severity=severity, text=text,
@@ -1227,22 +1586,48 @@ class GameAgentService:
         return prompts.t("CAUSE_JOIN_SEP", lang=self._lang).join(parts)
 
     def _push_retroactive_completion_cue(self, info: Dict[str, Any]) -> None:
-        """Tell the dialog LLM that a previously-dispatched task (one she
-        explicitly overwrote, or that timed out on this side but kept
-        running on mc-agent) actually finished. Without this, she'd keep
-        narrating "I'm doing X" or fall silent — both are wrong, the
-        action really completed and she needs to know.
+        """Tell the dialog LLM the fate of a previously-dispatched task she's
+        no longer waiting on (one she explicitly overwrote, or that timed out
+        on this side but kept running on mc-agent). Without this she'd keep
+        narrating "I'm doing X" or fall silent — both wrong once the task has
+        reached a terminal state on mc-agent. The header honestly reflects
+        that state: a genuine completion says "actually finished"; a
+        non-completion (interrupted/superseded/failed/timeout, or status=ok
+        whose text signals it was blocked) says "ended without completing" so
+        she never narrates a phantom success.
         """
         task_text = str(
             info.get("task_text")
             or prompts.t("PLACEHOLDER_UNKNOWN", lang=self._lang)
         )
         status = str(info.get("status") or "ok")
+        # [NO-SWITCH-CUE] same as the live cue: a late interrupted/superseded
+        # frame is a task the LLM already replaced on purpose. Re-surfacing it
+        # only nudges another dispatch (the retry storm). Drop it silently.
+        if status.strip().lower() in ("interrupted", "superseded"):
+            self._log_debug("[no-switch-cue] skipping retroactive cue for status={}", status)
+            return
         text = str(info.get("text") or "").strip()
         inv = info.get("inventory")
 
+        # Only assert "actually finished" when the late frame reports a
+        # genuine completion. Two ways it can fail to be genuine:
+        #   1. an explicit non-completion status — mc-agent now distinguishes
+        #      ``interrupted`` / ``superseded`` / ``failed`` / ``timeout``;
+        #   2. status=="ok" but the free-text feedback signals the action was
+        #      actually blocked (target not found, no path…) — the same
+        #      status=ok-but-really-blocked quirk the live completion cue
+        #      re-labels (see ``text_signals_blocked``). Without this second
+        #      check the retroactive cue would say "it actually finished (result ok)" while
+        #      its own feedback line shows "could not find path" — re-telling
+        #      telling the catgirl about a success that never happened.
+        # ``.strip().lower()`` so a whitespace-padded "ok " still reads as ok.
+        is_genuine_ok = (
+            status.strip().lower() == "ok" and not text_signals_blocked(text)
+        )
+        header_key = "RETROACTIVE_HEADER" if is_genuine_ok else "RETROACTIVE_HEADER_ENDED"
         sections = [prompts.t(
-            "RETROACTIVE_HEADER", lang=self._lang,
+            header_key, lang=self._lang,
             task_text=task_text[:100], status=status,
         )]
         if text:
@@ -1286,6 +1671,24 @@ class GameAgentService:
         text = str(
             data.get("text") or data.get("data") or data.get("message") or ""
         )
+        # [ANTI-PARROT] a completion's free-text can carry the same mc-agent
+        # command/telemetry syntax the _on_log filter drops (e.g. "Finished
+        # goToCoordinates(118,64,-115,1)"). This ``text`` feeds both _log_cache
+        # (→ RECENT_EVENTS_BLOCK) and the completion / retroactive cue, so scrub
+        # the command syntax here at its single derivation point before any
+        # model-visible sink sees it — otherwise the dialog LLM re-dispatches the
+        # raw command. Scrub only the matched command syntax (``sub``, don't blank
+        # the whole line): a status="ok" completion whose text ALSO explains a
+        # block ("Failed goToCoordinates(...): could not find path") must keep the
+        # "could not find path" signal so ``text_signals_blocked`` still fires and
+        # the blocked action isn't relabeled a success.
+        if text and _INJECTION_LOG_RE.search(text):
+            scrubbed = _INJECTION_LOG_RE.sub("", text).strip()
+            self._log_debug(
+                "[anti-parrot] scrubbed command syntax from completion text: {!r} -> {!r}",
+                text[:80], scrubbed[:80],
+            )
+            text = scrubbed
         status = str(data.get("status") or "ok")
         # Optional explicit correlation: agents that opt in echo back
         # the ``task_id`` we sent on the matching ``task`` frame.
@@ -1310,7 +1713,7 @@ class GameAgentService:
             #   (b) echoed in dispatched history → retroactive cue
             #       (an earlier task — usually one we overwrote — really
             #       finished on mc-agent, surface that to the dialog LLM
-            #       so猫娘 knows the prior action actually completed)
+            #       so the catgirl knows the prior action actually completed)
             #   (c) no task_id or unknown id, but ``_pending`` is set →
             #       FIFO fallback: treat as completion of current pending
             #       (covers legacy mc-agent builds that don't echo id)
@@ -1319,7 +1722,9 @@ class GameAgentService:
             pending = self._pending
             historical_text: Optional[str] = None
             if echoed_task_id is not None:
-                if pending is not None and pending.task_id == echoed_task_id:
+                if pending is not None and echoed_task_id in (
+                    pending.task_id, pending.alias_task_id or None
+                ):
                     bucket = "current"
                     # Only flip the latch once the id has been proven to
                     # belong to OUR dispatch (current pending or recent
@@ -1362,6 +1767,29 @@ class GameAgentService:
                 self._last_inventory = parsed_inv
                 self._last_inventory_at = time.time()
 
+            # ``duplicate`` is NOT a terminal frame. mc-agent sends it when the
+            # the same instruction is already running ("continue the current task without restarting…
+            # do not resend"). Treating it as completion (observed 2026-09-07)
+            # cleared the slot AND told the dialog LLM the action "couldn't
+            # finish" → it re-sent the same text → duplicate again, forever.
+            # Keep the slot claimed and don't wake the handler; remember the
+            # id of the earlier dispatch that is really running so its
+            # eventual ``task_finished`` resolves this slot.
+            if status.strip().lower() == "duplicate" and bucket in ("current", "fifo"):
+                prior_id = self._find_prior_dispatch_id(
+                    pending.task_text, exclude=pending.task_id
+                )
+                if prior_id:
+                    pending.alias_task_id = prior_id
+                    self._duplicate_root[pending.task_id] = prior_id
+                if text:
+                    self._log_cache.append(text)
+                self._log_info(
+                    "task_finished duplicate: keeping pending {!r} (alias={})",
+                    pending.task_text[:40], prior_id or "-",
+                )
+                return
+
             if bucket == "current":
                 self._pending = None
                 if text:
@@ -1378,6 +1806,13 @@ class GameAgentService:
                 pending.event.set()
                 self._task_finished = True
                 self._last_task_finished_at = time.time()
+                # [BUSY] a dispatched task just reached a terminal frame — the
+                # agent is no longer mid-action on it. Clear the busy flag now so
+                # the keep-going nudge isn't suppressed for the full
+                # ``_agent_busy_ttl`` while the agent sits idle awaiting the next
+                # dispatch; a fresh bot_status_nl re-arms it if the agent starts
+                # something on its own.
+                self._mark_agent_idle()
             elif bucket == "fifo":
                 # Legacy agent without task_id echo: pending exists, so
                 # treat this as its completion.
@@ -1396,6 +1831,9 @@ class GameAgentService:
                 pending.event.set()
                 self._task_finished = True
                 self._last_task_finished_at = time.time()
+                # [BUSY] see the "current" branch — clear the busy flag on a
+                # completed dispatch so the nudge loop can resume promptly.
+                self._mark_agent_idle()
             elif bucket == "retroactive":
                 # A previously-dispatched task (now no longer pending)
                 # actually finished — emit a cue so the dialog LLM
@@ -1410,10 +1848,15 @@ class GameAgentService:
                 # Don't touch ``_task_finished`` — current pending is
                 # genuinely still running.
             else:  # "unknown" or "stray"
-                # No pending and no known dispatch → drift. Update the
-                # nudge gate so the autonomous loop knows agent is idle.
+                # No pending and no known dispatch → drift (e.g. an autonomous
+                # task_finished). Mark idle so the nudge loop resumes, and clear
+                # the busy latch too: a terminal frame proves the agent reached
+                # idle, so the recovery/keep-going nudge shouldn't be suppressed
+                # for the full _agent_busy_ttl. A fresh bot_status_nl re-arms it
+                # if the agent starts something new.
                 if pending is None:
                     self._task_finished = True
+                    self._mark_agent_idle()  # [BUSY] terminal frame — drop stale latch
 
         # Emit the retroactive cue outside the lock.
         if retroactive is not None:
@@ -1461,16 +1904,16 @@ class GameAgentService:
         # firing entirely ("user has moved on"). In practice that PERMANENTLY
         # killed the autonomous self-prompt — after one >90s idle stretch she
         # went dead-air until something external (mc-agent self-prompt / user)
-        # restarted her (the user-reported "self-prompt 停了很久才恢复"). For an
+        # restarted her (the user-reported "self-prompt stopped for a long time before recovering"). For an
         # autonomous game companion the desired behaviour is the opposite: keep
         # nudging her to play as long as she's idle. So the upper bound is gone —
         # keep_going now fires whenever idle, forever, paced by the cooldown.
         # (User present/absent gating is main_server's proactive SM job, not the
         # plugin's; the plugin only paces wake-ups.)
-        _IN_PROGRESS_AFTER = 8.0
-        _IN_PROGRESS_COOLDOWN = 8.0
-        _KEEP_GOING_AFTER = 8.0
-        _KEEP_GOING_COOLDOWN = 10.0
+        _IN_PROGRESS_AFTER = 30.0      # [THROTTLE] was 8.0
+        _IN_PROGRESS_COOLDOWN = 30.0   # [THROTTLE] was 8.0
+        _KEEP_GOING_AFTER = 30.0       # [THROTTLE] was 8.0
+        _KEEP_GOING_COOLDOWN = 45.0    # [THROTTLE] was 10.0
 
         self._log_debug(
             "system_prompt_loop started (in_progress={}/{}, keep_going={}/{}, "
@@ -1511,6 +1954,7 @@ class GameAgentService:
                     self._task_finished
                     and self._pending is None
                     and self._last_task_finished_at > 0
+                    and not self._mc_agent_busy()  # [BUSY] agent is executing on its own — don't tell her to dispatch
                 ):
                     since_finish = now - self._last_task_finished_at
                     since_last_keep = now - self._last_keep_going_nudge_at
@@ -1580,10 +2024,9 @@ class GameAgentService:
             "IN_PROGRESS_HEADER", lang=self._lang,
             pending_text=pending_text[:120], elapsed=f"{elapsed:.0f}",
         )]
-        if self._last_inventory:
-            items = sorted(self._last_inventory.items(), key=lambda kv: -kv[1])
-            inv_str = "、".join(f"{n}×{c}" for n, c in items[:15])
-            sections.append(prompts.t("BAG_LINE", lang=self._lang, items=inv_str))
+        inv_line = self._inventory_section_if_changed(top_n=15)
+        if inv_line:
+            sections.append(inv_line)
         sections.append(prompts.t("IN_PROGRESS_FOLLOWUP", lang=self._lang))
         body_text = prompts.t("CUE_PREFIX_IN_PROGRESS", lang=self._lang) + "\n" + "\n".join(sections)
         parts.append({"type": "text", "text": body_text})
@@ -1613,12 +2056,9 @@ class GameAgentService:
         it can ground its next decision.
         """
         sections: list[str] = []
-        if self._last_inventory:
-            items = sorted(self._last_inventory.items(), key=lambda kv: -kv[1])
-            inv_str = "、".join(f"{n}×{c}" for n, c in items[:20])
-            sections.append(prompts.t("BAG_LINE", lang=self._lang, items=inv_str))
-        elif self._last_inventory_at > 0:
-            sections.append(prompts.t("BAG_EMPTY_LINE", lang=self._lang))
+        inv_line = self._inventory_section_if_changed(top_n=20)
+        if inv_line:
+            sections.append(inv_line)
         sections.append(prompts.t("KEEP_GOING_BODY", lang=self._lang))
         body_text = prompts.t("CUE_PREFIX_IDLE", lang=self._lang) + "\n" + "\n".join(sections)
         parts: list[Dict[str, Any]] = [{"type": "text", "text": body_text}]
@@ -1645,20 +2085,45 @@ class GameAgentService:
         "task running — comment if you like" tail.
         """
         log_text = ""
-        if self._log_cache:
-            log_text = _ANSI_RE.sub("", "\n".join(self._log_cache))
-            self._log_cache.clear()
+        # Re-send recent lines rather than draining them into one burst. These
+        # bursts coalesce on ``mc_state`` (latest wins) and a coalesced burst is
+        # dropped whole, so lines drained into it would be gone before the model
+        # ever saw them. They are not snapshot data like the inventory or a
+        # screenshot; they are the game's incremental events.
+        #
+        # The window is the host's own cue TTL, not a generation count. Carrying
+        # exactly one generation only survives ONE coalescing step, and the
+        # playback gate routinely stays shut for several burst intervals -- the
+        # queue has been observed at depth 25 -- so three bursts collapsing in a
+        # row is the normal case, not an edge one, and the older two would still
+        # vanish. Anything older than the TTL is dropped here because the host
+        # drops it too ("dropping stale cue ... reason=ttl"): it was never going
+        # to arrive as news, so keeping it would only pad the context.
+        #
+        # The plugin cannot do better than a window: ``push_message`` answers
+        # ``Submitted | Rejected`` and no delivery ack is plumbed back to it, so
+        # "keep until confirmed" has nothing to confirm against. The cost is that
+        # a line repeats across the bursts inside its window; the burst is
+        # ``ai_behavior="read"`` context rather than a speak cue, so that costs
+        # context, not a repeated sentence.
+        now = time.time()
+        fresh_lines = list(self._log_cache)
+        self._log_cache.clear()
+        while self._log_carry and (now - self._log_carry[0][0]) > _LOG_CARRY_TTL_SECONDS:
+            self._log_carry.popleft()
+        combined = [line for _ts, line in self._log_carry] + fresh_lines
+        for line in fresh_lines:
+            self._log_carry.append((now, line))
+        if combined:
+            log_text = _ANSI_RE.sub("", "\n".join(combined))
 
         sections: list[str] = []
         # Inventory line first — it's the closest thing to ground truth
         # we have, and the dialog LLM should know it before narrating
         # anything that depends on owned items.
-        if self._last_inventory:
-            items = sorted(self._last_inventory.items(), key=lambda kv: -kv[1])
-            inv_str = "、".join(f"{n}×{c}" for n, c in items[:20])
-            sections.append(prompts.t("BAG_LINE", lang=self._lang, items=inv_str))
-        elif self._last_inventory_at > 0:
-            sections.append(prompts.t("BAG_EMPTY_LINE", lang=self._lang))
+        inv_line = self._inventory_section_if_changed(top_n=20)
+        if inv_line:
+            sections.append(inv_line)
         if self._pending is not None:
             sections.append(prompts.t(
                 "CURRENT_TASK_LINE", lang=self._lang,
@@ -1668,10 +2133,21 @@ class GameAgentService:
             sections.append(prompts.t(
                 "RECENT_EVENTS_BLOCK", lang=self._lang, log_text=log_text,
             ))
-        if self._task_finished:
-            sections.append(prompts.t("SYSTEM_PROMPT_IDLE_BODY", lang=self._lang))
-        else:
+        # [BUSY] Three states, not two. mc-agent's own activity still suppresses
+        # the dispatch invitation (otherwise the loop keeps telling her to
+        # dispatch over whatever the agent is already doing), but it must not
+        # borrow the BUSY wording: with no ``_pending`` there IS no previous
+        # action of hers, and telling her there is stalls her for the whole
+        # busy-latch TTL while the user is asking her to move.
+        if self._pending is not None:
+            # A task we dispatched is genuinely in flight.
             sections.append(prompts.t("SYSTEM_PROMPT_BUSY_BODY", lang=self._lang))
+        elif self._mc_agent_busy() or not self._task_finished:
+            # mc-agent is doing its own thing. Say exactly that, and keep the
+            # master-override door open.
+            sections.append(prompts.t("SYSTEM_PROMPT_AUTONOMOUS_BODY", lang=self._lang))
+        else:
+            sections.append(prompts.t("SYSTEM_PROMPT_IDLE_BODY", lang=self._lang))
         prompt_text = prompts.t("CUE_PREFIX_STATE", lang=self._lang) + "\n" + "\n".join(sections)
 
         # Build the parts list: cached screenshots first (so the LLM
@@ -1703,12 +2179,22 @@ class GameAgentService:
             # forcing an AI turn, so it can't make her narrate non-stop or
             # compete with real alert/completion cues in the pacing manager.
             # The specific nudges (in_progress / keep_going) remain "respond".
+            #
+            # ``coalesce_key`` matters as much as the pacing here. This burst is
+            # a SNAPSHOT of current state, so only the newest one is worth
+            # delivering — but it was the one minecraft category that never
+            # tagged a key, so every burst got a unique ``__uniq:N`` slot and
+            # they stacked. Observed in the wild: a delivery queue at pending=25
+            # (``__uniq:68``) where the user's one-line request had to compete
+            # with two dozen stale state bursts, several of them saying she was
+            # busy. Latest-wins collapses that back to one.
             self._push_message(
                 source="game_agent_minecraft",
                 visibility=[],
                 ai_behavior="read",
                 parts=parts,
                 priority=4,
+                coalesce_key="mc_state",
             )
         except Exception as exc:
             self._log_error(
@@ -1778,4 +2264,4 @@ class GameAgentService:
                 pass  # log emission itself failed — see comment above
 
 
-__all__ = ["GameAgentService", "PendingTask"]
+__all__ = ["GameAgentService", "PendingTask", "text_signals_blocked"]

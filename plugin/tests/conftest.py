@@ -1,5 +1,24 @@
 from __future__ import annotations
 
+# This deliberately duplicates plugin/conftest.py: plugin/tests has its own pytest.ini, and running
+# `pytest plugin/tests` makes it rootdir, so confcutdir excludes the parent plugin/conftest.py.
+# Running plugin/plugins/<name>/tests directly activates only the parent copy. Retain both so
+# all eight test trees are guarded. Duplicate registration is harmless: the first restores and fails on drift, the second sees none.
+#
+# Set sys.path before any project import: these trees have different rootdirs, while the venv's
+# editable .pth points to the main repository. Inserting it midway resolves early imports from the main repository and later ones
+# from this copy (observed failure in main_logic.agent_event_bus).
+import sys as _sys
+from pathlib import Path as _Path
+
+_REPO_ROOT = str(_Path(__file__).resolve().parents[2])
+if _sys.path[:1] != [_REPO_ROOT]:
+    _sys.path.insert(0, _REPO_ROOT)
+
+# pytest discovers hooks by name in the conftest namespace, so this import has no explicit call site;
+# it is not dead code: deleting it disables the entire process-wide clock guard.
+from tests.clock_guard import pytest_runtest_call  # noqa: F401,E402
+
 import asyncio.events as _events
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -13,6 +32,7 @@ from plugin.server.infrastructure.exceptions import register_exception_handlers
 from plugin.server.routes.health import router as health_router
 from plugin.server.routes.metrics import router as metrics_router
 from plugin.server.routes.runs import router as runs_router
+
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -35,24 +55,10 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
 
 
 @pytest.fixture(autouse=True)
-def _disable_galgame_rapidocr_warmup(monkeypatch: pytest.MonkeyPatch) -> None:
-    """No-op RapidOcrBackend.warmup_async so tests don't oversubscribe cores via daemon ONNX threads."""
-    try:
-        from plugin.plugins.galgame_plugin.ocr_reader import RapidOcrBackend
-    except Exception:
-        return
-    monkeypatch.setattr(RapidOcrBackend, "warmup_async", lambda self, logger=None: None)
-
-
-@pytest.fixture(autouse=True)
-def _isolate_galgame_runtime_root(
-    request: pytest.FixtureRequest,
+def _isolate_plugin_runtime_root(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    path = Path(str(request.node.fspath))
-    if "galgame" not in str(path):
-        return
     monkeypatch.setenv("NEKO_STORAGE_SELECTED_ROOT", str(tmp_path / "runtime_data"))
     monkeypatch.delenv("NEKO_STORAGE_ANCHOR_ROOT", raising=False)
 
@@ -61,10 +67,9 @@ def _isolate_galgame_runtime_root(
 def _isolate_runtime_overrides(monkeypatch: pytest.MonkeyPatch):
     """Redirect plugin runtime override persistence to an in-memory dict for tests.
 
-    Without this, tests that exercise `disable_extension` / `enable_extension`
-    (directly or via `delete_plugin`) would write to the real user's
-    ``plugin_runtime_overrides.json``, persistently disabling extensions on the
-    developer's machine.
+    Without this, lifecycle tests could write to the real user's
+    ``plugin_runtime_overrides.json`` and persist test state on the developer's
+    machine.
     """
     from plugin.server.infrastructure import runtime_overrides as _ro
 
@@ -110,11 +115,6 @@ def plugin_test_app() -> FastAPI:
     app.include_router(metrics_router)
     app.include_router(runs_router)
     return app
-
-
-@pytest.fixture(scope="session")
-def galgame_i18n_dir() -> Path:
-    return Path(__file__).resolve().parents[1] / "plugins/galgame_plugin/i18n"
 
 
 @pytest.fixture

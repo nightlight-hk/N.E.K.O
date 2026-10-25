@@ -1,29 +1,46 @@
 # -*- coding: utf-8 -*-
+# Copyright 2025-2026 Project N.E.K.O. Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
-鲁棒的日志配置模块
-适用于exe封装后的应用，支持：
-- 自动选择合适的日志目录（用户数据目录）
-- 日志轮转（按大小和时间）
-- 自动清理旧日志
-- 降级策略（当无法写入时的备用方案）
-- 跨平台支持
+Robust logging configuration module
+For exe-packaged applications, supporting:
+- automatic selection of a suitable log directory (user data directory)
+- log rotation (by size and time)
+- automatic cleanup of old logs
+- degradation strategy (fallbacks when writing is impossible)
+- cross-platform support
 
 ╔══════════════════════════════════════════════════════════════════════════╗
-║                        ⚠⚠⚠  警  告  ⚠⚠⚠                                ║
+║                        ⚠⚠⚠  WARNING  ⚠⚠⚠                                ║
 ║                                                                          ║
-║   本模块是全仓库唯一允许的日志后端。所有 Python 进程（main_*、         ║
-║   agent_*、memory_*、user_plugin_server、各 Plugin 子进程）都必须      ║
-║   通过 setup_logging(service_name=...) 走这里。                         ║
+║   This module is the ONLY logging backend allowed in this repo. Every    ║
+║   Python process (main_*, agent_*, memory_*, user_plugin_server, each    ║
+║   Plugin subprocess) must go through setup_logging(service_name=...).    ║
 ║                                                                          ║
-║   严禁：                                                                ║
-║     1. 引入 loguru / structlog / logbook 等第三方日志库；              ║
-║     2. 用 cwd / __file__.parent 算日志目录（AppImage squashfs 只读）；║
-║     3. 自创 FileHandler 绕过 RobustLoggerConfig；                       ║
-║     4. 把 plugin 日志单独写到别的地方。                                ║
+║   Strictly forbidden:                                                    ║
+║     1. introducing third-party logging libs like loguru / structlog /    ║
+║        logbook;                                                          ║
+║     2. computing the log dir from cwd / __file__.parent (AppImage        ║
+║        squashfs is read-only);                                           ║
+║     3. creating your own FileHandler to bypass RobustLoggerConfig;       ║
+║     4. writing plugin logs anywhere else.                                ║
 ║                                                                          ║
-║   再有人乱搞 —— 按维护者口径就把谁杀了。                                ║
-║   lint 守门：scripts/check_no_loguru.py（CI: .github/workflows/         ║
-║   analyze.yml）。                                                        ║
+║   Whoever messes this up again will — in the maintainer's words — be     ║
+║   killed.                                                                ║
+║   Lint gate: scripts/check_no_loguru.py (CI: .github/workflows/          ║
+║   analyze.yml).                                                          ║
 ╚══════════════════════════════════════════════════════════════════════════╝
 """
 import os
@@ -47,7 +64,7 @@ def _get_application_root() -> Path:
 
 
 def _get_writable_application_directory() -> Path:
-    """返回适合作为日志落盘基目录的可写路径。"""
+    """Return a writable path suitable as the base directory for log files."""
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return _get_application_root()
@@ -69,9 +86,9 @@ def _get_selected_storage_root_from_env() -> Path | None:
 
 
 class RobustLoggerConfig:
-    """鲁棒的日志配置类"""
+    """Robust logging configuration class"""
     
-    # 默认配置
+    # Default configuration.
     DEFAULT_LOG_LEVEL = logging.INFO
     DEFAULT_MAX_BYTES = 10 * 1024 * 1024  # 10MB per log file
     DEFAULT_BACKUP_COUNT = 5  # Keep 5 backup files
@@ -80,65 +97,66 @@ class RobustLoggerConfig:
     def __init__(self, app_name=None, service_name=None, log_level=None, max_bytes=None,
                  backup_count=None, retention_days=None, log_subdir=None):
         """
-        初始化日志配置
+        Initialize logging configuration
 
         Args:
-            app_name: 应用名称，用于创建日志目录，默认使用配置中的 APP_NAME
-            service_name: 服务名称，用于区分不同服务的日志文件（如Main、Memory、Agent）
-            log_level: 日志级别
-            max_bytes: 单个日志文件的最大大小
-            backup_count: 保留的备份文件数量
-            retention_days: 日志保留天数
-            log_subdir: 日志落到基目录下的哪个子目录（如 "plugin"）。默认 None =
-                直接写到基目录 ``<docs>/N.E.K.O/logs/``。传入 ``"plugin"`` 会把日志
-                路由到 ``<docs>/N.E.K.O/logs/plugin/``，用于把大量 plugin 子进程
-                日志从顶层收纳到一个子目录，避免与 PluginServer / Main / Memory /
-                Agent 等宿主进程日志混在一起。
+            app_name: application name, used to create the log directory; defaults to APP_NAME from config
+            service_name: service name, distinguishing log files of different services (e.g. Main, Memory, Agent)
+            log_level: log level
+            max_bytes: maximum size of a single log file
+            backup_count: number of backup files to keep
+            retention_days: days to keep logs
+            log_subdir: which subdirectory under the base dir logs land in (e.g. "plugin").
+                Default None = write directly to the base dir ``<docs>/N.E.K.O/logs/``.
+                Passing ``"plugin"`` routes logs to ``<docs>/N.E.K.O/logs/plugin/``, used
+                to tuck the many plugin subprocess logs out of the top level into one
+                subdirectory, keeping them apart from host-process logs like
+                PluginServer / Main / Memory / Agent.
         """
         self.app_name = app_name if app_name is not None else APP_NAME
-        self.service_name = service_name  # 服务名称用于文件名区分
+        self.service_name = service_name  # Service name distinguishes filenames.
         self.log_level = log_level or self.DEFAULT_LOG_LEVEL
         self.max_bytes = max_bytes or self.DEFAULT_MAX_BYTES
         self.backup_count = backup_count or self.DEFAULT_BACKUP_COUNT
         self.retention_days = retention_days or self.DEFAULT_LOG_RETENTION_DAYS
         self.log_subdir = log_subdir
 
-        # 获取日志目录（先拿到基目录，再按 log_subdir 路由到子目录）
+        # Get the base log directory, then route to the log_subdir subdirectory.
         self.log_dir = self._get_log_directory()
         if log_subdir:
-            # 不让调用方传带 "/" 的路径，避免意外逃出基目录。
+            # Reject caller paths containing "/" to prevent accidental escape from the base directory.
             safe = str(log_subdir).strip().strip("/\\")
             if safe:
                 self.log_dir = self.log_dir / safe
         
-        # 日志文件名：如果有service_name则包含，否则只用app_name
+        # Log filename includes service_name when present; otherwise use only app_name.
         if self.service_name:
             log_filename = f"{self.app_name}_{self.service_name}_{datetime.now().strftime('%Y%m%d')}.log"
         else:
             log_filename = f"{self.app_name}_{datetime.now().strftime('%Y%m%d')}.log"
         self.log_file = self.log_dir / log_filename
         
-        # 确保日志目录存在
+        # Ensure the log directory exists.
         self._ensure_log_directory()
         
-        # 清理旧日志
+        # Clean up old logs.
         self._cleanup_old_logs()
     
     def _get_log_directory(self):
         """
-        获取合适的日志目录
-        优先级：
-        1. 已选择的运行时存储目录/logs（由启动器通过环境变量注入）
-        2. 用户文档目录/{APP_NAME}/logs（兼容旧版本和直接运行）
-        3. 应用程序所在目录/logs
-        4. 用户数据目录（AppData等）
-        5. 用户主目录
-        6. 临时目录（最后的降级选项）
+        Get a suitable log directory
+        Priority:
+        1. selected runtime storage directory/logs (injected by the launcher via environment variables)
+        2. user documents directory/{APP_NAME}/logs (compatible with old versions and direct runs)
+        3. application directory/logs
+        4. user data directory (AppData etc.)
+        5. user home directory
+        6. temp directory (last-resort fallback)
         
         Returns:
-            Path: 日志目录路径
+            Path: log directory path
         """
-        # 尝试1: 使用当前存储根目录。老日志不迁移；新日志跟随新根目录。
+        # Attempt 1: current storage root. Do not migrate old logs; new logs follow the new root.
         try:
             selected_root = _get_selected_storage_root_from_env()
             if selected_root is not None:
@@ -148,17 +166,17 @@ class RobustLoggerConfig:
         except Exception as e:
             print(f"Warning: Failed to use selected storage log directory: {e}", file=sys.stderr)
 
-        # 尝试2: 使用用户文档目录（兼容旧版本和非 launcher 直接运行）
+        # Attempt 2: user Documents directory (compatible with older versions and direct non-launcher runs).
         try:
             docs_dir = self._get_documents_directory()
-            # 使用配置的应用名称目录
+            # Use the configured application-name directory.
             log_dir = docs_dir / self.app_name / "logs"
             if self._test_directory_writable(log_dir):
                 return log_dir
         except Exception as e:
             print(f"Warning: Failed to use Documents directory: {e}", file=sys.stderr)
         
-        # 尝试2: 使用应用程序所在目录
+        # Attempt 2: application directory.
         try:
             app_dir = _get_writable_application_directory()
             log_dir = app_dir / "logs"
@@ -167,7 +185,7 @@ class RobustLoggerConfig:
         except Exception as e:
             print(f"Warning: Failed to use application directory: {e}", file=sys.stderr)
         
-        # 尝试3: 使用系统用户数据目录
+        # Attempt 3: system user-data directory.
         try:
             if sys.platform == "win32":
                 # Windows: %APPDATA%\AppName\logs
@@ -194,7 +212,7 @@ class RobustLoggerConfig:
         except Exception as e:
             print(f"Warning: Failed to get system data directory: {e}", file=sys.stderr)
         
-        # 尝试4: 使用用户主目录
+        # Attempt 4: user home directory.
         try:
             log_dir = Path.home() / f".{self.app_name}" / "logs"
             if self._test_directory_writable(log_dir):
@@ -202,7 +220,7 @@ class RobustLoggerConfig:
         except Exception as e:
             print(f"Warning: Failed to use home directory: {e}", file=sys.stderr)
         
-        # 尝试5: 使用临时目录（最后的降级选项）
+        # Attempt 5: temporary directory (last-resort fallback).
         try:
             import tempfile
             log_dir = Path(tempfile.gettempdir()) / self.app_name / "logs"
@@ -211,19 +229,19 @@ class RobustLoggerConfig:
         except Exception as e:
             print(f"Warning: Failed to use temp directory: {e}", file=sys.stderr)
         
-        # 如果所有方法都失败，返回当前目录
+        # If every method fails, return the current directory.
         print("Warning: All log directory attempts failed, using application directory", file=sys.stderr)
         return _get_writable_application_directory() / "logs"
     
     def _get_documents_directory(self):
-        """获取系统的用户文档目录（使用系统API）"""
+        """Get the system's user documents directory (via system APIs)"""
         if sys.platform == "win32":
-            # Windows: 使用系统API获取真正的"我的文档"路径
+            # Windows: use the system API to find the actual Documents path.
             try:
                 import ctypes
                 from ctypes import windll, wintypes
                 
-                # 使用SHGetFolderPath获取我的文档路径
+                # Use SHGetFolderPath to get the Documents path.
                 CSIDL_PERSONAL = 5  # My Documents
                 SHGFP_TYPE_CURRENT = 0
                 
@@ -236,7 +254,7 @@ class RobustLoggerConfig:
             except Exception as e:
                 print(f"Warning: Failed to get Documents path via API: {e}", file=sys.stderr)
             
-            # 降级：尝试从注册表读取
+            # Fallback: try reading the registry.
             try:
                 import winreg
                 key = winreg.OpenKey(
@@ -246,14 +264,14 @@ class RobustLoggerConfig:
                 docs_dir = Path(winreg.QueryValueEx(key, "Personal")[0])
                 winreg.CloseKey(key)
                 
-                # 展开环境变量
+                # Expand environment variables.
                 docs_dir = Path(os.path.expandvars(str(docs_dir)))
                 if docs_dir.exists():
                     return docs_dir
             except Exception as e:
                 print(f"Warning: Failed to get Documents path from registry: {e}", file=sys.stderr)
             
-            # 最后的降级
+            # Final fallback.
             docs_dir = Path.home() / "Documents"
             if not docs_dir.exists():
                 docs_dir = Path.home() / "文档"
@@ -263,7 +281,7 @@ class RobustLoggerConfig:
             # macOS
             return Path.home() / "Documents"
         else:
-            # Linux: 尝试使用XDG
+            # Linux: try XDG.
             xdg_docs = os.getenv('XDG_DOCUMENTS_DIR')
             if xdg_docs:
                 return Path(xdg_docs)
@@ -271,47 +289,47 @@ class RobustLoggerConfig:
     
     def _test_directory_writable(self, directory):
         """
-        测试目录是否可写
+        Test whether a directory is writable
         
         Args:
-            directory: 要测试的目录
+            directory: directory to test
             
         Returns:
-            bool: 是否可写
+            bool: whether it is writable
         """
         try:
-            # 分步创建目录，避免parents=True在打包后可能出现的问题
-            # 收集所有需要创建的父目录
+            # Create directories incrementally to avoid possible packaged-app problems with parents=True.
+            # Collect all parent directories needing creation.
             dirs_to_create = []
             current = directory
             while current and not current.exists():
                 dirs_to_create.append(current)
                 current = current.parent
             
-            # 从最顶层开始创建目录
+            # Create directories from the top down.
             for dir_path in reversed(dirs_to_create):
                 if not dir_path.exists():
                     dir_path.mkdir(exist_ok=True)
             
-            # 尝试创建一个测试文件
+            # Try creating a test file.
             test_file = directory / ".write_test"
-            test_file.write_text("test")
+            test_file.write_text("test", encoding="utf-8")
             test_file.unlink()
             return True
         except Exception:
             return False
     
     def _ensure_log_directory(self):
-        """确保日志目录存在"""
+        """Ensure the log directory exists"""
         try:
-            # 分步创建目录，避免parents=True在打包后可能出现的问题
+            # Create directories incrementally to avoid possible packaged-app problems with parents=True.
             dirs_to_create = []
             current = self.log_dir
             while current and not current.exists():
                 dirs_to_create.append(current)
                 current = current.parent
             
-            # 从最顶层开始创建目录
+            # Create directories from the top down.
             for dir_path in reversed(dirs_to_create):
                 if not dir_path.exists():
                     dir_path.mkdir(exist_ok=True)
@@ -320,10 +338,11 @@ class RobustLoggerConfig:
             raise
     
     def _cleanup_old_logs(self):
-        """清理超过保留期的旧日志文件。
+        """Clean up old log files past the retention period.
 
-        除了主日志目录外，源码运行时还会顺手清一下 dev DEBUG 目录
-        （``<repo>/logs/``），避免按天滚的 ``*_debug_YYYYMMDD.log`` 无限堆积。
+        Besides the main log directory, source-mode runs also sweep the dev DEBUG
+        directory (``<repo>/logs/``), so daily-rolled ``*_debug_YYYYMMDD.log`` files
+        don't pile up forever.
         """
         cutoff_date = datetime.now() - timedelta(days=self.retention_days)
         dirs_to_scan = [self.log_dir]
@@ -349,10 +368,10 @@ class RobustLoggerConfig:
                 print(f"Warning: Failed to cleanup old logs in {scan_dir}: {e}", file=sys.stderr)
     
     def _resolve_console_level(self) -> int:
-        """决定 console handler 的级别。
+        """Decide the console handler's level.
 
-        默认：max(log_level, INFO) —— 即便整体开 DEBUG，控制台也只显示 INFO+，
-        DEBUG 走文件。可用 NEKO_LOG_CONSOLE_LEVEL=DEBUG/INFO/... 覆盖。
+        Default: max(log_level, INFO) — even with DEBUG enabled overall, the console
+        only shows INFO+; DEBUG goes to files. Override with NEKO_LOG_CONSOLE_LEVEL=DEBUG/INFO/...
         """
         override = (os.environ.get("NEKO_LOG_CONSOLE_LEVEL") or "").strip().upper()
         if override:
@@ -362,24 +381,24 @@ class RobustLoggerConfig:
         return max(self.log_level, logging.INFO)
 
     def get_log_file_path(self):
-        """获取日志文件路径"""
+        """Get the log file path"""
         return str(self.log_file)
     
     def get_log_directory_path(self):
-        """获取日志目录路径"""
+        """Get the log directory path"""
         return str(self.log_dir)
     
     def setup_logger(self, logger_name=None):
         """
-        配置并返回logger实例
+        Configure and return a logger instance
         
         Args:
-            logger_name: logger的名称，如果为None则返回root logger
+            logger_name: name of the logger; returns the root logger when None
             
         Returns:
-            logging.Logger: 配置好的logger实例
+            logging.Logger: the configured logger instance
         """
-        # 创建或获取logger。默认使用服务专属logger，避免落到root。
+        # Create or retrieve the logger; default to a service-specific logger rather than root.
         if not logger_name:
             if self.service_name:
                 logger_name = f"{self.app_name}.{self.service_name}"
@@ -387,9 +406,9 @@ class RobustLoggerConfig:
                 logger_name = self.app_name
         logger = logging.getLogger(logger_name)
         logger.setLevel(self.log_level)
-        # 不向root传播，避免被外部handler劫持到错误文件。
+        # Disable propagation to root so external handlers cannot redirect logs to the wrong file.
         logger.propagate = False
-        # 幂等重建：清理当前logger已有handler，避免重复写入。
+        # Idempotent rebuild: remove existing handlers from this logger to avoid duplicate writes.
         if logger.handlers:
             for handler in list(logger.handlers):
                 logger.removeHandler(handler)
@@ -398,16 +417,16 @@ class RobustLoggerConfig:
                 except Exception:
                     pass
         
-        # 日志格式
+        # Log format.
         log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
         date_format = '%Y-%m-%d %H:%M:%S'
         formatter = logging.Formatter(log_format, date_format)
         
-        # 控制台默认钳到 INFO：DEBUG 量太大会瞬间淹没终端，落盘即可。
-        # 想让 console 也吐 DEBUG（极少数本地排障场景），设 NEKO_LOG_CONSOLE_LEVEL=DEBUG。
+        # Console defaults to INFO: DEBUG floods terminals instantly; disk logging suffices.
+        # Set NEKO_LOG_CONSOLE_LEVEL=DEBUG for rare local troubleshooting requiring console DEBUG.
         console_level = self._resolve_console_level()
 
-        # 1. 控制台Handler
+        # 1. Console handler.
         try:
             console_handler = logging.StreamHandler(sys.stdout)
             console_handler.setLevel(console_level)
@@ -416,26 +435,26 @@ class RobustLoggerConfig:
         except Exception as e:
             print(f"Warning: Failed to add console handler: {e}", file=sys.stderr)
         
-        # 2. 文件Handler（带轮转）
+        # 2. Rotating file handler.
         try:
-            # 使用RotatingFileHandler进行按大小轮转
+            # Use RotatingFileHandler for size-based rotation.
             file_handler = RotatingFileHandler(
                 self.log_file,
                 maxBytes=self.max_bytes,
                 backupCount=self.backup_count,
                 encoding='utf-8'
             )
-            # 主日志钳到 INFO+：DEBUG 走单独的 dev 文件，不污染用户统一日志。
+            # Main log accepts INFO+; DEBUG goes to a separate dev file to keep the unified user log clean.
             file_handler.setLevel(max(self.log_level, logging.INFO))
             file_handler.setFormatter(formatter)
             logger.addHandler(file_handler)
         except Exception as e:
             print(f"Error: Failed to add file handler: {e}", file=sys.stderr)
-            # 文件handler失败不应该阻止应用运行
+            # File-handler failures must not stop the application.
 
-        # 2b. Dev-only DEBUG Handler：仅源码运行时启用，落到源码 ``logs/`` 下，
-        # 只收 DEBUG 一级（INFO+ 已经在主日志里）。frozen 时不挂——AppImage
-        # squashfs 只读，且打包后用户不需要 dev 调试日志。
+        # 2b. Dev-only DEBUG handler: enable only for source runs, writing under source logs/,
+        # accepting only DEBUG (INFO+ already goes to the main log). Do not attach when frozen:
+        # AppImage squashfs is read-only, and packaged users do not need developer debug logs.
         if not getattr(sys, "frozen", False) and self.log_level <= logging.DEBUG:
             try:
                 dev_debug_dir = _get_application_root() / "logs"
@@ -458,7 +477,7 @@ class RobustLoggerConfig:
             except Exception as e:
                 print(f"Warning: Failed to add dev debug handler: {e}", file=sys.stderr)
 
-        # 3. 错误日志Handler（单独记录ERROR及以上级别）
+        # 3. Error-log handler (separate ERROR-and-above output).
         try:
             if self.service_name:
                 error_filename = f"{self.app_name}_{self.service_name}_error.log"
@@ -481,25 +500,25 @@ class RobustLoggerConfig:
 
 
 class EnhancedLogger:
-    """增强的Logger包装器，自动处理traceback"""
+    """Enhanced logger wrapper that handles tracebacks automatically"""
     
     def __init__(self, logger):
         self._logger = logger
     
     def __getattr__(self, name):
-        """代理所有其他方法到原始logger"""
+        """Proxy all other methods to the original logger"""
         return getattr(self._logger, name)
     
     def error(self, msg, *args, exc_info=None, **kwargs):
         """
-        增强的error方法，自动包含traceback
+        Enhanced error method that automatically includes the traceback
         
         Args:
-            msg: 错误消息
-            exc_info: 是否包含异常信息，默认True（自动检测）
-            *args, **kwargs: 传递给原始logger.error的其他参数
+            msg: error message
+            exc_info: whether to include exception info, default True (auto-detect)
+            *args, **kwargs: other arguments passed through to the original logger.error
         """
-        # 如果在异常上下文中且未明确指定exc_info，自动设置为True
+        # In exception context, automatically set exc_info=True unless explicitly supplied.
         if exc_info is None:
             import sys
             exc_info = sys.exc_info()[0] is not None
@@ -507,31 +526,31 @@ class EnhancedLogger:
         self._logger.error(msg, *args, exc_info=exc_info, **kwargs)
     
     def exception(self, msg, *args, **kwargs):
-        """异常记录方法（始终包含traceback）"""
+        """Exception logging method (always includes the traceback)"""
         self._logger.exception(msg, *args, **kwargs)
 
 
 def setup_logging(app_name=None, service_name=None, log_level=None, silent=False,
                   log_subdir=None):
     """
-    便捷函数：设置日志配置
+    Convenience function: set up logging configuration
 
     Args:
-        app_name: 应用名称，默认使用配置中的 APP_NAME（用于确定日志目录）
-        service_name: 服务名称，用于区分不同服务的日志文件（如Main、Memory、Agent）
-        log_level: 日志级别
-        silent: 静默模式，不打印初始化消息（用于子进程避免重复输出）
-        log_subdir: 日志子目录。plugin 子进程传 ``"plugin"`` 即可把
-            ``N.E.K.O_Plugin_<id>_*.log`` 收纳到 ``logs/plugin/`` 下，避免与
-            PluginServer / Main / Memory / Agent 等宿主进程的日志混在顶层。
-            默认 ``None`` = 保持老行为，写到 ``logs/`` 基目录。
+        app_name: application name, defaults to APP_NAME from config (determines the log directory)
+        service_name: service name, distinguishing log files of different services (e.g. Main, Memory, Agent)
+        log_level: log level
+        silent: silent mode, no init message printed (for subprocesses, avoiding duplicate output)
+        log_subdir: log subdirectory. Plugin subprocesses pass ``"plugin"`` to tuck
+            ``N.E.K.O_Plugin_<id>_*.log`` under ``logs/plugin/``, keeping them apart
+            from host-process logs like PluginServer / Main / Memory / Agent.
+            Default ``None`` = keep the old behavior, writing to the ``logs/`` base directory.
 
     Returns:
-        tuple: (增强的logger实例, 日志配置对象)
+        tuple: (enhanced logger instance, logging config object)
 
-    注意：
-        返回的logger会自动在error()调用时包含traceback（如果在异常上下文中）
-        也可以使用logger.exception()来明确记录异常信息
+    Note:
+        The returned logger automatically includes the traceback on error() calls (when in an exception context)
+        logger.exception() can also be used to record exception info explicitly
     """
     config = RobustLoggerConfig(
         app_name=app_name,
@@ -539,19 +558,19 @@ def setup_logging(app_name=None, service_name=None, log_level=None, silent=False
         log_level=log_level,
         log_subdir=log_subdir,
     )
-    # 使用带命名空间的 logger 名（如 N.E.K.O.Agent），
-    # 避免与第三方库的同名 logger 冲突（browser_use 内部有名为 "Agent" 的 logger）。
+    # Use namespaced logger names (e.g. N.E.K.O.Agent)
+    # to avoid collisions with third-party loggers (browser_use internally has an "Agent" logger).
     base_logger = config.setup_logger()
     
-    # 为 APP_NAME 父 logger 挂载 handler，使跨服务共享模块（utils, config 等）
-    # 的日志也能写入文件。共享模块使用 get_module_logger(__name__) 创建如
-    # N.E.K.O.utils.xxx 的 logger，向上传播到此父 logger 后被捕获。
+    # Attach handlers to the APP_NAME parent logger so cross-service shared modules (utils, config, etc.)
+    # also write to files. Shared modules use get_module_logger(__name__) for loggers such as
+    # N.E.K.O.utils.xxx, whose propagation reaches this parent and is captured.
     _ensure_shared_parent_logger(config, base_logger)
     
-    # 包装为增强logger
+    # Wrap as an enhanced logger.
     logger = EnhancedLogger(base_logger)
     
-    # 记录日志配置信息（子进程静默模式下跳过）
+    # Record logging configuration (skip in subprocess silent mode).
     if not silent:
         service_info = f"{service_name}" if service_name else config.app_name
         logger.info(f"=== {service_info} 日志系统已初始化 ===")
@@ -563,18 +582,20 @@ def setup_logging(app_name=None, service_name=None, log_level=None, silent=False
 
 
 # =============================================================================
-# 统一的速率限制日志过滤器
+# Unified rate-limiting log filter.
 # =============================================================================
 
 class RateLimitedEndpointFilter(logging.Filter):
     """
-    统一的速率限制日志过滤器
+    Unified rate-limited log filter
     
-    支持两种模式：
-    1. 完全抑制：某些端点的日志完全不显示
-    2. 速率限制：某些端点的日志每 N 秒只显示一次
-    
-    使用示例：
+    Three modes are supported:
+    1. full suppression: logs for certain endpoints are never shown
+    2. success-only suppression: logs for certain endpoints are hidden only when
+       the record carries a 2xx status code (httpx client logs)
+    3. rate limiting: logs for certain endpoints are shown only once every N seconds
+
+    Usage example:
         filter = RateLimitedEndpointFilter(
             suppressed_endpoints=["/health", "/ping"],
             rate_limited_endpoints=["/api/tasks", "/status"],
@@ -582,73 +603,100 @@ class RateLimitedEndpointFilter(logging.Filter):
         )
         logging.getLogger("uvicorn.access").addFilter(filter)
     """
-    
-    DEFAULT_RATE_LIMIT_INTERVAL = 15.0  # 默认15秒
-    
-    def __init__(self, 
+
+    DEFAULT_RATE_LIMIT_INTERVAL = 15.0  # Default: 15 seconds.
+
+    def __init__(self,
                  suppressed_endpoints: list = None,
                  rate_limited_endpoints: list = None,
                  rate_limit_interval: float = None,
-                 rate_limit_message: str = None):
+                 rate_limit_message: str = None,
+                 suppressed_on_success_endpoints: list = None):
         """
-        初始化过滤器
-        
+        Initialize the filter
+
         Args:
-            suppressed_endpoints: 完全抑制的端点列表（日志完全不显示）
-            rate_limited_endpoints: 速率限制的端点列表（每 N 秒显示一次）
-            rate_limit_interval: 速率限制间隔（秒），默认15秒
-            rate_limit_message: 速率限制提示消息，默认 "(此日志每{N}秒显示一次)"
+            suppressed_endpoints: endpoints to suppress entirely (logs never shown)
+            rate_limited_endpoints: endpoints to rate-limit (shown once every N seconds)
+            rate_limit_interval: rate-limit interval in seconds, default 15
+            rate_limit_message: rate-limit hint message, default "(this log is shown every {N} seconds)"
+            suppressed_on_success_endpoints: endpoints whose logs are hidden only
+                when the record's status code is 2xx; other statuses, or records
+                without a readable status code, are still shown
         """
         super().__init__()
         self.suppressed_endpoints = suppressed_endpoints or []
+        self.suppressed_on_success_endpoints = suppressed_on_success_endpoints or []
         self.rate_limited_endpoints = rate_limited_endpoints or []
         self.rate_limit_interval = rate_limit_interval or self.DEFAULT_RATE_LIMIT_INTERVAL
         self.rate_limit_message = rate_limit_message or f"(此日志每{int(self.rate_limit_interval)}秒显示一次)"
         
-        # 记录每个端点的上次日志时间
+        # Track each endpoint's previous log time.
         self._last_log_times = {}
     
     def filter(self, record: logging.LogRecord) -> bool:
         """
-        过滤日志记录
+        Filter a log record
         
         Returns:
-            bool: True 表示显示日志，False 表示抑制日志
+            bool: True to show the log, False to suppress it
         """
         import time
         
-        # WARNING 和 ERROR 级别的日志始终显示
+        # Always display WARNING and ERROR logs.
         if record.levelno > logging.INFO:
             return True
         
         msg = record.getMessage()
         
-        # 检查完全抑制的端点
+        # Check fully suppressed endpoints.
         for endpoint in self.suppressed_endpoints:
             if endpoint in msg:
                 return False
-        
-        # 检查速率限制的端点
+
+        # Check success-only suppressed endpoints.
+        if self.suppressed_on_success_endpoints and self._is_success_status(record):
+            for endpoint in self.suppressed_on_success_endpoints:
+                if endpoint in msg:
+                    return False
+
+        # Check rate-limited endpoints.
         current_time = time.time()
         for endpoint in self.rate_limited_endpoints:
             if endpoint in msg:
                 last_time = self._last_log_times.get(endpoint, 0)
                 if current_time - last_time >= self.rate_limit_interval:
                     self._last_log_times[endpoint] = current_time
-                    # 添加速率限制提示
+                    # Add a rate-limit notice.
                     record.msg = f"{record.msg} {self.rate_limit_message}"
                     return True
                 else:
                     return False
         
         return True
-    
+
+    @staticmethod
+    def _is_success_status(record: logging.LogRecord) -> bool:
+        """Return True only when the record carries a 2xx status code.
+
+        httpx logs ``'HTTP Request: %s %s "%s %d %s"'`` with args
+        ``(method, url, http_version, status_code, reason_phrase)``. Any other
+        shape counts as "unknown" and is never treated as success.
+        """
+        args = record.args
+        if not isinstance(args, tuple) or len(args) != 5:
+            return False
+        status_code = args[3]
+        if isinstance(status_code, bool) or not isinstance(status_code, int):
+            return False
+        return 200 <= status_code < 300
+
     def reset_timer(self, endpoint: str = None):
         """
-        重置计时器
+        Reset timers
         
         Args:
-            endpoint: 要重置的端点，如果为 None 则重置所有
+            endpoint: endpoint to reset; resets all when None
         """
         if endpoint:
             self._last_log_times.pop(endpoint, None)
@@ -658,29 +706,29 @@ class RateLimitedEndpointFilter(logging.Filter):
 
 class ThrottledLogger:
     """
-    带速率限制的日志记录器包装器
+    Rate-limited logger wrapper
     
-    用于业务逻辑中需要速率限制日志的场景
+    For business-logic scenarios that need rate-limited logging
     
-    使用示例:
+    Usage example:
         throttled = ThrottledLogger(logger, interval=15.0)
-        throttled.info("mcp_check", "MCP availability check result: ready")  # 每15秒只记录一次
+        throttled.info("mcp_check", "MCP availability check result: ready")  # logged once every 15s
     """
     
     def __init__(self, logger, interval: float = 15.0):
         """
-        初始化速率限制日志记录器
+        Initialize the rate-limited logger
         
         Args:
-            logger: 原始 logger 实例
-            interval: 速率限制间隔（秒）
+            logger: original logger instance
+            interval: rate-limit interval in seconds
         """
         self._logger = logger
         self._interval = interval
         self._last_log_times = {}
     
     def _should_log(self, key: str) -> bool:
-        """检查是否应该记录日志"""
+        """Check whether the log should be recorded"""
         import time
         current_time = time.time()
         last_time = self._last_log_times.get(key, 0)
@@ -690,31 +738,31 @@ class ThrottledLogger:
         return False
     
     def _format_message(self, msg: str) -> str:
-        """格式化消息，添加速率限制提示"""
+        """Format the message, appending the rate-limit hint"""
         return f"{msg} (此日志每{int(self._interval)}秒显示一次)"
     
     def debug(self, key: str, msg: str, *args, **kwargs):
-        """速率限制的 debug 日志"""
+        """Rate-limited debug log"""
         if self._should_log(key):
             self._logger.debug(self._format_message(msg), *args, **kwargs)
     
     def info(self, key: str, msg: str, *args, **kwargs):
-        """速率限制的 info 日志"""
+        """Rate-limited info log"""
         if self._should_log(key):
             self._logger.info(self._format_message(msg), *args, **kwargs)
     
     def warning(self, key: str, msg: str, *args, **kwargs):
-        """速率限制的 warning 日志"""
+        """Rate-limited warning log"""
         if self._should_log(key):
             self._logger.warning(self._format_message(msg), *args, **kwargs)
     
     def error(self, key: str, msg: str, *args, **kwargs):
-        """速率限制的 error 日志"""
+        """Rate-limited error log"""
         if self._should_log(key):
             self._logger.error(self._format_message(msg), *args, **kwargs)
     
     def reset(self, key: str = None):
-        """重置计时器"""
+        """Reset timers"""
         if key:
             self._last_log_times.pop(key, None)
         else:
@@ -722,21 +770,26 @@ class ThrottledLogger:
 
 
 # =============================================================================
-# 预定义的过滤器配置
+# Predefined filter configurations.
 # =============================================================================
 
-# Main Server 的端点配置
+# Main Server endpoint configuration.
 MAIN_SERVER_SUPPRESSED_ENDPOINTS = [
     "/api/characters/current_catgirl",
     "/api/agent/computer_use/availability",
     "/api/agent/mcp/availability",
     "/api/steam/update-playtime",
+    # OAuth callbacks carry short-lived code/state in the query string.  The
+    # route handles them, but the raw request target must never reach access logs.
+    "/oauth/callback",
+    "/api/card-drop/oauth/callback",
+    "/api/card-drop/steam-callback",
 ]
 
 MAIN_SERVER_RATE_LIMITED_ENDPOINTS = [
 ]
 
-# Agent Server 的端点配置
+# Agent Server endpoint configuration.
 AGENT_SERVER_SUPPRESSED_ENDPOINTS = [
     "/computer_use/availability",
     "/mcp/availability",
@@ -746,7 +799,7 @@ AGENT_SERVER_RATE_LIMITED_ENDPOINTS = [
     "/tasks",
 ]
 
-# HTTPX 客户端的抑制配置
+# HTTPX client suppression configuration.
 HTTPX_SUPPRESSED_PATTERNS = [
     "/computer_use/availability",
     "/mcp/availability",
@@ -759,7 +812,7 @@ HTTPX_SUPPRESSED_PATTERNS = [
     "bandcamp.com",
     # Crawler domains — memes (meme_fetcher.py)
     "imgflip.com",
-    # 2026-04-16: doutub.com 域名易主挂黑产，停用
+    # 2026-04-16: doutub.com changed ownership and hosts illicit services; disable it.
     # "doutub.com",
     "fabiaoqing.com",
     "doutupk.com",
@@ -777,15 +830,25 @@ HTTPX_SUPPRESSED_PATTERNS = [
     "getdaytrends.com",
 ]
 
-# HTTPX 客户端的速率限制配置（每 N 秒显示一次）
+# HTTPX client: hide only 2xx responses; failures still reach the log so an
+# unreachable or erroring peer stays visible.
+HTTPX_SUPPRESSED_ON_SUCCESS_PATTERNS = [
+    # Main Server -> Memory Server knowledge availability heartbeat (every 60s).
+    "/internal/knowledge/availability",
+    # Plugin Server -> Market update check; market_bridge logs its own
+    # "[market-update-check]" line with the status, so the httpx line is a duplicate.
+    "/api/v1/plugins/latest-versions",
+]
+
+# HTTPX client rate limits (display once every N seconds).
 HTTPX_RATE_LIMITED_PATTERNS = [
-    "/mcp",  # MCP 相关请求日志限流
-    "/tasks",  # 任务状态轮询请求限流
+    "/mcp",  # Rate-limit MCP request logs.
+    "/tasks",  # Rate-limit task-status polling requests.
 ]
 
 
 def create_main_server_filter() -> RateLimitedEndpointFilter:
-    """创建 Main Server 的日志过滤器"""
+    """Create the Main Server log filter"""
     return RateLimitedEndpointFilter(
         suppressed_endpoints=MAIN_SERVER_SUPPRESSED_ENDPOINTS,
         rate_limited_endpoints=MAIN_SERVER_RATE_LIMITED_ENDPOINTS,
@@ -794,7 +857,7 @@ def create_main_server_filter() -> RateLimitedEndpointFilter:
 
 
 def create_agent_server_filter() -> RateLimitedEndpointFilter:
-    """创建 Agent Server 的日志过滤器"""
+    """Create the Agent Server log filter"""
     return RateLimitedEndpointFilter(
         suppressed_endpoints=AGENT_SERVER_SUPPRESSED_ENDPOINTS,
         rate_limited_endpoints=AGENT_SERVER_RATE_LIMITED_ENDPOINTS,
@@ -803,19 +866,38 @@ def create_agent_server_filter() -> RateLimitedEndpointFilter:
 
 
 def create_httpx_filter() -> RateLimitedEndpointFilter:
-    """创建 HTTPX 客户端的日志过滤器"""
+    """Create the HTTPX client log filter"""
     return RateLimitedEndpointFilter(
         suppressed_endpoints=HTTPX_SUPPRESSED_PATTERNS,
+        suppressed_on_success_endpoints=HTTPX_SUPPRESSED_ON_SUCCESS_PATTERNS,
         rate_limited_endpoints=HTTPX_RATE_LIMITED_PATTERNS,
         rate_limit_interval=15.0
     )
 
 
-def _ensure_shared_parent_logger(config, service_logger):
-    """为 APP_NAME 父 logger 挂载与服务 logger 相同的 handler。
+_HTTPX_FILTER_MARKER = "_neko_httpx_filter_installed"
 
-    每个进程只配置一次（幂等）。这样 get_module_logger(__name__)（不带 service_name）
-    创建的共享 logger（如 N.E.K.O.utils.xxx）也能正确写入日志文件。
+
+def install_httpx_filter() -> None:
+    """Attach the HTTPX client filter to the ``httpx`` logger once per process.
+
+    Several services can share one process (launcher merged mode, the plugin
+    server embedded in the Agent Server), and each may reach this call; the
+    marker keeps a single filter instance so rate-limit state is not split.
+    """
+    httpx_logger = logging.getLogger("httpx")
+    if getattr(httpx_logger, _HTTPX_FILTER_MARKER, False):
+        return
+    httpx_logger.addFilter(create_httpx_filter())
+    setattr(httpx_logger, _HTTPX_FILTER_MARKER, True)
+
+
+def _ensure_shared_parent_logger(config, service_logger):
+    """Attach the same handlers as the service logger to the APP_NAME parent logger.
+
+    Configured only once per process (idempotent). This way shared loggers created by
+    get_module_logger(__name__) (without service_name), like N.E.K.O.utils.xxx, also
+    write to the log files correctly.
     """
     app_logger = logging.getLogger(config.app_name)
     if app_logger.handlers:
@@ -827,21 +909,21 @@ def _ensure_shared_parent_logger(config, service_logger):
 
 
 def get_module_logger(module_name: str, service_name: str = None) -> logging.Logger:
-    """获取绑定到指定服务日志文件的模块级 logger。
+    """Get a module-level logger bound to the given service's log file.
 
-    通过 Python logging 的层级传播机制，子 logger 自动继承父 logger 的
-    file handler，无需为每个模块单独配置。
+    Via Python logging's hierarchical propagation, child loggers automatically inherit
+    the parent logger's file handler — no per-module configuration needed.
 
     Args:
-        module_name: 模块名，通常传 __name__。
-        service_name: 所属服务名（如 "Main", "Agent", "Memory"）。
-                      如果为 None，创建共享 logger（挂在 APP_NAME 下）。
+        module_name: module name, usually __name__.
+        service_name: owning service name (e.g. "Main", "Agent", "Memory").
+                      When None, creates a shared logger (under APP_NAME).
 
     Examples:
-        # 属于 Main 服务的模块
+        # a module belonging to the Main service
         logger = get_module_logger(__name__, "Main")   # → N.E.K.O.Main.main_logic.core
 
-        # 跨服务共享的工具模块
+        # a utility module shared across services
         logger = get_module_logger(__name__)            # → N.E.K.O.utils.config_manager
     """
     if service_name:
@@ -849,31 +931,33 @@ def get_module_logger(module_name: str, service_name: str = None) -> logging.Log
     return logging.getLogger(f"{APP_NAME}.{module_name}")
 
 
-# 导出主要接口
+# Export primary interfaces.
 __all__ = [
     'RobustLoggerConfig', 
     'EnhancedLogger', 
     'setup_logging',
     'get_module_logger',
-    # 速率限制相关
+    # Rate limiting.
     'RateLimitedEndpointFilter',
     'ThrottledLogger',
-    # 预定义配置
+    # Predefined configurations.
     'MAIN_SERVER_SUPPRESSED_ENDPOINTS',
     'MAIN_SERVER_RATE_LIMITED_ENDPOINTS',
     'AGENT_SERVER_SUPPRESSED_ENDPOINTS',
     'AGENT_SERVER_RATE_LIMITED_ENDPOINTS',
     'HTTPX_SUPPRESSED_PATTERNS',
+    'HTTPX_SUPPRESSED_ON_SUCCESS_PATTERNS',
     'HTTPX_RATE_LIMITED_PATTERNS',
-    # 工厂函数
+    # Factory functions.
     'create_main_server_filter',
     'create_agent_server_filter',
     'create_httpx_filter',
+    'install_httpx_filter',
 ]
 
 
 if __name__ == "__main__":
-    # 测试代码
+    # Test code.
     logger, config = setup_logging("TestApp")
     
     logger.debug("这是一条debug消息")

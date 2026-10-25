@@ -20,13 +20,16 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
+import main_routers.config_router as config_router
 from main_routers.config_router import (
     ConnectivityTestRequest,
     ConnectivityTestResponse,
     _auto_resolve_provider_urls_for_save,
     _get_save_provider_api_key,
     _test_openai_compatible,
+    _test_anthropic,
     _test_websocket,
+    _test_vllm_omni_ws_handshake,
     _classify_openai_error,
     test_connectivity as _endpoint_test_connectivity,
 )
@@ -64,9 +67,11 @@ class TestSchemaValidation:
             url="wss://realtime.example.com",
             api_key="sk-ws-key",
             provider_type="websocket",
+            voice_id="S_test",
             is_free=True,
         )
         assert req.provider_type == "websocket"
+        assert req.voice_id == "S_test"
         assert req.is_free is True
 
     def test_request_model_defaults(self):
@@ -100,7 +105,7 @@ class TestSchemaValidation:
     async def test_endpoint_allows_empty_api_key_for_keyless_services(self):
         """Empty api_key is allowed for local/keyless services (Decision 15)."""
         with patch(
-            "main_routers.config_router._test_openai_compatible",
+            "main_routers.config_router.connectivity._test_openai_compatible",
             new_callable=AsyncMock,
             return_value={"success": True},
         ) as mock_http:
@@ -119,7 +124,7 @@ class TestSchemaValidation:
     async def test_endpoint_allows_whitespace_api_key_for_keyless_services(self):
         """Whitespace-only api_key is stripped and allowed for keyless services (Decision 15)."""
         with patch(
-            "main_routers.config_router._test_openai_compatible",
+            "main_routers.config_router.connectivity._test_openai_compatible",
             new_callable=AsyncMock,
             return_value={"success": True},
         ) as mock_http:
@@ -131,7 +136,7 @@ class TestSchemaValidation:
     async def test_endpoint_routes_to_openai_compatible_by_default(self):
         """Default provider_type routes to _test_openai_compatible (Req 1.1)."""
         with patch(
-            "main_routers.config_router._test_openai_compatible",
+            "main_routers.config_router.connectivity._test_openai_compatible",
             new_callable=AsyncMock,
             return_value={"success": True},
         ) as mock_http:
@@ -145,7 +150,7 @@ class TestSchemaValidation:
     async def test_endpoint_routes_to_websocket_when_specified(self):
         """provider_type='websocket' routes to _test_websocket (Req 1.1, 1.3)."""
         with patch(
-            "main_routers.config_router._test_websocket",
+            "main_routers.config_router.connectivity._test_websocket",
             new_callable=AsyncMock,
             return_value={"success": True},
         ) as mock_ws:
@@ -158,8 +163,47 @@ class TestSchemaValidation:
             mock_ws.assert_awaited_once()
             assert result["success"] is True
 
+    async def test_anthropic_connectivity_sets_kimi_code_user_agent(self, monkeypatch):
+        captured = {}
+
+        class FakeChatAnthropic:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+            async def ainvoke(self, messages):
+                captured["messages"] = messages
+                return MagicMock(content="ok")
+
+            async def aclose(self):
+                captured["closed"] = True
+
+        monkeypatch.setattr("utils.llm_client.ChatAnthropic", FakeChatAnthropic)
+
+        result = await _test_anthropic(
+            "https://api.kimi.com/coding",
+            "sk-test",
+            model="kimi-for-coding",
+        )
+
+        assert result["success"] is True
+        assert captured["default_headers"]["User-Agent"] == "claude-code/0.1.0"
+        assert captured["closed"] is True
+
+    async def test_anthropic_connectivity_requires_model_for_non_kimi_endpoint(self, monkeypatch):
+        constructor = MagicMock()
+        monkeypatch.setattr("utils.llm_client.ChatAnthropic", constructor)
+
+        result = await _test_anthropic(
+            "https://api.anthropic.com",
+            "sk-test",
+            model="",
+        )
+
+        assert result == {"success": False, "error": "缺少模型 ID", "error_code": "missing_params"}
+        constructor.assert_not_called()
+
     async def test_builtin_assist_accepts_any_successful_candidate_url(self):
-        """内置辅助 provider 有多个候选 URL 时，任一通过即返回可用 URL。"""
+        """With multiple built-in assist-provider URL candidates, any successful candidate returns an available URL."""
         calls = []
 
         async def fake_test(url, api_key, model="gpt-3.5-turbo", is_free=False):
@@ -183,7 +227,7 @@ class TestSchemaValidation:
         }
 
         with patch("utils.api_config_loader.get_config", return_value=fake_config), patch(
-            "main_routers.config_router._test_openai_compatible",
+            "main_routers.config_router.connectivity._test_openai_compatible",
             side_effect=fake_test,
         ):
             req = ConnectivityTestRequest(
@@ -197,8 +241,168 @@ class TestSchemaValidation:
         assert result["resolved_url"] == "https://dashscope-us.aliyuncs.com/compatible-mode/v1"
         assert "https://dashscope-us.aliyuncs.com/compatible-mode/v1" in calls
 
+    async def test_builtin_assist_infers_anthropic_probe_from_url(self):
+        """Built-in Anthropic URLs without provider_type still use the Anthropic probe."""
+        fake_config = {
+            "assist_api_providers": {
+                "claude": {
+                    "name": "Claude",
+                    "openrouter_url": "https://api.anthropic.com/v1",
+                    "conversation_model": "claude-sonnet-test",
+                }
+            }
+        }
+
+        with patch("utils.api_config_loader.get_config", return_value=fake_config), patch(
+            "main_routers.config_router.connectivity._test_anthropic",
+            new=AsyncMock(return_value={"success": True}),
+        ) as mock_anthropic, patch(
+            "main_routers.config_router.connectivity._test_openai_compatible",
+            new=AsyncMock(return_value={"success": True}),
+        ) as mock_openai:
+            req = ConnectivityTestRequest(
+                provider_key="claude",
+                provider_scope="assist",
+                api_key="sk-anthropic",
+            )
+            result = await _endpoint_test_connectivity(req)
+
+        assert result["success"] is True
+        mock_anthropic.assert_awaited_once_with(
+            "https://api.anthropic.com/v1",
+            "sk-anthropic",
+            model="claude-sonnet-test",
+            is_free=False,
+        )
+        mock_openai.assert_not_awaited()
+
+    async def test_builtin_assist_keeps_kimi_coding_v1_on_openai_probe(self):
+        """Kimi's documented /coding/v1 OpenAI-compatible URL must not be treated as Messages API."""
+        fake_config = {
+            "assist_api_providers": {
+                "kimi_code": {
+                    "name": "Kimi Code",
+                    "openrouter_url": "https://api.kimi.com/coding/v1",
+                    "conversation_model": "kimi-for-coding",
+                }
+            }
+        }
+
+        with patch("utils.api_config_loader.get_config", return_value=fake_config), patch(
+            "main_routers.config_router.connectivity._test_anthropic",
+            new=AsyncMock(return_value={"success": True}),
+        ) as mock_anthropic, patch(
+            "main_routers.config_router.connectivity._test_openai_compatible",
+            new=AsyncMock(return_value={"success": True}),
+        ) as mock_openai:
+            req = ConnectivityTestRequest(
+                provider_key="kimi_code",
+                provider_scope="assist",
+                api_key="sk-kimi",
+            )
+            result = await _endpoint_test_connectivity(req)
+
+        assert result["success"] is True
+        mock_openai.assert_awaited_once_with(
+            "https://api.kimi.com/coding/v1",
+            "sk-kimi",
+            model="kimi-for-coding",
+            is_free=False,
+        )
+        mock_anthropic.assert_not_awaited()
+
+    async def test_builtin_mimo_assist_accepts_token_plan_url_override(self):
+        """MiMo Token Plan may override the built-in MiMo assist endpoint."""
+        calls = []
+
+        async def fake_test(url, api_key, model="gpt-3.5-turbo", is_free=False):
+            calls.append((url, api_key, model))
+            return {"success": True}
+
+        fake_config = {
+            "assist_api_providers": {
+                "mimo": {
+                    "name": "MiMo",
+                    "openrouter_url": "https://api.xiaomimimo.com/v1",
+                    "conversation_model": "mimo-v2.5",
+                }
+            }
+        }
+
+        with patch("utils.api_config_loader.get_config", return_value=fake_config), patch(
+            "main_routers.config_router.connectivity._test_openai_compatible",
+            side_effect=fake_test,
+        ):
+            req = ConnectivityTestRequest(
+                provider_key="mimo",
+                provider_scope="assist",
+                url="https://token-plan-sgp.xiaomimimo.com/v1",
+                api_key="tp-token-plan",
+            )
+            result = await _endpoint_test_connectivity(req)
+
+        assert result["success"] is True
+        assert result["resolved_url"] == "https://token-plan-sgp.xiaomimimo.com/v1"
+        assert calls == [("https://token-plan-sgp.xiaomimimo.com/v1", "tp-token-plan", "mimo-v2.5")]
+
+    async def test_builtin_non_mimo_assist_rejects_token_plan_url_override(self):
+        """MiMo Token Plan override must not affect other built-in assist APIs."""
+        fake_config = {
+            "assist_api_providers": {
+                "qwen": {
+                    "name": "Qwen",
+                    "openrouter_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                    "conversation_model": "qwen-plus",
+                }
+            }
+        }
+
+        with patch("utils.api_config_loader.get_config", return_value=fake_config), patch(
+            "main_routers.config_router.connectivity._test_openai_compatible",
+            new_callable=AsyncMock,
+        ) as mock_http:
+            req = ConnectivityTestRequest(
+                provider_key="qwen",
+                provider_scope="assist",
+                url="https://token-plan-sgp.xiaomimimo.com/v1",
+                api_key="sk-qwen",
+            )
+            result = await _endpoint_test_connectivity(req)
+
+        mock_http.assert_not_awaited()
+        assert result["success"] is False
+        assert result["error_code"] == "missing_params"
+
+    async def test_builtin_mimo_assist_rejects_plain_http_token_plan_url(self):
+        """A Token Plan host over plain HTTP is not a valid override."""
+        fake_config = {
+            "assist_api_providers": {
+                "mimo": {
+                    "name": "MiMo",
+                    "openrouter_url": "https://api.xiaomimimo.com/v1",
+                    "conversation_model": "mimo-v2.5",
+                }
+            }
+        }
+
+        with patch("utils.api_config_loader.get_config", return_value=fake_config), patch(
+            "main_routers.config_router.connectivity._test_openai_compatible",
+            new_callable=AsyncMock,
+        ) as mock_http:
+            req = ConnectivityTestRequest(
+                provider_key="mimo",
+                provider_scope="assist",
+                url="http://token-plan-sgp.xiaomimimo.com/v1",
+                api_key="tp-token-plan",
+            )
+            result = await _endpoint_test_connectivity(req)
+
+        mock_http.assert_not_awaited()
+        assert result["success"] is False
+        assert result["error_code"] == "missing_params"
+
     async def test_builtin_core_accepts_any_successful_candidate_url(self):
-        """内置核心 provider 若配置多个候选 URL，任一通过即返回可用 URL。"""
+        """With multiple built-in core-provider URL candidates, any successful candidate returns an available URL."""
         calls = []
 
         async def fake_test(url, api_key, model=""):
@@ -222,7 +426,7 @@ class TestSchemaValidation:
         }
 
         with patch("utils.api_config_loader.get_config", return_value=fake_config), patch(
-            "main_routers.config_router._test_websocket",
+            "main_routers.config_router.connectivity._test_websocket",
             side_effect=fake_test,
         ):
             req = ConnectivityTestRequest(
@@ -237,7 +441,7 @@ class TestSchemaValidation:
         assert calls[-1][1] == "sk-region-key"
 
     async def test_save_auto_resolve_core_prefers_provider_keybook_key(self):
-        """核心 provider 有专属 Key 时，保存前检测优先使用专属 Key 而非旧 coreApiKey。"""
+        """Pre-save connectivity checks prefer a dedicated core-provider key over old coreApiKey when configured."""
         calls = []
 
         async def fake_test(url, api_key, model=""):
@@ -271,7 +475,7 @@ class TestSchemaValidation:
         }
 
         with patch("utils.api_config_loader.get_config", return_value=fake_config), patch(
-            "main_routers.config_router._test_websocket",
+            "main_routers.config_router.connectivity._test_websocket",
             side_effect=fake_test,
         ):
             result = await _auto_resolve_provider_urls_for_save(core_cfg)
@@ -281,7 +485,7 @@ class TestSchemaValidation:
         assert _get_save_provider_api_key(core_cfg, fake_config, "qwen_intl") == "sk-intl-key"
 
     async def test_save_auto_resolves_builtin_candidate_url(self):
-        """保存配置时会自动检测候选 URL，并写入通过的 URL。"""
+        """Saving configuration automatically probes URL candidates and persists the successful URL."""
         calls = []
 
         async def fake_test(url, api_key, model="gpt-3.5-turbo", is_free=False):
@@ -317,7 +521,7 @@ class TestSchemaValidation:
         }
 
         with patch("utils.api_config_loader.get_config", return_value=fake_config), patch(
-            "main_routers.config_router._test_openai_compatible",
+            "main_routers.config_router.connectivity._test_openai_compatible",
             side_effect=fake_test,
         ):
             result = await _auto_resolve_provider_urls_for_save(core_cfg)
@@ -329,7 +533,7 @@ class TestSchemaValidation:
         assert calls[-1][1] == "sk-intl"
 
     async def test_save_auto_resolve_reuses_frontend_checked_url(self):
-        """前端本轮已检测通过的 URL 会被复用，避免保存时重复检测。"""
+        """Reuse URLs already validated by the frontend this round to avoid duplicate probing on save."""
         fake_config = {
             "core_api_providers": {},
             "assist_api_providers": {
@@ -356,7 +560,7 @@ class TestSchemaValidation:
         }
 
         with patch("utils.api_config_loader.get_config", return_value=fake_config), patch(
-            "main_routers.config_router._test_openai_compatible",
+            "main_routers.config_router.connectivity._test_openai_compatible",
             new_callable=AsyncMock,
         ) as mock_test:
             result = await _auto_resolve_provider_urls_for_save(
@@ -369,7 +573,7 @@ class TestSchemaValidation:
         assert core_cfg["resolvedProviderUrls"]["assist:qwen_intl"] == "https://dashscope-us.aliyuncs.com/compatible-mode/v1"
 
     async def test_save_auto_resolve_drops_stale_url_when_detection_fails(self):
-        """保存前检测失败时不能继续保留旧的地域 URL。"""
+        """Failed pre-save probes must not retain old regional URLs."""
         fake_config = {
             "core_api_providers": {},
             "assist_api_providers": {
@@ -399,7 +603,7 @@ class TestSchemaValidation:
         }
 
         with patch("utils.api_config_loader.get_config", return_value=fake_config), patch(
-            "main_routers.config_router._test_openai_compatible",
+            "main_routers.config_router.connectivity._test_openai_compatible",
             new_callable=AsyncMock,
             return_value={"success": False, "error": "auth_failed", "error_code": "auth_failed"},
         ):
@@ -410,9 +614,9 @@ class TestSchemaValidation:
         assert core_cfg["resolvedProviderUrls"] == {}
 
     async def test_save_auto_resolve_keeps_unrelated_when_target_fails(self):
-        """target 测失败时丢掉它自己的旧 resolved，但不该误伤同一份 dict 里
-        其它 provider 的记忆。覆盖 CodeRabbit #3258131687 (失败丢旧值) 和
-        Codex #3258589662 (保留无关 provider) 的组合语义。
+        """When a target probe fails, drop its own old resolved value without harming other providers' remembered values
+        in the same dictionary. Combines CodeRabbit #3258131687 (drop failed old values) and
+        Codex #3258589662 (preserve unrelated providers).
         """
         fake_config = {
             "core_api_providers": {},
@@ -442,7 +646,7 @@ class TestSchemaValidation:
         }
 
         with patch("utils.api_config_loader.get_config", return_value=fake_config), patch(
-            "main_routers.config_router._test_openai_compatible",
+            "main_routers.config_router.connectivity._test_openai_compatible",
             new_callable=AsyncMock,
             return_value={"success": False, "error": "auth_failed", "error_code": "auth_failed"},
         ):
@@ -454,11 +658,11 @@ class TestSchemaValidation:
         }
 
     async def test_save_auto_resolve_skips_assist_provider_with_empty_key(self):
-        """assist provider 的 key 缺失时不应该回退到 coreApiKey 去 probe：
-        core/assist 是不同 provider 时 coreApiKey 是 OpenAI 的，拿去打 qwen_intl
-        必然 401 → 误判失败 → 顺手 pop 掉之前测通的 region pin
-        (Codex P2 #3258802582)。target 应该被 _build_save_connectivity_targets
-        过滤掉，resolved 旧值保留。
+        """Missing assist-provider keys must not fall back to coreApiKey for probing:
+        with different core/assist providers, OpenAI's coreApiKey sent to qwen_intl
+        inevitably returns 401, causing a false failure and removal of a previously working regional pin
+        (Codex P2 #3258802582). _build_save_connectivity_targets should filter the target,
+        preserving the old resolved value.
         """
         fake_config = {
             "core_api_providers": {},
@@ -487,7 +691,7 @@ class TestSchemaValidation:
         }
 
         with patch("utils.api_config_loader.get_config", return_value=fake_config), patch(
-            "main_routers.config_router._test_openai_compatible",
+            "main_routers.config_router.connectivity._test_openai_compatible",
             new_callable=AsyncMock,
         ) as mock_test:
             result = await _auto_resolve_provider_urls_for_save(core_cfg)
@@ -499,8 +703,8 @@ class TestSchemaValidation:
         }
 
     async def test_save_auto_resolve_keeps_unrelated_resolved_when_no_targets(self):
-        """没有候选目标时保留历史 resolved URL：本次 save 没动 qwen_intl，
-        别把 CosyVoice intl runtime 还要用的 US 端点记忆顺手清掉
+        """Preserve historical resolved URLs when no target candidates exist: this save did not change qwen_intl,
+        so do not clear the US endpoint remembered for CosyVoice international runtime.
         (Codex P1 #3258589662)。
         """
         core_cfg = {
@@ -930,7 +1134,7 @@ class TestConcurrency:
             return {"success": True}
 
         with patch(
-            "main_routers.config_router._test_openai_compatible",
+            "main_routers.config_router.connectivity._test_openai_compatible",
             side_effect=mock_test_openai,
         ):
             requests = [
@@ -958,7 +1162,7 @@ class TestConcurrency:
             return {"success": True}
 
         with patch(
-            "main_routers.config_router._test_websocket",
+            "main_routers.config_router.connectivity._test_websocket",
             side_effect=mock_test_ws,
         ):
             requests = [
@@ -989,11 +1193,11 @@ class TestConcurrency:
 
         with (
             patch(
-                "main_routers.config_router._test_openai_compatible",
+                "main_routers.config_router.connectivity._test_openai_compatible",
                 side_effect=mock_test_openai,
             ),
             patch(
-                "main_routers.config_router._test_websocket",
+                "main_routers.config_router.connectivity._test_websocket",
                 side_effect=mock_test_ws,
             ),
         ):
@@ -1029,7 +1233,7 @@ class TestConcurrency:
             return {"success": True}
 
         with patch(
-            "main_routers.config_router._test_openai_compatible",
+            "main_routers.config_router.connectivity._test_openai_compatible",
             side_effect=mock_test_openai,
         ):
             requests = [
@@ -1066,7 +1270,7 @@ class TestEndpointExceptionHandling:
     async def test_unexpected_exception_returns_unknown(self):
         """If the helper raises an unexpected exception, endpoint returns unknown."""
         with patch(
-            "main_routers.config_router._test_openai_compatible",
+            "main_routers.config_router.connectivity._test_openai_compatible",
             new_callable=AsyncMock,
             side_effect=RuntimeError("totally unexpected"),
         ):
@@ -1081,7 +1285,7 @@ class TestEndpointExceptionHandling:
     async def test_provider_type_case_insensitive(self):
         """provider_type is case-insensitive (e.g. 'WebSocket' → websocket)."""
         with patch(
-            "main_routers.config_router._test_websocket",
+            "main_routers.config_router.connectivity._test_websocket",
             new_callable=AsyncMock,
             return_value={"success": True},
         ) as mock_ws:
@@ -1097,7 +1301,7 @@ class TestEndpointExceptionHandling:
     async def test_is_free_passed_to_openai_compatible(self):
         """is_free flag is forwarded to _test_openai_compatible."""
         with patch(
-            "main_routers.config_router._test_openai_compatible",
+            "main_routers.config_router.connectivity._test_openai_compatible",
             new_callable=AsyncMock,
             return_value={"success": True},
         ) as mock_http:
@@ -1111,3 +1315,277 @@ class TestEndpointExceptionHandling:
             mock_http.assert_awaited_once_with(
                 "https://api.example.com/v1", "sk-free", model="gpt-3.5-turbo", is_free=True
             )
+
+
+# ===========================================================================
+# 12. vLLM-Omni TTS handshake-only probe (#1764 review round 6).
+#     Verify sub_type='vllm_omni_tts' sends no OpenAI Realtime session.update.
+# ===========================================================================
+
+class TestVllmOmniWsHandshake:
+    """vLLM-Omni's /v1/audio/speech/stream uses the Qwen custom protocol
+    (session.config / input.text / input.done) and does not understand the
+    OpenAI Realtime session.update message. _test_vllm_omni_ws_handshake only
+    performs the WebSocket handshake and immediately closes — it never sends
+    any application-layer frame."""
+
+    async def test_handshake_succeeds_without_sending_session_update(self):
+        """Handshake succeeds and ws.send is never called (core assertion: no session.update)."""
+        mock_conn = AsyncMock()
+        mock_conn.__aenter__ = AsyncMock(return_value=mock_conn)
+        mock_conn.__aexit__ = AsyncMock(return_value=False)
+        mock_conn.send = AsyncMock()
+        mock_conn.recv = AsyncMock()
+
+        with patch("websockets.connect", return_value=mock_conn):
+            result = await _test_vllm_omni_ws_handshake(
+                "ws://10.0.1.92:8091/v1/audio/speech/stream", ""
+            )
+
+        assert result["success"] is True
+        # Key assertion: handshake probes never send application frames (session.update or any send).
+        mock_conn.send.assert_not_called()
+        mock_conn.recv.assert_not_called()
+
+    async def test_handshake_with_api_key_sets_authorization_header(self):
+        """When api_key is provided, the Authorization header is set (matches _test_websocket behaviour)."""
+        mock_conn = AsyncMock()
+        mock_conn.__aenter__ = AsyncMock(return_value=mock_conn)
+        mock_conn.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("websockets.connect", return_value=mock_conn) as mock_connect:
+            await _test_vllm_omni_ws_handshake(
+                "ws://10.0.1.92:8091/v1/audio/speech/stream", "sk-test"
+            )
+            headers = mock_connect.call_args[1].get("additional_headers", {})
+            assert headers.get("Authorization") == "Bearer sk-test"
+
+    async def test_handshake_empty_api_key_no_authorization_header(self):
+        """When api_key is empty, no Authorization header is sent (vLLM self-hosted deployments commonly run without auth)."""
+        mock_conn = AsyncMock()
+        mock_conn.__aenter__ = AsyncMock(return_value=mock_conn)
+        mock_conn.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("websockets.connect", return_value=mock_conn) as mock_connect:
+            await _test_vllm_omni_ws_handshake(
+                "ws://10.0.1.92:8091/v1/audio/speech/stream", ""
+            )
+            headers = mock_connect.call_args[1].get("additional_headers", {})
+            assert "Authorization" not in headers
+
+    async def test_handshake_url_passed_through_unchanged(self):
+        """URL is passed through unchanged; unlike _test_websocket it does NOT append a ?model= query parameter."""
+        mock_conn = AsyncMock()
+        mock_conn.__aenter__ = AsyncMock(return_value=mock_conn)
+        mock_conn.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("websockets.connect", return_value=mock_conn) as mock_connect:
+            await _test_vllm_omni_ws_handshake(
+                "ws://10.0.1.92:8091/v1/audio/speech/stream", "sk-test"
+            )
+            ws_url = mock_connect.call_args[0][0]
+            assert ws_url == "ws://10.0.1.92:8091/v1/audio/speech/stream"
+            assert "?model=" not in ws_url
+
+    async def test_handshake_auth_failed_401(self):
+        """A 401 during handshake → auth_failed (matches _test_websocket's error_code)."""
+        exc = Exception("HTTP 401")
+        exc.status_code = 401
+        with patch("websockets.connect", side_effect=exc):
+            result = await _test_vllm_omni_ws_handshake(
+                "ws://example.com/v1/audio/speech/stream", "wrong-key"
+            )
+
+        assert result["success"] is False
+        assert result["error_code"] == "auth_failed"
+
+    async def test_handshake_dns_error(self):
+        """OSError 'getaddrinfo' → dns_error。"""
+        with patch(
+            "websockets.connect",
+            side_effect=OSError("[Errno 11001] getaddrinfo failed"),
+        ):
+            result = await _test_vllm_omni_ws_handshake(
+                "ws://nonexistent.example.com/v1/audio/speech/stream", ""
+            )
+
+        assert result["success"] is False
+        assert result["error_code"] == "dns_error"
+
+    async def test_handshake_connection_refused(self):
+        """OSError 'connection refused' → connection_refused。"""
+        with patch(
+            "websockets.connect",
+            side_effect=OSError("[Errno 111] Connection refused"),
+        ):
+            result = await _test_vllm_omni_ws_handshake(
+                "ws://localhost:9999/v1/audio/speech/stream", ""
+            )
+
+        assert result["success"] is False
+        assert result["error_code"] == "connection_refused"
+
+    async def test_handshake_timeout(self):
+        """asyncio.TimeoutError → timeout。"""
+        with patch("websockets.connect", side_effect=asyncio.TimeoutError()):
+            result = await _test_vllm_omni_ws_handshake(
+                "ws://10.0.1.92:8091/v1/audio/speech/stream", ""
+            )
+
+        assert result["success"] is False
+        assert result["error_code"] == "timeout"
+
+    async def test_endpoint_dispatches_sub_type_to_handshake(self):
+        """End-to-end: sub_type='vllm_omni_tts' must dispatch to
+        _test_vllm_omni_ws_handshake instead of _test_websocket. This is the
+        core contract behind the connectivity-mis-detection fix."""
+        with patch(
+            "main_routers.config_router.connectivity._test_vllm_omni_ws_handshake",
+            new=AsyncMock(return_value={"success": True}),
+        ) as mock_handshake, patch(
+            "main_routers.config_router.connectivity._test_websocket",
+            new=AsyncMock(return_value={"success": True}),
+        ) as mock_realtime_ws:
+            req = ConnectivityTestRequest(
+                url="ws://10.0.1.92:8091/v1/audio/speech/stream",
+                api_key="",
+                model="Qwen3-TTS",
+                provider_type="websocket",
+                sub_type="vllm_omni_tts",
+            )
+            await _endpoint_test_connectivity(req)
+
+        mock_handshake.assert_awaited_once()
+        mock_realtime_ws.assert_not_called()
+
+    async def test_endpoint_dispatches_doubao_tts_probe(self, monkeypatch):
+        captured = {}
+
+        async def fake_probe(url, api_key, model="", voice_id=""):
+            captured.update({
+                "url": url,
+                "api_key": api_key,
+                "model": model,
+                "voice_id": voice_id,
+            })
+            return {"success": True}
+
+        monkeypatch.setattr(
+            "main_routers.config_router.connectivity._test_doubao_tts_connectivity",
+            fake_probe,
+        )
+        with patch(
+            "main_routers.config_router.connectivity._test_openai_compatible",
+            new=AsyncMock(return_value={"success": False}),
+        ) as mock_openai:
+            req = ConnectivityTestRequest(
+                url="https://openspeech.bytedance.com",
+                api_key="ark-test",
+                model="seed-icl-2.0",
+                provider_type="tts",
+                sub_type="doubao_tts",
+                voice_id="S_test",
+            )
+            result = await _endpoint_test_connectivity(req)
+
+        assert result["success"] is True
+        assert captured == {
+            "url": "https://openspeech.bytedance.com",
+            "api_key": "ark-test",
+            "model": "seed-icl-2.0",
+            "voice_id": "S_test",
+        }
+        mock_openai.assert_not_called()
+
+    async def test_endpoint_websocket_without_sub_type_uses_realtime_probe(self):
+        """End-to-end inverse contract: when sub_type is omitted, the request
+        still routes to _test_websocket (the OpenAI Realtime path) so genuine
+        Realtime providers like Qwen Realtime / Step are not hit by mistake."""
+        with patch(
+            "main_routers.config_router.connectivity._test_vllm_omni_ws_handshake",
+            new=AsyncMock(return_value={"success": True}),
+        ) as mock_handshake, patch(
+            "main_routers.config_router.connectivity._test_websocket",
+            new=AsyncMock(return_value={"success": True}),
+        ) as mock_realtime_ws:
+            req = ConnectivityTestRequest(
+                url="wss://realtime.example.com",
+                api_key="sk-test",
+                model="step-audio-2",
+                provider_type="websocket",
+            )
+            await _endpoint_test_connectivity(req)
+
+        mock_realtime_ws.assert_awaited_once()
+        mock_handshake.assert_not_called()
+
+    async def test_handshake_auth_failed_via_invalidstatus_response_status_code(self):
+        """Real websockets >=15 raises InvalidStatus with status code at e.response.status_code,
+        NOT at e.status_code. Production code's second-layer fallback (getattr(e, 'response', None)
+        → getattr(_resp, 'status_code', None)) must catch it. The earlier test (test_handshake_auth_failed_401)
+        used a bare Exception with .status_code attribute and only exercises the FIRST fallback layer."""
+        # Build a fake exception that mimics websockets.exceptions.InvalidStatus shape:
+        # bare attribute lookup `e.status_code` returns None; `e.response.status_code` returns 401.
+        class _FakeResponse:
+            status_code = 401
+
+        class _FakeInvalidStatus(Exception):
+            def __init__(self):
+                super().__init__("server rejected WebSocket connection: HTTP 401")
+                self.response = _FakeResponse()
+
+        with patch("websockets.connect", side_effect=_FakeInvalidStatus()):
+            result = await _test_vllm_omni_ws_handshake(
+                "ws://example.com/v1/audio/speech/stream", "wrong-key"
+            )
+
+        assert result["success"] is False
+        assert result["error_code"] == "auth_failed", (
+            f"Expected auth_failed via InvalidStatus.response.status_code path, got {result}"
+        )
+
+    async def test_handshake_forbidden_via_invalidstatus_403(self):
+        """403 via InvalidStatus.response.status_code → auth_failed (same bucket as 401)."""
+        class _FakeResponse:
+            status_code = 403
+
+        class _FakeInvalidStatus(Exception):
+            def __init__(self):
+                super().__init__("server rejected WebSocket connection: HTTP 403")
+                self.response = _FakeResponse()
+
+        with patch("websockets.connect", side_effect=_FakeInvalidStatus()):
+            result = await _test_vllm_omni_ws_handshake(
+                "ws://example.com/v1/audio/speech/stream", "expired-key"
+            )
+
+        assert result["success"] is False
+        assert result["error_code"] == "auth_failed"
+
+    async def test_endpoint_mode1_ignores_sub_type_injection(self):
+        """Security gating contract: when both provider_key and provider_scope are set (Mode 1
+        built-in provider), sub_type is dropped and Mode 1's resolved provider_type drives the
+        probe. A malicious frontend cannot force handshake-only probe on a non-vllm-omni
+        built-in provider via sub_type injection.
+        (#1764 review round 6 - gating at config_router.py line ~1937-1942)"""
+        with patch(
+            "main_routers.config_router.connectivity._test_vllm_omni_ws_handshake",
+            new=AsyncMock(return_value={"success": True}),
+        ) as mock_handshake, patch(
+            "main_routers.config_router.connectivity._test_websocket",
+            new=AsyncMock(return_value={"success": True}),
+        ) as mock_realtime_ws:
+            # Mode 1 built-in: qwen + scope=core resolves to provider_type="websocket"
+            # from api_providers.json. sub_type='vllm_omni_tts' would be a malicious
+            # injection attempt, but the gating (line 1941-1943) sets sub_type="" for Mode 1.
+            req = ConnectivityTestRequest(
+                provider_key="qwen",
+                provider_scope="core",
+                sub_type="vllm_omni_tts",
+            )
+            await _endpoint_test_connectivity(req)
+
+        # Mode 1 must use _test_websocket regardless of sub_type. Handshake probe must NEVER fire.
+        mock_handshake.assert_not_called()
+        # _test_websocket should be called (Mode 1 resolved provider_type="websocket" from api_providers.json).
+        mock_realtime_ws.assert_awaited_once()

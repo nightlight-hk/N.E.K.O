@@ -3,10 +3,14 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from fastapi import HTTPException
+from plugin.server.infrastructure.error_mapping import http_exception
 
+from plugin.core.plugin_layout import PluginLayout, resolve_plugin_layout
 from plugin.core.state import state
 from plugin.logging_config import get_logger
+from plugin.server.infrastructure.config_access import get_config_access
+from plugin.server.infrastructure.config_locking import get_plugin_update_lock
+from plugin.server.infrastructure.config_storage import atomic_write_bytes
 from plugin.settings import PLUGIN_CONFIG_ROOTS
 
 logger = get_logger("server.infrastructure.config_paths")
@@ -61,8 +65,11 @@ def _resolve_registered_plugin_config_path(plugin_id: str) -> Path | None:
 
 
 def get_plugin_config_path(plugin_id: str) -> Path:
+    snapshot = get_config_access(plugin_id)
+    if snapshot is not None:
+        return snapshot.manifest_path
     if not re.match(r"^[a-zA-Z0-9_-]+$", plugin_id):
-        raise HTTPException(
+        raise http_exception(
             status_code=400,
             detail=(
                 f"Invalid plugin_id: '{plugin_id}'. Only alphanumeric characters, "
@@ -80,7 +87,7 @@ def get_plugin_config_path(plugin_id: str) -> Path:
             resolved_path = config_file.resolve()
             root_resolved = root.resolve()
         except (OSError, RuntimeError, ValueError) as exc:
-            raise HTTPException(
+            raise http_exception(
                 status_code=400,
                 detail=f"Invalid plugin_id: '{plugin_id}'. {str(exc)}",
             ) from exc
@@ -103,7 +110,84 @@ def get_plugin_config_path(plugin_id: str) -> Path:
             )
             return config_file
 
-    raise HTTPException(
+    raise http_exception(
         status_code=404,
         detail=f"Plugin '{plugin_id}' configuration not found",
     )
+
+
+def get_plugin_manifest_path(plugin_id: str) -> Path:
+    """Return the installed payload manifest.
+
+    ``get_plugin_config_path`` remains the compatibility name while callers are
+    migrated away from treating the manifest as writable runtime config.
+    """
+
+    return get_plugin_config_path(plugin_id)
+
+
+def _runtime_layout(
+    plugin_id: str,
+    manifest_path: Path | None,
+) -> PluginLayout:
+    if manifest_path is None:
+        manifest_path = get_plugin_manifest_path(plugin_id)
+    return resolve_plugin_layout(plugin_id, manifest_path.parent)
+
+
+def get_plugin_runtime_config_path(
+    plugin_id: str,
+    *,
+    manifest_path: Path | None = None,
+) -> Path:
+    """Return the runtime path using current installation and storage paths."""
+    return _runtime_layout(plugin_id, manifest_path).config_path
+
+
+def ensure_plugin_runtime_config(
+    plugin_id: str,
+    *,
+    manifest_path: Path | None = None,
+) -> Path:
+    """Initialize runtime config using current installation and storage paths."""
+    layout = _runtime_layout(plugin_id, manifest_path)
+    return ensure_plugin_layout_runtime_config(layout)
+
+
+def ensure_plugin_layout_runtime_config(layout: PluginLayout) -> Path:
+    target = layout.config_path
+    with get_plugin_update_lock(layout.plugin_id):
+        if target.exists():
+            if target.is_file():
+                return target
+            raise http_exception(
+                status_code=500,
+                detail=f"Plugin '{layout.plugin_id}' runtime config path is not a file: {target}",
+            )
+
+        source = layout.installed_dir / "config.example.toml"
+        if not source.is_file():
+            source = layout.manifest_path
+        try:
+            payload = source.read_bytes()
+            target.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_bytes(
+                target=target,
+                payload=payload,
+                prefix=".plugin_config_init_",
+            )
+        except OSError as exc:
+            raise http_exception(
+                status_code=500,
+                detail=f"Failed to initialize runtime config for plugin '{layout.plugin_id}': {exc}",
+            ) from exc
+        return target
+
+
+__all__ = [
+    "get_plugin_config_path",
+    "get_plugin_manifest_path",
+    "get_plugin_runtime_config_path",
+    "ensure_plugin_layout_runtime_config",
+    "ensure_plugin_runtime_config",
+]

@@ -6,7 +6,7 @@ Coverage:
 - Decay math snapshots (effective_reinforcement / effective_disputation
   parametrized over age × value × half-life)
 - Sub-zero accumulation: never resets when score recovers (§3.5.3
-  "归档更积极")
+  \"Archive more aggressively\")
 - protected=True exemption: never accumulates / never archives
 - Sharded append: > ARCHIVE_FILE_MAX_ENTRIES rolls a new shard
 - Legacy flat reflections_archive.json migration: per-day bucketing,
@@ -59,8 +59,8 @@ def _install(tmpdir: str):
     cm = _mock_cm(tmpdir)
     with patch("memory.event_log.get_config_manager", return_value=cm), \
          patch("memory.facts.get_config_manager", return_value=cm), \
-         patch("memory.persona.get_config_manager", return_value=cm), \
-         patch("memory.reflection.get_config_manager", return_value=cm):
+         patch("memory.persona.manager.get_config_manager", return_value=cm), \
+         patch("memory.reflection.manager.get_config_manager", return_value=cm):
         event_log = EventLog()
         event_log._config_manager = cm
         fs = FactStore()
@@ -123,7 +123,7 @@ def test_effective_value_decay_snapshots(func, age_days, value, half_life, expec
 
 
 def test_sub_zero_persists_through_score_oscillation():
-    """RFC §3.5.3 "归档更积极": sub_zero_days never resets even when
+    """RFC §3.5.3 \"Archive more aggressively\": sub_zero_days never resets even when
     score climbs back to >= 0. Exhaustively walks negative→positive→
     negative to lock the invariant."""
     from memory.evidence import maybe_mark_sub_zero
@@ -402,7 +402,7 @@ def test_append_to_shard_sync_stamper_uses_correct_path_per_chunk_on_overflow(
     tmp_path,
 ):
     """Sync twin of the async overflow-stamper test — keeps the symmetry
-    invariant (CLAUDE.md "对偶性是硬性要求")."""
+    invariant (CLAUDE.md \"duality is a hard requirement\")."""
     from memory.archive_shards import _list_shard_files, append_to_shard_sync
 
     archive_dir = str(tmp_path / "ref_arc")
@@ -469,7 +469,7 @@ async def test_age_based_archival_records_have_metadata_on_disk(tmp_path):
 
 def test_age_based_archival_records_have_metadata_on_disk_sync(tmp_path):
     """Sync twin — keeps symmetry between save_reflections /
-    asave_reflections (CLAUDE.md 对偶性)."""
+    asave_reflections (CLAUDE.md duality)."""
     from memory.reflection import _REFLECTION_ARCHIVE_DAYS
 
     _ev, _fs, _pm, re, _rec, _cm = _install(str(tmp_path))
@@ -1488,7 +1488,7 @@ async def test_persona_sync_save_evicts_cache_on_atomic_write_failure(tmp_path):
                 )
         return _real_atomic(path, *args, **kwargs)
 
-    with patch("memory.persona.atomic_write_json",
+    with patch("memory.persona.persistence.atomic_write_json",
                side_effect=_boom_on_second_persona_write):
         with pytest.raises(RuntimeError, match="simulated persona.json"):
             await pm.amerge_into(
@@ -1572,7 +1572,7 @@ async def test_persona_sync_save_evicts_cache_on_cloudsave_gate_raise(tmp_path):
                     "simulated cloudsave readonly on entry_updated save"
                 )
 
-    with patch("memory.persona.assert_cloudsave_writable",
+    with patch("memory.persona.persistence.assert_cloudsave_writable",
                side_effect=_boom_on_second_cloudsave):
         with pytest.raises(RuntimeError, match="simulated cloudsave"):
             await pm.amerge_into(
@@ -1678,7 +1678,7 @@ def test_save_persona_evicts_cache_on_atomic_write_failure(tmp_path):
             raise RuntimeError("simulated atomic_write_json failure")
         return _real_atomic(path, *args, **kwargs)
 
-    with patch("memory.persona.atomic_write_json", side_effect=_boom):
+    with patch("memory.persona.persistence.atomic_write_json", side_effect=_boom):
         with pytest.raises(RuntimeError, match="simulated atomic_write_json"):
             pm.save_persona("小天", _persona_round7_polluted())
 
@@ -1710,7 +1710,7 @@ def test_save_persona_evicts_cache_on_cloudsave_gate_raise(tmp_path):
         if target.endswith("persona.json") and operation == "save":
             raise RuntimeError("simulated cloudsave readonly")
 
-    with patch("memory.persona.assert_cloudsave_writable",
+    with patch("memory.persona.persistence.assert_cloudsave_writable",
                side_effect=_boom_gate):
         with pytest.raises(RuntimeError, match="simulated cloudsave"):
             pm.save_persona("小天", _persona_round7_polluted())
@@ -1743,7 +1743,7 @@ async def test_asave_persona_evicts_cache_on_atomic_write_failure(tmp_path):
             raise RuntimeError("simulated atomic_write_json_async failure")
         return await _real_atomic_a(path, *args, **kwargs)
 
-    with patch("memory.persona.atomic_write_json_async", side_effect=_boom_async):
+    with patch("memory.persona.persistence.atomic_write_json_async", side_effect=_boom_async):
         with pytest.raises(RuntimeError, match="simulated atomic_write_json_async"):
             await pm.asave_persona("小天", _persona_round7_polluted())
 
@@ -1773,7 +1773,7 @@ async def test_asave_persona_evicts_cache_on_cloudsave_gate_raise(tmp_path):
         if target.endswith("persona.json") and operation == "save":
             raise RuntimeError("simulated cloudsave readonly (async)")
 
-    with patch("memory.persona.assert_cloudsave_writable",
+    with patch("memory.persona.persistence.assert_cloudsave_writable",
                side_effect=_boom_gate):
         with pytest.raises(RuntimeError, match="simulated cloudsave"):
             await pm.asave_persona("小天", _persona_round7_polluted())
@@ -1785,3 +1785,315 @@ async def test_asave_persona_evicts_cache_on_cloudsave_gate_raise(tmp_path):
         f"asave_persona (round-7 Major regression): "
         f"got {entry_after['text']!r}"
     )
+
+
+# ── facts archive: two-file commit half-commit regressions (issue #2528) ──
+#
+# `_archive_absorbed` commits two files that cannot be written atomically
+# together: facts_archive.json then facts.json. These tests pin the three
+# properties that make an interrupted commit converge instead of leaving a
+# permanent duplicate: cache follows the durable write, the append is
+# idempotent by id, and the reader collapses the overlap.
+
+
+import contextlib
+import logging
+
+
+class _RecordSink(logging.Handler):
+    def __init__(self):
+        super().__init__(level=logging.DEBUG)
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record):
+        self.records.append(record)
+
+    def at_least(self, level: int) -> list[str]:
+        return [r.getMessage() for r in self.records if r.levelno >= level]
+
+
+@contextlib.contextmanager
+def _capture_logger(name: str):
+    """Collect records straight off the named logger.
+
+    Attaches a handler to the logger itself instead of relying on ``caplog``:
+    the project sets ``propagate=False`` somewhere in its logger hierarchy
+    depending on import order, so propagation-based capture silently records
+    nothing (see the same note in tests/unit/test_callback_instruction_origin.py).
+    """
+    log = logging.getLogger(name)
+    sink = _RecordSink()
+    prior_level = log.level
+    log.addHandler(sink)
+    log.setLevel(logging.DEBUG)
+    try:
+        yield sink
+    finally:
+        log.removeHandler(sink)
+        log.setLevel(prior_level)
+
+
+_FACTS_LOGGER = "N.E.K.O.Memory.memory.facts"
+
+
+def _archive_fact_store(tmpdir: str):
+    from memory.facts import FactStore
+    cm = _mock_cm(tmpdir)
+    with patch("memory.facts.get_config_manager", return_value=cm):
+        fs = FactStore()
+        fs._config_manager = cm
+    return fs
+
+
+def _old_absorbed_fact(tag: str, **extra):
+    old = (datetime.now() - timedelta(days=30)).isoformat()
+    entry = {
+        "id": tag, "text": f"t-{tag}", "importance": 5, "entity": "master",
+        "tags": [], "hash": f"h-{tag}", "created_at": old, "absorbed": True,
+    }
+    entry.update(extra)
+    return entry
+
+
+def _live_fact(fid: str = "live"):
+    return {
+        "id": fid, "text": f"t-{fid}", "importance": 5, "entity": "master",
+        "tags": [], "hash": f"h-{fid}",
+        "created_at": datetime.now().isoformat(), "absorbed": False,
+    }
+
+
+def _ids(rows):
+    return [r.get("id") for r in rows]
+
+
+def _read_json(path):
+    with open(path, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def _fail_facts_json_after_archive():
+    """Patch context: let the archive write through, blow up on facts.json.
+
+    Reproduces the exact interruption point — the second write of the two-file
+    commit — without touching the first (plain `save_facts`) write.
+    """
+    import memory.facts as facts_mod
+    real = facts_mod.atomic_write_json
+    state = {"archive_written": False}
+
+    def _guard(path, data, **kw):
+        text = str(path)
+        if text.endswith("facts_archive.json"):
+            state["archive_written"] = True
+            return real(path, data, **kw)
+        if state["archive_written"] and text.endswith("facts.json"):
+            raise OSError("simulated facts.json write failure")
+        return real(path, data, **kw)
+
+    return patch("memory.facts.atomic_write_json", side_effect=_guard)
+
+
+def test_archive_does_not_touch_cache_until_facts_json_is_durable(tmp_path):
+    fs = _archive_fact_store(str(tmp_path))
+    name = "小天"
+    fs._facts[name] = [
+        _old_absorbed_fact("old1"), _old_absorbed_fact("old2"), _live_fact(),
+    ]
+
+    with _fail_facts_json_after_archive():
+        fs.save_facts(name)  # archive failure must not fail the save itself
+
+    disk = _read_json(fs._facts_path(name))
+    assert _ids(disk) == ["old1", "old2", "live"]
+    # The cache must not move ahead of the durable file: the save_facts eviction fallback covers only the previous try block,
+    # so a fork here would remain alive until restart, then be read as a duplicate.
+    assert _ids(fs._facts[name]) == _ids(disk)
+    assert _ids(_read_json(fs._facts_archive_path(name))) == ["old1", "old2"]
+
+
+def test_archive_keeps_a_fact_appended_during_the_two_file_commit(tmp_path):
+    fs = _archive_fact_store(str(tmp_path))
+    name = "小天"
+    fs._facts[name] = [_old_absorbed_fact("old1"), _live_fact()]
+    newcomer = _live_fact("concurrent")
+
+    import memory.facts as facts_mod
+    real = facts_mod.atomic_write_json
+    state = {"archive_written": False}
+
+    def _guard(path, data, **kw):
+        text = str(path)
+        if text.endswith("facts_archive.json"):
+            state["archive_written"] = True
+        elif state["archive_written"] and text.endswith("facts.json"):
+            # add_facts calls aload_facts and appends directly without holding _get_lock (existing repository convention),
+            # so it can land between these two archive writes.
+            fs._facts[name].append(newcomer)
+        return real(path, data, **kw)
+
+    with patch("memory.facts.atomic_write_json", side_effect=_guard):
+        fs.save_facts(name)
+
+    # Replacing the cache with the active snapshot taken at function entry would erase this new fact too;
+    # filter archived rows by identity to change only the rows that need changing.
+    assert _ids(fs._facts[name]) == ["live", "concurrent"], _ids(fs._facts[name])
+    # This run writes only the snapshot to disk (the new fact is persisted by the next save); archive normally.
+    assert _ids(_read_json(fs._facts_path(name))) == ["live"]
+    assert _ids(_read_json(fs._facts_archive_path(name))) == ["old1"]
+
+
+def test_archive_retry_is_idempotent_by_id(tmp_path):
+    fs = _archive_fact_store(str(tmp_path))
+    name = "小天"
+    fs._facts[name] = [
+        _old_absorbed_fact("old1"), _old_absorbed_fact("old2"), _live_fact(),
+    ]
+    with _fail_facts_json_after_archive():
+        fs.save_facts(name)
+
+    archive_path = fs._facts_archive_path(name)
+    stale = (datetime.now() - timedelta(hours=48)).timestamp()
+    os.utime(archive_path, (stale, stale))
+    os.utime(archive_path + ".last_attempt", (stale, stale))
+
+    # Replace with a fresh store = restart: disk is the sole source of truth.
+    fs2 = _archive_fact_store(str(tmp_path))
+    fs2.load_facts(name)
+    fs2.save_facts(name)
+
+    assert _ids(_read_json(archive_path)) == ["old1", "old2"]
+    assert _ids(_read_json(fs2._facts_path(name))) == ["live"]
+
+
+def test_archive_heals_duplicates_already_on_disk(tmp_path):
+    fs = _archive_fact_store(str(tmp_path))
+    name = "小天"
+    archive_path = fs._facts_archive_path(name)
+    os.makedirs(os.path.dirname(archive_path), exist_ok=True)
+    with open(archive_path, "w", encoding="utf-8") as fh:
+        json.dump([_old_absorbed_fact("old1"), _old_absorbed_fact("old1")], fh)
+    stale = (datetime.now() - timedelta(hours=48)).timestamp()
+    os.utime(archive_path, (stale, stale))
+
+    fs._facts[name] = [_old_absorbed_fact("old2"), _live_fact()]
+    fs.save_facts(name)
+
+    # Catch the incomplete "prevents new duplicates but does not fix existing ones" implementation: filtering incoming IDs against existing ones leaves
+    # the duplicate pair already on disk untouched.
+    assert _ids(_read_json(archive_path)) == ["old1", "old2"]
+
+
+def test_archive_replay_keeps_the_incoming_copy_of_a_duplicate(tmp_path):
+    fs = _archive_fact_store(str(tmp_path))
+    name = "小天"
+    archive_path = fs._facts_archive_path(name)
+    os.makedirs(os.path.dirname(archive_path), exist_ok=True)
+    with open(archive_path, "w", encoding="utf-8") as fh:
+        json.dump([_old_absorbed_fact(
+            "old1", signal_processed=False, note="archived",
+        )], fh)
+    stale = (datetime.now() - timedelta(hours=48)).timestamp()
+    os.utime(archive_path, (stale, stale))
+
+    # Replay that update with a flag absent from the old copy: after a partial commit, the active copy may already have been changed by
+    # If direction reverses to first-wins, the new flag would be written back to its old value (a test with identical row contents cannot detect the direction).
+    #
+    fs._facts[name] = [
+        _old_absorbed_fact("old1", signal_processed=True, note="live"),
+        _live_fact(),
+    ]
+    fs.save_facts(name)
+
+    archived = _read_json(archive_path)
+    assert _ids(archived) == ["old1"]
+    assert archived[0]["signal_processed"] is True, archived[0]
+    assert archived[0]["note"] == "live", archived[0]
+
+
+def test_archive_keeps_every_row_without_a_usable_id(tmp_path):
+    fs = _archive_fact_store(str(tmp_path))
+    name = "小天"
+    fs._facts[name] = [
+        _old_absorbed_fact("old1"),
+        _old_absorbed_fact("ok", id=None),
+        _old_absorbed_fact("ok2", id=""),
+        _live_fact(),
+    ]
+    fs.save_facts(name)
+
+    archived = _read_json(fs._facts_archive_path(name))
+    assert len(archived) == 3, (
+        "rows without a usable id share no key, so folding them together "
+        f"trades a duplicate for data loss: {_ids(archived)}"
+    )
+    assert sorted(r["hash"] for r in archived) == ["h-ok", "h-ok2", "h-old1"]
+
+
+def test_archive_failure_warns_and_touches_the_marker(tmp_path):
+    fs = _archive_fact_store(str(tmp_path))
+    name = "小天"
+    fs._facts[name] = [_old_absorbed_fact("old1"), _live_fact()]
+
+    import memory.facts as facts_mod
+    real = facts_mod.atomic_write_json
+
+    def _guard(path, data, **kw):
+        if str(path).endswith("facts_archive.json"):
+            raise OSError("simulated archive write failure")
+        return real(path, data, **kw)
+
+    with _capture_logger(_FACTS_LOGGER) as sink:
+        with patch("memory.facts.atomic_write_json", side_effect=_guard):
+            fs.save_facts(name)  # Do not roll back unrelated data: facts.json was already persisted successfully
+
+    warnings = sink.at_least(logging.WARNING)
+    assert any("归档失败" in m and name in m for m in warnings), warnings
+    # If archive writing fails, archive mtime is unchanged; without touching the marker, every save would retry the guaranteed-to-fail archive.
+    #
+    assert os.path.exists(fs._facts_archive_path(name) + ".last_attempt")
+    assert _ids(_read_json(fs._facts_path(name))) == ["old1", "live"]
+
+
+def test_maintenance_mode_archive_skip_is_not_warned(tmp_path):
+    from utils.cloudsave_runtime import MaintenanceModeError
+
+    fs = _archive_fact_store(str(tmp_path))
+    name = "小天"
+    fs._facts[name] = [_old_absorbed_fact("old1"), _live_fact()]
+
+    def _gate(_cm, *, operation: str, target: str):
+        if operation == "archive":
+            raise MaintenanceModeError("simulated maintenance")
+
+    with _capture_logger(_FACTS_LOGGER) as sink:
+        with patch("memory.facts.assert_cloudsave_writable", side_effect=_gate):
+            fs.save_facts(name)
+
+    warnings = sink.at_least(logging.WARNING)
+    assert warnings == [], f"maintenance skip is an expected path: {warnings}"
+    # Maintenance mode should not consume the archive window either: touching the marker here would extend the 24h
+    # cooldown on every save, forcing another full day of waiting after maintenance ends.
+    assert not os.path.exists(fs._facts_archive_path(name) + ".last_attempt")
+
+
+def test_load_facts_full_converges_id_overlap_to_the_active_copy(tmp_path):
+    fs = _archive_fact_store(str(tmp_path))
+    name = "小天"
+    facts_path = fs._facts_path(name)
+    with open(facts_path, "w", encoding="utf-8") as fh:
+        json.dump([
+            _old_absorbed_fact("old1", note="active"), _live_fact(),
+        ], fh)
+    with open(fs._facts_archive_path(name), "w", encoding="utf-8") as fh:
+        json.dump([_old_absorbed_fact("old1", note="archived")], fh)
+
+    with _capture_logger(_FACTS_LOGGER) as sink:
+        full = fs.load_facts_full(name)
+
+    ids = _ids(full)
+    assert ids == ["old1", "live"], ids
+    survivor = next(f for f in full if f["id"] == "old1")
+    assert survivor["note"] == "active"
+    warnings = sink.at_least(logging.WARNING)
+    assert any("id 重叠" in m for m in warnings), warnings

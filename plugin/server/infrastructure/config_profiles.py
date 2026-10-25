@@ -4,9 +4,9 @@ import os
 from collections.abc import Mapping
 from pathlib import Path
 
-from fastapi import HTTPException
+from plugin.server.infrastructure.error_mapping import http_exception
 
-from plugin.logging_config import get_logger
+from plugin.logging_config import get_logger, info_once
 from plugin.server.infrastructure.config_merge import deep_merge
 
 logger = get_logger("server.infrastructure.config_profiles")
@@ -101,7 +101,10 @@ def load_profiles_cfg_from_file(
         )
         return None
 
-    logger.info(
+    # Every plugin rescan re-resolves profiles; report each source once per process.
+    info_once(
+        logger,
+        ("config_profiles.using_profiles_toml", str(plugin_id), str(profiles_path)),
         "Plugin {}: using profiles.toml at {} for config_profiles; plugin.toml [plugin.config_profiles] will be ignored",
         plugin_id,
         profiles_path,
@@ -265,7 +268,7 @@ def apply_user_config_profiles(
             plugin_id,
             profile_path,
         )
-        raise HTTPException(
+        raise http_exception(
             status_code=400,
             detail=(
                 f"User profile for plugin '{plugin_id}' must not define a top-level 'plugin' section; "
@@ -288,7 +291,10 @@ def apply_user_config_profiles(
         else:
             merged[key] = value
 
-    logger.info(
+    # Keyed by profile name too, so switching the active profile is reported again.
+    info_once(
+        logger,
+        ("config_profiles.applied_profile", str(plugin_id), str(active_name), str(profile_path)),
         "Plugin {}: applied user config profile '{}' from {}",
         plugin_id,
         active_name,
@@ -303,7 +309,7 @@ def get_profiles_state(
     config_path: Path,
 ) -> dict[str, object]:
     if tomllib is None:
-        raise HTTPException(status_code=500, detail="TOML library not available")
+        raise http_exception(status_code=500, detail="TOML library not available")
 
     base_dir = config_path.parent
     profiles_path = base_dir / "profiles.toml"
@@ -347,9 +353,9 @@ def get_profile_config(
     config_path: Path,
 ) -> dict[str, object]:
     if tomllib is None:
-        raise HTTPException(status_code=500, detail="TOML library not available")
+        raise http_exception(status_code=500, detail="TOML library not available")
     if not profile_name:
-        raise HTTPException(status_code=400, detail="profile_name is required")
+        raise http_exception(status_code=400, detail="profile_name is required")
 
     base_dir = config_path.parent
     profiles_cfg = _resolve_profiles_cfg(plugin_id=plugin_id, config_path=config_path)
@@ -369,7 +375,7 @@ def get_profile_config(
             or "\\" in profile_name
             or profile_name in {".", ".."}
         ):
-            raise HTTPException(status_code=400, detail="Invalid profile_name")
+            raise http_exception(status_code=400, detail="Invalid profile_name")
         raw_path = f"profiles/{profile_name}.toml"
 
     profile_path = resolve_profile_path(raw_path, base_dir)
@@ -392,7 +398,7 @@ def get_profile_config(
                     profile_path,
                     exc,
                 )
-                raise HTTPException(
+                raise http_exception(
                     status_code=400,
                     detail=f"Failed to parse profile '{profile_name}'",
                 ) from exc
@@ -404,7 +410,7 @@ def get_profile_config(
                     profile_path,
                     exc,
                 )
-                raise HTTPException(
+                raise http_exception(
                     status_code=500,
                     detail=f"Failed to read profile '{profile_name}'",
                 ) from exc

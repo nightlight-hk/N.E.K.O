@@ -1,17 +1,31 @@
 # -*- coding: utf-8 -*-
+# Copyright 2025-2026 Project N.E.K.O. Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
-音频静音检测与裁剪工具
+Audio silence detection and trimming tool
 
-功能:
-- 基于 RMS 能量检测算法识别静音段落
-- 将超长静音段缩减至固定时长（从静音段正中间裁剪）
-- 保留静音段首尾边缘以确保自然过渡，不引入相位不连续
-- 保持输出与输入完全一致的技术参数
-- 支持取消操作与进度回调
-- MD5 校验确保数据完整性
+Features:
+- Detects silent segments using an RMS energy detection algorithm
+- Shrinks overlong silent segments to a fixed duration (trimming from the exact middle)
+- Keeps head/tail edges of silent segments for natural transitions, introducing no phase discontinuity
+- Keeps output technical parameters identical to the input
+- Supports cancellation and progress callbacks
+- MD5 checksum ensures data integrity
 
-静音阈值: -40 dBFS 以下且连续持续时间 ≥ 200 ms
-裁剪策略: 每段静音缩减至 200 ms，从正中间执行裁剪
+Silence threshold: below -40 dBFS lasting continuously >= 200 ms
+Trimming strategy: each silent segment is shrunk to 200 ms, trimmed from the exact middle
 """
 
 import io
@@ -26,18 +40,19 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# ─────────────────── 常量 ───────────────────
-SILENCE_THRESHOLD_DBFS = -40.0  # 静音阈值 (dBFS)
-MIN_SILENCE_DURATION_MS = 200   # 最小静音持续时间 (ms)
-RETAINED_SILENCE_MS = 200       # 每段静音裁剪后保留的时长 (ms)
-RMS_FRAME_DURATION_MS = 10      # RMS 计算帧长 (ms)
+# -- Constants --
+SILENCE_THRESHOLD_DBFS = -40.0  # Silence threshold (dBFS).
+MIN_SILENCE_DURATION_MS = 200   # Minimum silence duration (ms).
+RETAINED_SILENCE_MS = 200       # Duration retained after trimming each silence interval (ms).
+RMS_FRAME_DURATION_MS = 10      # RMS analysis frame duration (ms).
+RMS_FLOAT32_RECHECK_MARGIN_DB = 1e-4  # Recheck near-threshold values with float64 to preserve boundary semantics.
 
 
 @dataclass
 class SilenceSegment:
-    """一段被检测到的静音区间"""
-    start_ms: float   # 起始时间 (ms)
-    end_ms: float     # 结束时间 (ms)
+    """A detected silent interval"""
+    start_ms: float   # Start time (ms).
+    end_ms: float     # End time (ms).
 
     @property
     def duration_ms(self) -> float:
@@ -46,13 +61,13 @@ class SilenceSegment:
 
 @dataclass
 class SilenceAnalysisResult:
-    """静音分析结果"""
-    original_duration_ms: float           # 原始音频总时长 (ms)
-    silence_segments: list[SilenceSegment] = field(default_factory=list)  # 所有静音段
-    total_silence_ms: float = 0.0         # 检测到的静音总时长 (ms)
-    removable_silence_ms: float = 0.0     # 实际可移除的静音时长 (ms)
-    estimated_duration_ms: float = 0.0    # 处理后预计剩余时长 (ms)
-    saving_percentage: float = 0.0        # 节省百分比 (基于实际可移除量)
+    """Silence analysis result"""
+    original_duration_ms: float           # Total original audio duration (ms).
+    silence_segments: list[SilenceSegment] = field(default_factory=list)  # All silence intervals.
+    total_silence_ms: float = 0.0         # Total detected silence duration (ms).
+    removable_silence_ms: float = 0.0     # Actually removable silence duration (ms).
+    estimated_duration_ms: float = 0.0    # Expected remaining duration after processing (ms).
+    saving_percentage: float = 0.0        # Percentage saved, based on actually removable duration.
     sample_rate: int = 0
     sample_width: int = 0                 # bytes
     channels: int = 0
@@ -60,9 +75,9 @@ class SilenceAnalysisResult:
 
 @dataclass
 class TrimResult:
-    """裁剪处理结果"""
-    audio_data: bytes           # 处理后的音频二进制数据 (WAV)
-    md5: str                    # MD5 校验值
+    """Trim processing result"""
+    audio_data: bytes           # Processed audio bytes (WAV).
+    md5: str                    # MD5 checksum.
     original_duration_ms: float
     trimmed_duration_ms: float
     removed_silence_ms: float
@@ -73,46 +88,51 @@ class TrimResult:
 
 
 class SilenceRemovalCancelledError(Exception):
-    """任务被用户取消"""
+    """Task cancelled by the user"""
     pass
 
 
-# 兼容别名，避免破坏现有调用方
+# Compatibility alias to preserve existing callers.
 CancelledError = SilenceRemovalCancelledError
 
 
-def _samples_to_float(data: bytes, sample_width: int) -> np.ndarray:
-    """将原始 PCM bytes 转为 float64 numpy 数组 (范围 -1.0 ~ 1.0)"""
+def _samples_to_float(
+    data: bytes | memoryview,
+    sample_width: int,
+    dtype=np.float32,
+) -> np.ndarray:
+    """Convert raw PCM bytes to a floating array (range -1.0 ~ 1.0)."""
+    float_dtype = np.dtype(dtype)
     if sample_width == 1:
         # 8-bit unsigned
-        arr = np.frombuffer(data, dtype=np.uint8).astype(np.float64)
-        arr = (arr - 128.0) / 128.0
+        arr = np.frombuffer(data, dtype=np.uint8).astype(float_dtype)
+        arr = (arr - float_dtype.type(128.0)) / float_dtype.type(128.0)
     elif sample_width == 2:
         # 16-bit signed
-        arr = np.frombuffer(data, dtype=np.int16).astype(np.float64)
-        arr = arr / 32768.0
+        arr = np.frombuffer(data, dtype=np.int16).astype(float_dtype)
+        arr = arr / float_dtype.type(32768.0)
     elif sample_width == 3:
-        # 24-bit signed – numpy 向量化解码
+        # Signed 24-bit: vectorized NumPy decoding.
         n_samples = len(data) // 3
         raw = np.frombuffer(data, dtype=np.uint8).reshape(n_samples, 3)
-        # 组装为 32-bit 整数 (little-endian: byte0 + byte1<<8 + byte2<<16)
+        # Assemble 32-bit integers (little-endian: byte0 + byte1<<8 + byte2<<16).
         i32 = (raw[:, 0].astype(np.int32)
                | (raw[:, 1].astype(np.int32) << 8)
                | (raw[:, 2].astype(np.int32) << 16))
-        # 符号扩展: 如果最高位 (bit 23) 为 1，扩展为负数
+        # Sign extension: if the highest bit (23) is set, extend to a negative number.
         i32[i32 >= 0x800000] -= 0x1000000
-        arr = i32.astype(np.float64) / 8388608.0
+        arr = i32.astype(float_dtype) / float_dtype.type(8388608.0)
     elif sample_width == 4:
         # 32-bit signed
-        arr = np.frombuffer(data, dtype=np.int32).astype(np.float64)
-        arr = arr / 2147483648.0
+        arr = np.frombuffer(data, dtype=np.int32).astype(float_dtype)
+        arr = arr / float_dtype.type(2147483648.0)
     else:
         raise ValueError(f"不支持的采样宽度: {sample_width} bytes")
     return arr
 
 
 def _float_to_samples(arr: np.ndarray, sample_width: int) -> bytes:
-    """将 float64 numpy 数组 (-1.0 ~ 1.0) 转回原始 PCM bytes"""
+    """Convert a floating-point numpy array (-1.0 ~ 1.0) to raw PCM bytes."""
     arr = np.clip(arr, -1.0, 1.0)
     if sample_width == 1:
         out = ((arr * 128.0) + 128.0).astype(np.uint8)
@@ -121,9 +141,9 @@ def _float_to_samples(arr: np.ndarray, sample_width: int) -> bytes:
         out = (arr * 32768.0).astype(np.int16)
         return out.tobytes()
     elif sample_width == 3:
-        # numpy 向量化 24-bit 编码
+        # Vectorized NumPy 24-bit encoding.
         i32 = np.clip(arr * 8388608.0, -8388608, 8388607).astype(np.int32)
-        # 将有符号 32-bit 转为无符号以便位运算提取字节
+        # Convert signed 32-bit values to unsigned for bitwise byte extraction.
         u32 = i32.view(np.uint32)
         raw = np.empty((len(u32), 3), dtype=np.uint8)
         raw[:, 0] = u32 & 0xFF
@@ -131,17 +151,20 @@ def _float_to_samples(arr: np.ndarray, sample_width: int) -> bytes:
         raw[:, 2] = (u32 >> 16) & 0xFF
         return raw.tobytes()
     elif sample_width == 4:
-        out = (arr * 2147483648.0).astype(np.int32)
+        # float32 rounds the valid s32 maximum to 1.0. Scale in float64 and
+        # clamp before casting so +2147483647 never wraps to -2147483648.
+        scaled = arr.astype(np.float64, copy=False) * 2147483648.0
+        out = np.clip(scaled, -2147483648.0, 2147483647.0).astype(np.int32)
         return out.tobytes()
     else:
         raise ValueError(f"不支持的采样宽度: {sample_width} bytes")
 
 
 def _rms_dbfs(samples: np.ndarray) -> float:
-    """计算一帧采样的 RMS 值 (dBFS)"""
+    """Compute the RMS value (dBFS) of one frame of samples"""
     if len(samples) == 0:
         return -100.0
-    rms = np.sqrt(np.mean(samples ** 2))
+    rms = np.sqrt(np.mean(np.square(samples, dtype=np.float64)))
     if rms < 1e-10:
         return -100.0
     return 20.0 * math.log10(rms)
@@ -155,16 +178,16 @@ def detect_silence(
     cancel_check: Optional[Callable[[], bool]] = None,
 ) -> SilenceAnalysisResult:
     """
-    分析 WAV 音频中的静音段落。
+    Analyze silent segments in WAV audio.
 
-    参数:
-        audio_buffer: WAV 音频数据的 BytesIO
-        threshold_dbfs: 静音阈值 (dBFS)，低于此值视为静音
-        min_silence_ms: 最小静音持续时间 (ms)
-        progress_callback: 进度回调 (0-100)
-        cancel_check: 取消检测回调，返回 True 表示取消
+    Args:
+        audio_buffer: BytesIO of the WAV audio data
+        threshold_dbfs: silence threshold (dBFS); below this counts as silence
+        min_silence_ms: minimum silence duration (ms)
+        progress_callback: progress callback (0-100)
+        cancel_check: cancellation callback; returning True means cancel
 
-    返回:
+    Returns:
         SilenceAnalysisResult
     """
     audio_buffer.seek(0)
@@ -177,16 +200,18 @@ def detect_silence(
 
     duration_ms = (n_frames / sample_rate) * 1000.0
 
-    # 转为 float
+    # Use float32 for the main analysis array; recheck only frames extremely close to the threshold
+    # using original PCM in float64, preserving the old implementation's strict boundary classification.
     float_samples = _samples_to_float(raw_data, sample_width)
+    raw_view = memoryview(raw_data)
 
-    # 如果是多声道，取平均作为单声道进行分析
+    # Average multichannel audio into mono for analysis.
     if channels > 1:
         float_samples_mono = float_samples.reshape(-1, channels).mean(axis=1)
     else:
         float_samples_mono = float_samples
 
-    # 每帧的采样数
+    # Samples per frame.
     frame_size = int(sample_rate * RMS_FRAME_DURATION_MS / 1000.0)
     if frame_size < 1:
         frame_size = 1
@@ -205,6 +230,17 @@ def detect_silence(
         frame_data = float_samples_mono[start_idx:end_idx]
 
         rms = _rms_dbfs(frame_data)
+        if abs(rms - threshold_dbfs) <= RMS_FLOAT32_RECHECK_MARGIN_DB:
+            raw_start = start_idx * channels * sample_width
+            raw_end = end_idx * channels * sample_width
+            precise_samples = _samples_to_float(
+                raw_view[raw_start:raw_end],
+                sample_width,
+                dtype=np.float64,
+            )
+            if channels > 1:
+                precise_samples = precise_samples.reshape(-1, channels).mean(axis=1)
+            rms = _rms_dbfs(precise_samples)
 
         if rms < threshold_dbfs:
             if not in_silence:
@@ -219,12 +255,12 @@ def detect_silence(
                 if seg_duration >= min_silence_ms:
                     silence_segments.append(SilenceSegment(start_ms=start_ms, end_ms=end_ms))
 
-        # 进度回调 (检测阶段占 0-100%)
+        # Progress callback (detection occupies 0-100%).
         if progress_callback and i % max(1, total_frames // 100) == 0:
             pct = int((i / total_frames) * 100)
             progress_callback(min(pct, 100))
 
-    # 处理末尾仍在静音中的情况
+    # Handle silence continuing through the audio's end.
     if in_silence:
         start_ms = (silence_start_frame * frame_size / sample_rate) * 1000.0
         end_ms = duration_ms
@@ -233,7 +269,7 @@ def detect_silence(
             silence_segments.append(SilenceSegment(start_ms=start_ms, end_ms=end_ms))
 
     total_silence_ms = sum(s.duration_ms for s in silence_segments)
-    # 每段静音保留 RETAINED_SILENCE_MS，超出部分才是实际可移除量
+    # Retain RETAINED_SILENCE_MS per interval; only the excess is actually removable.
     removable_silence_ms = sum(
         max(0, s.duration_ms - RETAINED_SILENCE_MS) for s in silence_segments
     )
@@ -269,24 +305,25 @@ def trim_silence(
     cancel_check: Optional[Callable[[], bool]] = None,
 ) -> TrimResult:
     """
-    根据静音分析结果，将每段静音缩减至 RETAINED_SILENCE_MS (200 ms)。
+    Shrink each silent segment to RETAINED_SILENCE_MS (200 ms) based on the silence analysis.
 
-    裁剪策略:
-        对每段检测到的静音区间，保留首尾各 RETAINED_SILENCE_MS / 2 的边缘，
-        移除正中间多余的静音。这样拼接点处的采样自然过渡（均为近零值），
-        不会引入新的相位不连续或咔嗒声。
+    Trimming strategy:
+        For each detected silent interval, keep RETAINED_SILENCE_MS / 2 edges at the
+        head and tail, and remove the excess silence in the exact middle. Samples at
+        the splice points transition naturally (all near zero), introducing no new
+        phase discontinuities or clicks.
 
-    参数:
-        audio_buffer: 原始 WAV 音频的 BytesIO
-        analysis: detect_silence 返回的分析结果
-        progress_callback: 进度回调 (0-100)
-        cancel_check: 取消检测回调
+    Args:
+        audio_buffer: BytesIO of the original WAV audio
+        analysis: analysis result returned by detect_silence
+        progress_callback: progress callback (0-100)
+        cancel_check: cancellation callback
 
-    返回:
+    Returns:
         TrimResult
     """
     if not analysis.silence_segments:
-        # 没有静音段，直接返回原始音频
+        # No silence intervals: return the original audio directly.
         audio_buffer.seek(0)
         original_data = audio_buffer.read()
         md5 = hashlib.md5(original_data).hexdigest()
@@ -309,82 +346,63 @@ def trim_silence(
         n_frames = wf.getnframes()
         raw_data = wf.readframes(n_frames)
 
-    float_samples = _samples_to_float(raw_data, sample_width)
-
-    # 对于多声道，reshape 为 (n_frames, channels)
-    if channels > 1:
-        float_samples = float_samples.reshape(-1, channels)
-    else:
-        float_samples = float_samples.reshape(-1, 1)
-
-    # 每侧保留的采样数
+    # Samples retained on each side.
     retain_half_samples = int(sample_rate * (RETAINED_SILENCE_MS / 2) / 1000.0)
 
     if progress_callback:
         progress_callback(0)
 
-    # 按顺序遍历音频，对每段静音只保留首尾各 retain_half，移除正中间部分
+    # Traverse audio in order, retaining retain_half at each end of each silence and removing its center.
     total_segs = len(analysis.silence_segments)
-    result_parts: list[np.ndarray] = []
-    prev_end = 0  # 上一次拷贝到的样本位置
-
-    for idx, seg in enumerate(analysis.silence_segments):
-        if cancel_check and cancel_check():
-            raise SilenceRemovalCancelledError("裁剪处理已被用户取消")
-
-        seg_start = int(seg.start_ms * sample_rate / 1000.0)
-        seg_end = int(seg.end_ms * sample_rate / 1000.0)
-
-        # 计算中心裁剪区域
-        cut_start = seg_start + retain_half_samples  # 前半保留结束点
-        cut_end = seg_end - retain_half_samples       # 后半保留起始点
-
-        if cut_start >= cut_end:
-            # 静音段不足以裁剪（≤ RETAINED_SILENCE_MS），保留完整静音
-            continue
-
-        # 拷贝: 从 prev_end 到 cut_start（包含语音 + 静音前半段保留）
-        if cut_start > prev_end:
-            result_parts.append(float_samples[prev_end:cut_start])
-
-        # 跳过中间部分 [cut_start, cut_end)
-        prev_end = cut_end
-
-        # 进度回调
-        if progress_callback:
-            pct = int(((idx + 1) / total_segs) * 100)
-            progress_callback(min(pct, 100))
-
-    # 拷贝最后一段静音之后的剩余音频
-    total_samples_per_channel = float_samples.shape[0]
-    if prev_end < total_samples_per_channel:
-        result_parts.append(float_samples[prev_end:total_samples_per_channel])
-
-    if not result_parts:
-        # 极端情况：没有任何内容需要保留（理论上不会发生）
-        result_parts.append(float_samples[:0])  # 空数组，保持 shape 兼容
-
-    # 拼接所有段
-    final_samples = np.concatenate(result_parts, axis=0)
-
-    # reshape 回一维 (多声道交错)
-    final_flat = final_samples.reshape(-1)
-
-    # 转回 PCM bytes
-    pcm_data = _float_to_samples(final_flat, sample_width)
-
-    # 写入 WAV
+    prev_end = 0  # Last copied sample position.
+    kept_frames = 0
+    frame_width = sample_width * channels
+    raw_view = memoryview(raw_data)
     output_buf = io.BytesIO()
     with wave.open(output_buf, 'wb') as out_wf:
         out_wf.setnchannels(channels)
         out_wf.setsampwidth(sample_width)
         out_wf.setframerate(sample_rate)
-        out_wf.writeframes(pcm_data)
+
+        for idx, seg in enumerate(analysis.silence_segments):
+            if cancel_check and cancel_check():
+                raise SilenceRemovalCancelledError("裁剪处理已被用户取消")
+
+            seg_start = int(seg.start_ms * sample_rate / 1000.0)
+            seg_end = int(seg.end_ms * sample_rate / 1000.0)
+
+            # Calculate the central trimming interval.
+            cut_start = seg_start + retain_half_samples  # End of the retained first half.
+            cut_end = seg_end - retain_half_samples       # Start of the retained second half.
+
+            if cut_start >= cut_end:
+                # Silence too short to trim (<= RETAINED_SILENCE_MS): preserve it entirely.
+                continue
+
+            # Write original PCM frames directly, avoiding floating-point round trips and full concatenation.
+            if cut_start > prev_end:
+                out_wf.writeframesraw(
+                    raw_view[prev_end * frame_width : cut_start * frame_width]
+                )
+                kept_frames += cut_start - prev_end
+
+            # Skip the middle [cut_start, cut_end).
+            prev_end = cut_end
+
+            # Progress callback.
+            if progress_callback:
+                pct = int(((idx + 1) / total_segs) * 100)
+                progress_callback(min(pct, 100))
+
+        # Copy remaining audio after the last silence.
+        if prev_end < n_frames:
+            out_wf.writeframesraw(raw_view[prev_end * frame_width :])
+            kept_frames += n_frames - prev_end
 
     output_data = output_buf.getvalue()
     md5 = hashlib.md5(output_data).hexdigest()
 
-    trimmed_duration_ms = (final_samples.shape[0] / sample_rate) * 1000.0
+    trimmed_duration_ms = (kept_frames / sample_rate) * 1000.0
 
     if progress_callback:
         progress_callback(100)
@@ -408,7 +426,7 @@ def trim_silence(
 
 
 def format_duration_mmss(ms: float) -> str:
-    """将毫秒转为 mm:ss 格式"""
+    """Convert milliseconds to mm:ss format"""
     total_seconds = int(ms / 1000.0)
     minutes = total_seconds // 60
     seconds = total_seconds % 60
@@ -417,10 +435,10 @@ def format_duration_mmss(ms: float) -> str:
 
 def convert_to_wav_if_needed(audio_buffer: io.BytesIO, filename: str) -> tuple[io.BytesIO, str]:
     """
-    如果输入不是 WAV，使用 pyav 解码为 16-bit PCM 单声道 WAV。
-    对 WAV 文件直接返回（不做重采样/格式转换）。
+    If the input is not WAV, decode it to 16-bit PCM mono WAV using pyav.
+    WAV files are returned as-is (no resampling/format conversion).
 
-    返回: (wav_buffer, original_format)
+    Returns: (wav_buffer, original_format)
     """
     ext = filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
 
@@ -467,8 +485,8 @@ def convert_to_wav_if_needed(audio_buffer: io.BytesIO, filename: str) -> tuple[i
             for packet in container.demux(stream):
                 for frame in packet.decode():
                     if resampler is None:
-                        # 优先用流元数据；某些容器/编码下 stream.sample_rate
-                        # 会缺失或为 0，此时回退到首个解码帧的采样率
+                        # Prefer stream metadata; some containers/codecs have missing or zero stream.sample_rate,
+                        # in which case use the first decoded frame's sample rate.
                         sample_rate = int(stream.sample_rate or frame.sample_rate or 0)
                         if sample_rate <= 0:
                             raise ValueError('无法确定音频采样率')
@@ -502,8 +520,8 @@ def convert_to_wav_if_needed(audio_buffer: io.BytesIO, filename: str) -> tuple[i
 
 def convert_wav_back(wav_buffer: io.BytesIO, original_format: str, original_params: dict) -> io.BytesIO:
     """
-    将 WAV 转回原始格式（如果原始格式不是 WAV）。
-    保持与原始文件完全一致的技术参数。
+    Convert WAV back to the original format (if the original format is not WAV).
+    Keeps technical parameters identical to the original file.
     """
     if original_format == 'wav':
         wav_buffer.seek(0)
@@ -512,7 +530,7 @@ def convert_wav_back(wav_buffer: io.BytesIO, original_format: str, original_para
     try:
         from pydub import AudioSegment
     except ImportError:
-        # fallback: 返回 WAV
+        # Fallback: return WAV.
         wav_buffer.seek(0)
         return wav_buffer
 

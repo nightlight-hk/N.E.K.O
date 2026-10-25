@@ -1,7 +1,7 @@
 /**
  * 插件市场 API — 从 Market 后端获取插件列表和详情
  *
- * Market URL 从本地 /market/status 端点获取（由 NEKO_MARKET_URL 配置）。
+ * Market API URL 从本地 /market/status 端点获取（由 NEKO_MARKET_API_URL 配置）。
  *
  * v2（neko-market-version-sync）：
  * - 后端 schema 切到 latest_version 嵌套对象。version / download_url 不再
@@ -41,6 +41,8 @@ export interface MarketPlugin {
   name: string
   description: string
   short_description?: string
+  /** 完整详情接口返回的 README；列表接口通常不包含。 */
+  readme?: string
   /** 取自 latest_version.version；latest_version === null 时为 ''。 */
   version: string
   author: {
@@ -57,6 +59,7 @@ export interface MarketPlugin {
   downloads: number
   likes: number
   rating_average?: number
+  rating_count?: number
   created_at: string
   updated_at: string
   is_recommended?: boolean
@@ -140,6 +143,53 @@ export interface MarketPluginVersion {
   created_at: string
 }
 
+/** A compact latest-version row for one installed Market plugin. */
+export interface MarketLatestVersion {
+  plugin_id: number
+  channel: 'stable' | 'beta'
+  version: string
+  published_at: string
+}
+
+/** 已审核版本的 README；由 Market 单独的公开接口提供。 */
+export interface MarketPluginReadme {
+  availability: 'available' | 'unavailable'
+  content?: string | null
+  repository_url?: string
+  source_ref?: string
+}
+
+/** Market public comment thread. Comments are displayed read-only in NEKO. */
+export interface MarketPluginComment {
+  id: number
+  author: {
+    id: number
+    username: string
+    display_name: string | null
+    avatar_url: string | null
+  }
+  reply_to: {
+    id: number
+    author: {
+      id: number
+      username: string
+      display_name: string | null
+      avatar_url: string | null
+    }
+    body: string | null
+    is_hidden: boolean
+  } | null
+  body: string | null
+  format: 'plain'
+  is_hidden: boolean
+  created_at: string
+}
+
+export interface MarketPluginComments {
+  messages: MarketPluginComment[]
+  next_cursor: number | null
+}
+
 const ZONE_BY_ID: Record<number, string> = {
   1: 'game',
   2: 'companion',
@@ -190,6 +240,7 @@ export function normalizeMarketPlugin(raw: MarketPluginRaw): MarketPlugin {
     name: raw.name,
     description,
     short_description: raw.short_description ?? undefined,
+    readme: raw.readme ?? undefined,
     version,
     author: {
       name: authorName,
@@ -204,6 +255,7 @@ export function normalizeMarketPlugin(raw: MarketPluginRaw): MarketPlugin {
     downloads: raw.download_count ?? 0,
     likes: raw.likes ?? 0,
     rating_average: raw.rating_average,
+    rating_count: raw.rating_count,
     created_at: raw.created_at,
     updated_at: raw.updated_at,
     is_recommended: Boolean(raw.is_featured),
@@ -244,11 +296,14 @@ async function getMarketWebBaseUrl(): Promise<string | null> {
 async function getClient(): Promise<AxiosInstance | null> {
   if (_marketClient) return _marketClient
 
-  const baseUrl = await getMarketBaseUrl()
-  if (!baseUrl) return null
+  // Warm the web-link cache without making the local catalog bridge depend on
+  // the separate status request succeeding.
+  void getMarketBaseUrl()
 
   _marketClient = axios.create({
-    baseURL: `${baseUrl}/api/v1`,
+    // Keep catalog traffic same-origin. The local bridge forwards only the
+    // public, read-only catalog routes and avoids browser CORS failures.
+    baseURL: '/market/catalog/api/v1',
     timeout: 10000,
     headers: { 'Content-Type': 'application/json' },
   })
@@ -318,6 +373,35 @@ export async function fetchMarketPlugins(
   }
 }
 
+/** Market `/plugins` 单页上限（后端 `page_size` 校验为 `le=100`）。 */
+const CATALOG_PAGE_SIZE = 100
+
+export type FetchMarketCatalogParams = Pick<
+  FetchMarketPluginsParams,
+  'sort_by' | 'sort_order' | 'channel'
+>
+
+/**
+ * 拉取完整目录（按服务端排序拼接所有分页）。
+ *
+ * 过滤与分页在前端完成：前端过滤规则（qualifier、排除项、拼音、已安装状态）
+ * 服务端无法表达，只对单页结果过滤会让命中项散落在各页。任一页失败返回 null，
+ * 不返回残缺目录。
+ */
+export async function fetchMarketCatalog(
+  params: FetchMarketCatalogParams,
+): Promise<MarketPlugin[] | null> {
+  const first = await fetchMarketPlugins({ ...params, page: 1, page_size: CATALOG_PAGE_SIZE })
+  if (!first) return null
+  const rest = await Promise.all(
+    Array.from({ length: Math.max(0, first.pages - 1) }, (_, index) =>
+      fetchMarketPlugins({ ...params, page: index + 2, page_size: CATALOG_PAGE_SIZE }),
+    ),
+  )
+  if (rest.some((page) => !page)) return null
+  return [first, ...rest].flatMap((page) => page!.items)
+}
+
 /** 获取单个插件详情。 */
 export async function fetchMarketPlugin(
   pluginId: string | number,
@@ -330,6 +414,41 @@ export async function fetchMarketPlugin(
     return normalizeMarketPlugin(res.data)
   } catch (err) {
     console.warn('[Market] Failed to fetch plugin:', err)
+    return null
+  }
+}
+
+/** 获取 Market 审核快照对应的 README，而不是仓库当前分支的 README。 */
+export async function fetchMarketPluginReadme(
+  pluginId: string | number,
+): Promise<MarketPluginReadme | null> {
+  const client = await getClient()
+  if (!client) return null
+
+  try {
+    const res = await client.get<MarketPluginReadme>(`/plugins/${pluginId}/readme`)
+    return res.data
+  } catch (err) {
+    console.warn('[Market] Failed to fetch plugin README:', err)
+    return null
+  }
+}
+
+/** Fetch the first page of the Market's public plugin comments. */
+export async function fetchMarketPluginComments(
+  pluginId: string | number,
+  afterId?: number,
+): Promise<MarketPluginComments | null> {
+  const client = await getClient()
+  if (!client) return null
+
+  try {
+    const res = await client.get<MarketPluginComments>(`/plugins/${pluginId}/comments`, {
+      params: afterId ? { after_id: afterId } : undefined,
+    })
+    return res.data
+  } catch (err) {
+    console.warn('[Market] Failed to fetch plugin comments:', err)
     return null
   }
 }
@@ -358,6 +477,33 @@ export async function fetchMarketPluginVersions(
     return res.data
   } catch (err) {
     console.warn('[Market] Failed to fetch versions:', err)
+    return null
+  }
+}
+
+/**
+ * Fetch latest versions for a bounded group of installed Market plugin ids.
+ *
+ * The public Market endpoint intentionally caps a request at 100 ids.  The
+ * versions store chunks larger sets before calling this helper, avoiding a
+ * full catalog scan merely to render local "update available" badges.
+ */
+export async function fetchMarketLatestVersions(
+  pluginIds: Array<string | number>,
+  channel: 'stable' | 'beta',
+): Promise<MarketLatestVersion[] | null> {
+  if (pluginIds.length === 0) return []
+
+  const client = await getClient()
+  if (!client) return null
+
+  try {
+    const res = await client.get<{ items: MarketLatestVersion[] }>('/plugins/latest-versions', {
+      params: { ids: pluginIds.join(','), channel },
+    })
+    return Array.isArray(res.data?.items) ? res.data.items : null
+  } catch (err) {
+    console.warn('[Market] Failed to fetch latest versions:', err)
     return null
   }
 }

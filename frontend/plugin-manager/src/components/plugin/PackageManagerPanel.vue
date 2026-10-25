@@ -30,25 +30,18 @@
         :total-count="selectablePlugins.length"
         :selected-count="selectedPluginIds.length"
         :plugin-filter="pluginFilter"
-        :use-regex="useRegex"
-        :filter-mode="filterMode"
-        :regex-error="regexError"
         :selected-types="selectedTypes"
         :layout-mode="layoutMode"
         :plugin-count="pluginCount"
         :adapter-count="adapterCount"
-        :extension-count="extensionCount"
         :filtered-pure-plugins="filteredPurePlugins"
         :filtered-adapters="filteredAdapters"
-        :filtered-extensions="filteredExtensions"
         :selected-plugin-ids="selectedPluginIds"
         @refresh="refreshPluginSources"
         @select-all-visible="selectAllVisible"
         @clear-selection="clearSelection"
         @toggle-plugin="togglePlugin"
         @update:plugin-filter="pluginFilter = $event"
-        @update:use-regex="useRegex = $event"
-        @update:filter-mode="filterMode = $event"
         @update:selected-types="selectedTypes = $event"
         @update:layout-mode="layoutMode = $event"
       />
@@ -163,19 +156,13 @@
                   <el-input v-model="installForm.plugins_root" placeholder="默认写入我的文档下的用户插件目录" />
                 </el-form-item>
 
-                <el-form-item label="Profiles 目录">
-                  <el-input
-                    v-model="installForm.profiles_root"
-                    placeholder="默认写入我的文档下的 .neko-package-profiles 目录"
-                  />
-                </el-form-item>
-
-                <el-form-item label="冲突策略">
-                  <el-radio-group v-model="installForm.on_conflict">
-                    <el-radio-button label="rename">rename</el-radio-button>
-                    <el-radio-button label="fail">fail</el-radio-button>
-                  </el-radio-group>
-                </el-form-item>
+                <el-alert
+                  class="install-safety-note"
+                  :title="t('package.install.safeUpgradeHint')"
+                  type="info"
+                  :closable="false"
+                  show-icon
+                />
 
                 <div class="action-row">
                   <el-button type="warning" :loading="installing" @click="handleInstall">
@@ -248,6 +235,7 @@
 
 <script setup lang="ts">
 import { Close } from '@element-plus/icons-vue'
+import { useI18n } from 'vue-i18n'
 import PackageArchiveListPanel from '@/components/plugin/PackageArchiveListPanel.vue'
 import PackageResultPanel from '@/components/plugin/PackageResultPanel.vue'
 import PluginSelectorPanel from '@/components/plugin/PluginSelectorPanel.vue'
@@ -264,6 +252,8 @@ const props = withDefaults(
   },
 )
 
+const { t } = useI18n()
+
 defineEmits<{
   close: []
 }>()
@@ -273,9 +263,6 @@ const {
   layoutMode,
   buildMode,
   pluginFilter,
-  useRegex,
-  filterMode,
-  regexError,
   selectedTypes,
   pluginsLoading,
   packagesLoading,
@@ -298,10 +285,8 @@ const {
   selectablePlugins,
   pluginCount,
   adapterCount,
-  extensionCount,
   filteredPurePlugins,
   filteredAdapters,
-  filteredExtensions,
   selectedPluginIds,
   resolvedBuildTargets,
   filteredLocalPackages,
@@ -335,6 +320,11 @@ const {
 
 .package-manager--embedded {
   gap: 14px;
+  padding: 18px 18px 24px;
+  background: var(--surface-card);
+  border-radius: var(--radius-card);
+  border: 1px solid var(--surface-border);
+  box-shadow: var(--surface-shadow);
 }
 
 .main-grid {
@@ -372,10 +362,9 @@ const {
   gap: 12px;
   width: 100%;
   padding: 14px 16px;
-  border-radius: 18px;
-  background:
-    linear-gradient(135deg, color-mix(in srgb, var(--el-color-primary) 10%, white), color-mix(in srgb, var(--el-color-info) 9%, white));
-  border: 1px solid color-mix(in srgb, var(--el-color-primary) 12%, var(--el-border-color));
+  border-radius: var(--radius-panel);
+  background: var(--surface-inset);
+  border: 1px solid var(--surface-border);
 }
 
 .embedded-heading__copy {
@@ -408,9 +397,9 @@ const {
   gap: 10px;
   flex-wrap: wrap;
   padding: 12px 14px;
-  border-radius: 16px;
-  background: color-mix(in srgb, var(--el-fill-color-light) 78%, white);
-  border: 1px solid color-mix(in srgb, var(--el-color-info) 10%, var(--el-border-color));
+  border-radius: var(--radius-panel);
+  background: var(--surface-inset);
+  border: 1px solid var(--surface-border);
 }
 
 .embedded-selection-summary__text {
@@ -420,7 +409,7 @@ const {
 
 .history-button {
   position: relative;
-  border-radius: 999px;
+  border-radius: var(--radius-control);
   padding-inline: 18px;
 }
 
@@ -429,7 +418,10 @@ const {
 }
 
 .operations-card {
-  border-radius: 18px;
+  border-radius: var(--radius-card);
+  background: var(--surface-card);
+  border-color: var(--surface-border);
+  box-shadow: var(--surface-shadow);
 }
 
 .card-header {
@@ -449,25 +441,27 @@ const {
   margin: 6px 0 4px;
 }
 
+.install-safety-note {
+  margin-bottom: 14px;
+}
+
 /* ── Tab content transition ── */
 .pkg-tabs :deep(.el-tabs__content) {
   overflow: visible;
 }
 
 .pkg-tabs :deep(.el-tab-pane) {
-  animation: tab-enter 0.34s cubic-bezier(0.22, 1, 0.36, 1) both;
+  animation: tab-enter var(--motion-duration-emphasis) var(--motion-ease-standard) both;
 }
 
 @keyframes tab-enter {
   from {
     opacity: 0;
     transform: scale(0.97) translateY(8px);
-    filter: blur(4px);
   }
   to {
     opacity: 1;
     transform: scale(1) translateY(0);
-    filter: blur(0);
   }
 }
 

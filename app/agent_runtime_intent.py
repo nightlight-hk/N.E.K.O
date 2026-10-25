@@ -1,15 +1,28 @@
+# Copyright 2025-2026 Project N.E.K.O. Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """User-level persistence for agent runtime toggles.
 
-The agent server keeps six in-memory switches:
+The agent server keeps five in-memory switches:
 
-    analyzer_enabled         — master gate ("猫爪总开关")
-    computer_use_enabled     — 键鼠控制 sub flag
-    browser_use_enabled      — 浏览器控制 sub flag
-    user_plugin_enabled      — 用户插件 sub flag
+    analyzer_enabled         — master gate (the "cat paw" master switch)
+    computer_use_enabled     — keyboard/mouse control sub flag
+    browser_use_enabled      — browser control sub flag
+    user_plugin_enabled      — user plugin sub flag
     openclaw_enabled         — OpenClaw sub flag
-    openfang_enabled         — OpenFang sub flag
 
-Historically all six were re-zeroed on every process start, so the user had
+Historically all five were re-zeroed on every process start, so the user had
 to re-toggle every switch after restart. This module persists the user's
 **intent** (last explicit toggle) under the config dir as
 ``agent_runtime_intent.json``, and a restore path at first ``greeting_check``
@@ -24,7 +37,7 @@ codepaths (so capability checks still gate actual activation).
   intent survives transient LLM failures so the next restart still tries.
 * The restore path WILL clear intent back to ``False`` after a hard 15s
   retry window or on a permanent failure code, so the user sees a clear
-  "已自动禁用" notification instead of repeatedly retrying a dead key.
+  "auto-disabled" notification instead of repeatedly retrying a dead key.
 * Toggling the master gate off does NOT touch sub-flag intent — the master
   is a runtime gate, not a clear-all command. (See the matching fix in
   ``set_agent_enabled`` and the gate-fail branch of ``set_agent_flags``.)
@@ -54,7 +67,6 @@ INTENT_KEYS: frozenset[str] = frozenset({
     "browser_use_enabled",
     "user_plugin_enabled",
     "openclaw_enabled",
-    "openfang_enabled",
 })
 
 _cache_lock = threading.Lock()

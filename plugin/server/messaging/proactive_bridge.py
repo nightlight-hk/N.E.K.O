@@ -17,6 +17,7 @@ Flow: plugin ─(ZMQ ingest)→ message_plane ─(PUB)→ **this bridge** ─(PU
 from __future__ import annotations
 
 import json
+import math
 import os
 import threading
 import time
@@ -33,16 +34,35 @@ except Exception:  # pragma: no cover
 logger = get_logger("server.messaging.proactive_bridge")
 
 
-# Map (visibility, ai_behavior) → legacy delivery_mode the existing
-# main_server proactive_message handler understands.  ``visibility`` is
-# treated as a set; we only consult ``"hud"`` membership because
-# proactive_message always also fires the agent_notification HUD path.
+# Map ai_behavior → the legacy delivery_mode the existing main_server
+# proactive_message handler understands: respond → "proactive", read →
+# "passive", blind → "silent" (LLM channel skipped).
+#
+# ``visibility`` is NOT consulted here, despite the signature: it decides
+# where the plugin's own parts render, which is a separate question the
+# host answers on its own. Chat rendering is gated on "chat" membership in
+# ``_handle_agent_event``; the HUD agent_notification is gated on "hud"
+# membership there too, so a proactive_message no longer implies a HUD
+# toast. The parameter is kept so the call site reads as the full
+# (visibility, ai_behavior) pair the schema defines.
 def _resolve_delivery_mode(visibility: list[str], ai_behavior: str) -> str:
     if ai_behavior == "respond":
         return "proactive"
     if ai_behavior == "read":
         return "passive"
     return "silent"
+
+
+def _positive_finite_float(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        normalized = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return None
+    if not math.isfinite(normalized) or normalized <= 0.0:
+        return None
+    return normalized
 
 
 def _aggregate_text_parts(parts: list[dict[str, Any]]) -> str:
@@ -59,7 +79,13 @@ def _aggregate_text_parts(parts: list[dict[str, Any]]) -> str:
 
 
 def _media_parts(parts: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Filter for image/audio/video parts (passed through to the AI session)."""
+    """Filter for image/audio/video parts.
+
+    The result is only used to decide whether this push carries a payload
+    worth forwarding (``has_ai_payload``). The canonical ``parts`` list is
+    what actually rides on the event; the host derives its own model and
+    chat views from it.
+    """
     out: list[dict[str, Any]] = []
     for p in parts:
         if not isinstance(p, dict):
@@ -98,6 +124,14 @@ class ProactiveBridge:
     def __init__(self) -> None:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        # Set only after SUB/PUSH creation, connect, and SUBSCRIBE all succeed (this does
+        # not guarantee that the remote side is connected or has processed the subscription). Startup order depends on this:
+        # an autostart plugin may call push_message() in its startup hook, while PUB silently drops messages sent to absent subscribers —
+        # a character may never speak a message pushed in that window, even though push_message() returned
+        # submitted=True. Moving the bridge before plugins only starts the timer earlier; the window
+        # remains (the brief period before SUBSCRIBE propagates to the PUB side).
+        self._subscribed = threading.Event()
+        self._startup_finished = threading.Event()
 
     def start(self) -> None:
         if zmq is None:
@@ -105,20 +139,88 @@ class ProactiveBridge:
             return
         if self._thread is not None and self._thread.is_alive():
             return
-        self._stop.clear()
-        t = threading.Thread(target=self._run, daemon=True, name="proactive-bridge")
+        # Use a new event instead of clearing the shared one: stop() has a bounded join, and after a timeout
+        # the old thread may still be shutting down. Clearing the event it waits on would pull it back into the send/receive loop — its subscription
+        # still targets the retired PUB endpoint, and it would publish to the same PUSH alongside the new thread. Its
+        # own event remains set, so it exits on its own schedule and cannot be revived.
+        self._stop = threading.Event()
+        # _subscribed is also recreated for each generation instead of clearing a shared event: the retired thread holds
+        # its own generation's event; even if it reaches the ready signal after stop, it sets only its own
+        # invalidated event and cannot affect the new generation. wait_until_subscribed() reads
+        # self._subscribed (the new generation), so a previous run cannot falsely signal readiness. This is the same design as rebinding _stop
+        # for every generation; no extra lock is needed to protect generation changes.
+        subscribed = threading.Event()
+        self._subscribed = subscribed
+        # Wake startup waiters on either setup success or failure, without
+        # conflating completion with readiness. Retired generations keep their
+        # own event, just like stop and subscribed.
+        startup_finished = threading.Event()
+        self._startup_finished = startup_finished
+        t = threading.Thread(
+            target=self._run,
+            args=(self._stop, subscribed, startup_finished),
+            daemon=True,
+            name="proactive-bridge",
+        )
         self._thread = t
         t.start()
         logger.info("proactive bridge started")
 
+    def wait_until_subscribed(self, timeout: float) -> bool:
+        """Wait until socket setup succeeds, fails, or the generation stops.
+
+        Returns False on timeout, setup failure, stop, or a never-started bridge. The
+        caller must not be blocked by a bridge that is disabled or already
+        dead, only by one that is still coming up.
+
+        ⚠️ This is not a mathematically airtight close. A successful ZMQ SUBSCRIBE does not mean the PUB side has processed
+        the subscription yet (the classic slow joiner), so a very small gap remains. To close it completely, the bridge would need to
+        read the store once after startup and deduplicate by message_id — which risks duplicate delivery
+        (the character says the same sentence twice) and is outside this change's scope.
+        """
+        t = self._thread
+        subscribed = self._subscribed
+        startup_finished = self._startup_finished
+        stop = self._stop
+        if t is None or not t.is_alive():
+            return subscribed.is_set() and not stop.is_set()
+        startup_finished.wait(timeout)
+        return subscribed.is_set() and not stop.is_set()
+
+    def is_alive(self) -> bool:
+        """Whether the bridge is running without a known startup failure or stop.
+
+        ``wait_until_subscribed`` answers ``False`` both for a bridge that is
+        still coming up and for one that never started or has died, and those
+        want opposite handling: the first heals on its own, the second recovers
+        only if something restarts it. Callers that must tell them apart ask here.
+        """
+        t = self._thread
+        return (
+            t is not None and t.is_alive()
+            and not self._stop.is_set()
+            and not (self._startup_finished.is_set() and not self._subscribed.is_set())
+        )
+
     def stop(self) -> None:
         self._stop.set()
+        # Wake anyone waiting for subscription: once the bridge stops, there will be no subscription, so let them proceed
+        # instead of turning shutdown into a timeout-length hang.
+        self._startup_finished.set()
         t = self._thread
         self._thread = None
         if t is not None and t.is_alive():
             t.join(timeout=2.0)
 
-    def _run(self) -> None:
+    def _run(
+        self, stop: threading.Event, subscribed: threading.Event,
+        startup_finished: threading.Event,
+    ) -> None:
+        # All three events belong to THIS generation, handed over at
+        # start. Never read the rebound instance events here -- those names are
+        # rebound for each new thread, so reading them here would let a retired
+        # thread obey its successor's lifetime, or certify readiness for a
+        # generation that is not its own.
         from plugin.settings import MESSAGE_PLANE_ZMQ_PUB_ENDPOINT
 
         pub_endpoint = os.getenv(
@@ -127,36 +229,85 @@ class ProactiveBridge:
         )
         agent_push_addr = _resolve_agent_push_addr()
 
-        # Brief wait for message_plane PUB to bind before we connect.
-        time.sleep(1.0)
-        if self._stop.is_set():
+        # No fixed wait before connecting. Server startup binds the plane PUB
+        # synchronously (MessagePlanePubServer.__post_init__) before it starts
+        # this bridge, so the endpoint is already listening; and even if a peer
+        # binds later, ZeroMQ connect is asynchronous and reconnects, replaying
+        # the subscription on each attach. A delay before SUBSCRIBE only
+        # postpones subscription -- it never closes the PUB/SUB slow-joiner
+        # window. Readiness is gated on _subscribed (set below), which startup
+        # waits for before admitting autostart plugins.
+        if stop.is_set():
+            startup_finished.set()
             return
 
-        ctx = zmq.Context.instance()
-        sub_sock = ctx.socket(zmq.SUB)
-        sub_sock.linger = 0
-        sub_sock.setsockopt(zmq.RCVTIMEO, 1000)
-        sub_sock.connect(pub_endpoint)
-        sub_sock.setsockopt_string(zmq.SUBSCRIBE, "messages.")
+        sub_sock = None
+        push_sock = None
+        try:
+            ctx = zmq.Context.instance()
+            sub_sock = ctx.socket(zmq.SUB)
+            sub_sock.linger = 0
+            sub_sock.setsockopt(zmq.RCVTIMEO, 1000)
+            sub_sock.connect(pub_endpoint)
+            sub_sock.setsockopt_string(zmq.SUBSCRIBE, "messages.")
 
-        push_sock = ctx.socket(zmq.PUSH)
-        push_sock.linger = 1000
-        push_sock.connect(agent_push_addr)
+            push_sock = ctx.socket(zmq.PUSH)
+            push_sock.linger = 1000
+            push_sock.connect(agent_push_addr)
+        except Exception as exc:
+            # Socket setup failed. Do NOT signal readiness: a bridge that dies
+            # here must report not-alive so startup's wait_for_proactive_subscriber
+            # falls through to the proactive_bridge_is_alive() check and marks the
+            # delivery path incomplete. Signalling ready with a dead forwarder is
+            # the silent non-delivery this whole mechanism exists to prevent --
+            # push_message() would keep answering submitted=True.
+            logger.warning(
+                "proactive bridge socket setup failed: err_type={}, err={}",
+                type(exc).__name__, str(exc),
+            )
+            for sock in (sub_sock, push_sock):
+                if sock is not None:
+                    try:
+                        sock.close(linger=0)
+                    except Exception:
+                        pass
+            startup_finished.set()
+            return
+
+        if stop.is_set():
+            # This generation was retired mid-setup; do not report it as ready.
+            for sock in (sub_sock, push_sock):
+                if sock is not None:
+                    try:
+                        sock.close(linger=0)
+                    except Exception:
+                        pass
+            startup_finished.set()
+            return
+
+        # Signal readiness only once BOTH sockets exist: the SUB is subscribed
+        # and connect has been issued for PUSH (remote attachment is asynchronous).
+        # Setting this right after SUBSCRIBE (before push_sock was built) let a failure in between
+        # latch the bridge as ready while it could receive but never forward.
+        # Sets THIS generation's event, so a retired thread can never certify a
+        # successor that has not finished its own setup.
+        subscribed.set()
+        startup_finished.set()
 
         logger.info(
-            "proactive bridge connected: sub={} push={}",
+            "proactive bridge socket setup complete: sub={} push={}",
             pub_endpoint,
             agent_push_addr,
         )
 
         try:
-            while not self._stop.is_set():
+            while not stop.is_set():
                 try:
                     parts_raw = sub_sock.recv_multipart()
                 except zmq.Again:
                     continue
                 except Exception as e:
-                    if not self._stop.is_set():
+                    if not stop.is_set():
                         logger.debug("proactive bridge recv error: {}", e)
                         time.sleep(0.1)
                     continue
@@ -204,7 +355,13 @@ class ProactiveBridge:
         """
         plugin_id = payload.get("plugin_id", "")
         timestamp = payload.get("time", "")
-        metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+        raw_metadata = payload.get("metadata")
+        metadata = dict(raw_metadata) if isinstance(raw_metadata, dict) else {}
+        expires_in_s = _positive_finite_float(metadata.get("expires_in_s"))
+        if expires_in_s is None:
+            metadata.pop("expires_in_s", None)
+        else:
+            metadata["expires_in_s"] = expires_in_s
 
         # v2 fields are guaranteed by the SDK adapter's translate step,
         # but accept legacy shapes too for safety.
@@ -216,8 +373,12 @@ class ProactiveBridge:
         parts = payload.get("parts") if isinstance(payload.get("parts"), list) else []
         # Proactive-delivery hints (priority ordering + coalescing). Carried
         # through to the main_server callback so ProactiveDeliveryManager can
-        # order/coalesce. Lower priority = more urgent; unspecified (0) is
-        # normalised to a neutral band downstream.
+        # order/coalesce. Repo-wide convention: HIGHER number = more
+        # important (bilibili gift/SC=9, memo reminder=8). A missing or
+        # unparseable priority falls back to 0 = least important, so a cue
+        # that never set one cannot preempt a cue that did. Nothing rescales
+        # it downstream — main_logic.proactive_delivery.effective_priority
+        # just int()s the value and the queue sorts by (-priority, seq).
         try:
             # OverflowError: plugin payload is boundary input; JSON
             # Infinity/-Infinity → non-finite float → int() raises. Must not
@@ -233,7 +394,16 @@ class ProactiveBridge:
 
         events_out: list[dict[str, Any]] = []
 
-        # ---- ui_action parts → legacy music_* events ----
+        # Cards use their own display-only event, including updates with no text.
+        if "chat" in visibility:
+            for part in parts:
+                if isinstance(part, dict) and part.get("type") == "html_card":
+                    events_out.append({
+                        "event_type": "plugin_card", "plugin_id": plugin_id,
+                        "lanlan_name": target_lanlan, "card": part,
+                    })
+
+        # ---- ui_action parts → frontend control events ----
         for ui in _ui_action_parts(parts):
             action = ui.get("action")
             if action == "media_play_url":
@@ -257,9 +427,14 @@ class ProactiveBridge:
                 )
             elif action == "media_allowlist_add":
                 domains = ui.get("domains") or metadata.get("domains") or []
-                if not isinstance(domains, list) or not domains:
+                http_urls = ui.get("http_urls") or metadata.get("http_urls") or []
+                if not isinstance(domains, list):
+                    domains = []
+                if not isinstance(http_urls, list):
+                    http_urls = []
+                if not domains and not http_urls:
                     logger.debug(
-                        "ui_action=media_allowlist_add missing domains; plugin={}",
+                        "ui_action=media_allowlist_add missing domains/http_urls; plugin={}",
                         plugin_id,
                     )
                     continue
@@ -268,6 +443,27 @@ class ProactiveBridge:
                         "event_type": "music_allowlist_add",
                         "lanlan_name": target_lanlan,
                         "domains": list(domains),
+                        "http_urls": list(http_urls),
+                        "source": plugin_id,
+                        "timestamp": timestamp,
+                    }
+                )
+            elif action == "jukebox_control":
+                jukebox_action = ui.get("jukebox_action")
+                if not isinstance(jukebox_action, str) or not jukebox_action.strip():
+                    logger.debug(
+                        "ui_action=jukebox_control missing action; plugin={}",
+                        plugin_id,
+                    )
+                    continue
+                events_out.append(
+                    {
+                        "event_type": "jukebox_control",
+                        "lanlan_name": target_lanlan,
+                        "action": jukebox_action,
+                        "query": ui.get("query"),
+                        "value": ui.get("value"),
+                        "mode": ui.get("mode"),
                         "source": plugin_id,
                         "timestamp": timestamp,
                     }
@@ -280,18 +476,18 @@ class ProactiveBridge:
 
         # ---- text + media parts → proactive_message (or HUD-only) ----
         text = _aggregate_text_parts(parts)
-        # Bridge-level result_parser strips raw JSON envelopes that some
-        # plugins still emit when they hand-craft content.  Best-effort.
+        # Keep the historical aggregate-once cleanup for the model/callback
+        # text. Canonical parts remain untouched for verbatim chat rendering.
         if text:
             try:
                 from utils.result_parser import parse_push_message_content
 
                 text = parse_push_message_content(text)
-            except Exception as e:
-                # Best-effort sanitization — fall back to the raw aggregated
-                # text if the parser misbehaves on this particular shape.
-                logger.debug("parse_push_message_content failed (fallback to raw): {}", e)
-
+            except Exception as exc:
+                logger.debug(
+                    "parse_push_message_content failed (fallback to raw): {}",
+                    exc,
+                )
         media = _media_parts(parts)
         has_ai_payload = bool(text) or bool(media)
 
@@ -312,19 +508,25 @@ class ProactiveBridge:
                 "source_name": str(plugin_id) if plugin_id else "",
                 "timestamp": timestamp,
                 "metadata": metadata,
-                # v2 carries media inline; main_server will base64-decode
-                # and call session.send_media_input before/after the
-                # callback queue depending on ai_behavior.
-                "media_parts": media,
+                # Preserve canonical order until the final consumer.  The
+                # main server derives text/media views for its legacy paths,
+                # but chat rendering must not turn image→caption→image into
+                # caption→image→image.  Carrying one canonical list also
+                # avoids duplicating inline base64 data in this ZMQ frame.
+                "parts": parts,
                 "visibility": list(visibility),
                 "ai_behavior": ai_behavior,
                 "priority": priority,
                 "coalesce_key": coalesce_key,
             }
-            # When ai_behavior=blind we still want the HUD agent_notification
-            # to fire (handled by main_server's existing branch).  Setting
-            # delivery_mode="silent" tells the proactive_message handler to
-            # skip the LLM injection but keep the WS notif.
+            if expires_in_s is not None:
+                proactive_event["expires_in_s"] = expires_in_s
+            # delivery_mode="silent" (ai_behavior=blind) tells the
+            # proactive_message handler to skip the LLM injection. Whether a
+            # HUD agent_notification still fires is decided separately, by
+            # "hud" membership in visibility — blind + visibility=["chat"]
+            # renders the parts in chat and stays out of the HUD, and
+            # blind + visibility=[] produces no user-facing output at all.
             events_out.append(proactive_event)
 
         if not events_out:
@@ -350,6 +552,16 @@ _bridge = ProactiveBridge()
 
 def start_proactive_bridge() -> None:
     _bridge.start()
+
+
+def wait_for_proactive_subscriber(timeout: float) -> bool:
+    """Wait for the bridge's SUB socket before anything may publish."""
+    return _bridge.wait_until_subscribed(timeout)
+
+
+def proactive_bridge_is_alive() -> bool:
+    """Whether the bridge thread is running. See ``ProactiveBridge.is_alive``."""
+    return _bridge.is_alive()
 
 
 def stop_proactive_bridge() -> None:

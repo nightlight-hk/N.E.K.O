@@ -1,13 +1,13 @@
 """
 MCP Adapter Plugin
 
-MCP (Model Context Protocol) Router - 连接 MCP servers 并将其 tools 暴露为 NEKO entries。
+MCP (Model Context Protocol) Router - connects MCP servers and exposes their tools as NEKO entries.
 
-功能：
-1. 管理多个 MCP server 连接
-2. 自动发现 MCP server 的 tools
-3. 将 tools 动态注册为 NEKO entries
-4. 提供统一的工具调用接口
+Features:
+1. Manage connections to multiple MCP servers
+2. Automatically discover MCP server tools
+3. Dynamically register tools as NEKO entries
+4. Provide a unified tool invocation interface
 """
 import asyncio
 import json
@@ -19,6 +19,7 @@ from urllib.parse import urljoin
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Callable
 
+import httpx
 from pydantic import BaseModel, Field
 from bs4 import BeautifulSoup  # type: ignore[import-untyped]
 from markdownify import markdownify as markdownify_html  # type: ignore[import-untyped]
@@ -39,14 +40,29 @@ from plugin.plugins.mcp_adapter.normalizer import MCPRequestNormalizer
 from plugin.plugins.mcp_adapter.serializer import MCPResponseSerializer
 from plugin.plugins.mcp_adapter.router import MCPRouteEngine
 from plugin.plugins.mcp_adapter.invoker import MCPPluginInvoker
+from plugin.plugins.mcp_adapter.chat_schema import portable_chat_schema
 from utils.aiohttp_proxy_utils import aiohttp_session_kwargs_for_url
+
+# The chat-injection (LLM tool) path creates run records through POST /runs, then polls for terminal results.
+# These constants constrain the forwarding timeout budget: LLM tool registration timeout = MCP tool timeout + forwarding margin,
+# bounded by main_server /api/tools/register's 300s maximum.
+_LLM_TOOL_TIMEOUT_SLACK_S = 15.0
+_LLM_TOOL_TIMEOUT_CAP_S = 300.0
+_RUN_POLL_INTERVAL_S = 0.5
+_RUN_TERMINAL_STATUSES = frozenset(("succeeded", "failed", "canceled", "timeout"))
+# Cross-plugin LLM tool-name duplicate-check cache TTL; numeric suffix deduplication limit (prevents unbounded loops in extreme cases).
+_FOREIGN_NAME_CACHE_TTL_S = 5.0
+_LLM_TOOL_NAME_MAX_SUFFIX = 100
+# Polling window to confirm remote registration (register_llm_tool only queues registration to the host).
+_REMOTE_CONFIRM_TIMEOUT_S = 5.0
+_REMOTE_CONFIRM_INTERVAL_S = 0.2
 
 
 class _MCPInternalTransport:
     """
-    内部直调 transport。
+    Internal direct-call transport.
 
-    gateway_invoke 走 handle_envelope 直调，不依赖 recv/send 轮询。
+    gateway_invoke calls handle_envelope directly without recv/send polling.
     """
 
     protocol_name = "mcp_internal"
@@ -66,7 +82,7 @@ class _MCPInternalTransport:
 
 @dataclass
 class MCPServerConfig:
-    """MCP Server 配置"""
+    """MCP Server configuration"""
     name: str
     transport: str  # "stdio" | "sse" | "streamable-http"
     command: Optional[str] = None
@@ -74,11 +90,12 @@ class MCPServerConfig:
     url: Optional[str] = None
     env: Dict[str, str] = field(default_factory=dict)
     enabled: bool = True
+    headers: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
 class MCPTool:
-    """MCP Tool 信息"""
+    """MCP Tool information"""
     name: str
     description: str
     input_schema: Dict[str, object]
@@ -87,7 +104,7 @@ class MCPTool:
 
 @dataclass
 class MCPServerConnection:
-    """MCP Server 连接状态"""
+    """MCP Server connection status"""
     config: MCPServerConfig
     process: Optional[subprocess.Popen] = None
     reader: Optional[asyncio.StreamReader] = None
@@ -105,6 +122,7 @@ class McpServerView(BaseModel):
     tools_count: int
     error: str | None = None
     tools: list[dict[str, str]] = Field(default_factory=list)
+    inject_to_chat: bool = False
 
 
 class McpPanelState(BaseModel):
@@ -115,7 +133,7 @@ class McpPanelState(BaseModel):
 
 
 class MCPClient:
-    """MCP Client - 管理与 MCP Server 的通信"""
+    """MCP Client - manages communication with MCP Server"""
     
     def __init__(self, config: MCPServerConfig, logger=None):
         self.config = config
@@ -130,7 +148,7 @@ class MCPClient:
         self._read_task: Optional[asyncio.Task] = None
         self._stderr_task: Optional[asyncio.Task] = None
         self._shutdown = False
-        # 重连配置
+        # Reconnection configuration.
         self._reconnect_attempts = 0
         self._on_disconnect_callback: Optional[Callable] = None
         self._content_error_pattern = re.compile(r"<error>\s*(.*?)\s*</error>", re.IGNORECASE | re.DOTALL)
@@ -322,7 +340,7 @@ class MCPClient:
         return matched_payload
     
     async def connect(self, timeout: float = 30.0) -> bool:
-        """连接到 MCP Server"""
+        """Connect to MCP Server"""
         if self.config.transport == "stdio":
             return await self._connect_stdio(timeout)
         elif self.config.transport == "sse":
@@ -335,16 +353,16 @@ class MCPClient:
             return False
     
     async def _connect_stdio(self, timeout: float) -> bool:
-        """通过 stdio 连接到 MCP Server"""
+        """Connect to MCP Server over stdio"""
         try:
             if not self.config.command:
                 raise ValueError("Command is required for stdio transport")
             
-            # 准备环境变量
+            # Prepare environment variables.
             env = os.environ.copy()
             env.update(self.config.env)
             
-            # 启动进程
+            # Start the process.
             cmd = [self.config.command] + self.config.args
             if self.logger:
                 self.logger.info(f"Starting MCP server '{self.config.name}': {' '.join(cmd)}")
@@ -360,12 +378,12 @@ class MCPClient:
             self.reader = self.process.stdout
             self.writer = self.process.stdin
             
-            # 启动读取任务
+            # Start the reader task.
             self._read_task = asyncio.create_task(self._read_loop())
-            # 启动 stderr 读取任务（避免缓冲区满导致阻塞）
+            # Start stderr reading to avoid blocking when its buffer fills.
             self._stderr_task = asyncio.create_task(self._read_stderr())
             
-            # 发送 initialize 请求
+            # Send the initialize request.
             result = await asyncio.wait_for(
                 self._send_request("initialize", {
                     "protocolVersion": "2024-11-05",
@@ -381,10 +399,10 @@ class MCPClient:
             if result.get("error"):
                 raise Exception(f"Initialize failed: {result['error']}")
             
-            # 发送 initialized 通知
+            # Send the initialized notification.
             await self._send_notification("notifications/initialized", {})
             
-            # 获取 tools 列表
+            # Fetch the tools list.
             tools_result = await asyncio.wait_for(
                 self._send_request("tools/list", {}),
                 timeout=timeout
@@ -393,7 +411,7 @@ class MCPClient:
             if tools_result.get("error"):
                 raise Exception(f"Failed to list tools: {tools_result['error']}")
             
-            # 解析 tools
+            # Parse tools.
             self.tools = []
             result_obj = tools_result.get("result")
             tools_list: list[object] = []
@@ -431,7 +449,7 @@ class MCPClient:
             return False
     
     async def _connect_http(self, timeout: float) -> bool:
-        """通过 HTTP/SSE 连接到 MCP Server"""
+        """Connect to MCP Server over HTTP/SSE"""
         try:
             if not self.config.url:
                 raise ValueError("URL is required for HTTP/SSE transport")
@@ -442,12 +460,12 @@ class MCPClient:
             if self.logger:
                 self.logger.info(f"Connecting to MCP server '{self.config.name}' via HTTP: {url}")
             
-            # 创建 HTTP session
+            # Create the HTTP session.
             self._http_session = aiohttp.ClientSession(
                 **aiohttp_session_kwargs_for_url(url)
             )
             
-            # 发送 initialize 请求
+            # Send the initialize request.
             init_payload = {
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -462,8 +480,9 @@ class MCPClient:
                 }
             }
             
-            # MCP Streamable HTTP 需要 Accept 头
+            # MCP Streamable HTTP requires the Accept header.
             headers = {
+                **self.config.headers,
                 "Accept": "application/json, text/event-stream",
                 "Content-Type": "application/json",
             }
@@ -477,7 +496,7 @@ class MCPClient:
                 if resp.status != 200:
                     raise ValueError(f"HTTP {resp.status}: {await resp.text()}")
                 init_result = await self._read_http_response_payload(resp, expected_id=1)
-                # 保存 session ID（如果服务器返回）
+                # Save the session ID if returned by the server.
                 session_id = resp.headers.get("mcp-session-id")
                 if session_id:
                     self._http_session_id = session_id
@@ -486,7 +505,7 @@ class MCPClient:
             if "error" in init_result:
                 raise ValueError(f"Initialize failed: {init_result['error']}")
             
-            # 发送 initialized 通知
+            # Send the initialized notification.
             notif_payload = {
                 "jsonrpc": "2.0",
                 "method": "notifications/initialized"
@@ -495,7 +514,7 @@ class MCPClient:
                 if resp.status >= 400:
                     raise ValueError(f"HTTP {resp.status}: {await resp.text()}")
             
-            # 获取 tools 列表
+            # Fetch the tools list.
             tools_payload = {
                 "jsonrpc": "2.0",
                 "id": 2,
@@ -515,7 +534,7 @@ class MCPClient:
             if "error" in tools_result:
                 raise ValueError(f"Failed to list tools: {tools_result['error']}")
             
-            # 解析 tools
+            # Parse tools.
             self.tools = []
             result_obj = tools_result.get("result")
             tools_list: list[object] = []
@@ -553,7 +572,7 @@ class MCPClient:
             return False
 
     async def _connect_sse(self, timeout: float) -> bool:
-        """通过 legacy HTTP+SSE 连接到 MCP Server。"""
+        """Connect to MCP Server over legacy HTTP+SSE."""
         try:
             if not self.config.url:
                 raise ValueError("URL is required for SSE transport")
@@ -568,6 +587,7 @@ class MCPClient:
                 **aiohttp_session_kwargs_for_url(url)
             )
             headers = {
+                **self.config.headers,
                 "Accept": "text/event-stream",
                 "Cache-Control": "no-cache",
             }
@@ -650,11 +670,11 @@ class MCPClient:
             return False
     
     def set_disconnect_callback(self, callback: Callable) -> None:
-        """设置断开连接时的回调"""
+        """Set the disconnect callback"""
         self._on_disconnect_callback = callback
     
     async def disconnect(self):
-        """断开连接"""
+        """Disconnect"""
         self._shutdown = True
         self.connected = False
 
@@ -704,7 +724,7 @@ class MCPClient:
         self.reader = None
         self.tools = []
         
-        # 关闭 HTTP session
+        # Close the HTTP session.
         sse_response = getattr(self, "_sse_response", None)
         if sse_response is not None:
             try:
@@ -718,14 +738,14 @@ class MCPClient:
             await self._http_session.close()
             self._http_session = None
         
-        # 取消所有待处理的请求
+        # Cancel all pending requests.
         for future in self._pending_requests.values():
             if not future.done():
                 future.set_exception(Exception("Connection closed"))
         self._pending_requests.clear()
     
     async def call_tool(self, tool_name: str, arguments: Dict[str, object], timeout: float = 60.0) -> Dict[str, object]:
-        """调用 MCP tool"""
+        """Invoke an MCP tool"""
         if not self.connected:
             return {"error": "Not connected"}
         
@@ -781,10 +801,10 @@ class MCPClient:
         *,
         timeout: float = 60.0,
     ) -> Dict[str, object]:
-        """通过 HTTP 发送 JSON-RPC 请求"""
+        """Send a JSON-RPC request over HTTP"""
         import aiohttp
         
-        # 每次请求都创建新的 session，避免事件循环问题
+        # Create a fresh session per request to avoid event-loop issues.
         async with aiohttp.ClientSession(
             **aiohttp_session_kwargs_for_url(self.config.url or "")
         ) as session:
@@ -819,7 +839,7 @@ class MCPClient:
             async with session.post(
                 message_url,
                 json=payload,
-                headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"},
+                headers={**self.config.headers, "Content-Type": "application/json", "Accept": "application/json, text/event-stream"},
                 timeout=aiohttp.ClientTimeout(total=timeout),
             ) as resp:
                 if resp.status >= 400:
@@ -846,7 +866,7 @@ class MCPClient:
         *,
         timeout: float = 60.0,
     ) -> Dict[str, object]:
-        """执行实际的 HTTP 请求"""
+        """Perform the actual HTTP request"""
         import aiohttp
         
         self._request_id += 1
@@ -864,10 +884,11 @@ class MCPClient:
             raise Exception("URL not configured")
         
         headers = {
+            **self.config.headers,
             "Accept": "application/json, text/event-stream",
             "Content-Type": "application/json",
         }
-        # 添加 session ID（如果有）
+        # Add the session ID if present.
         if hasattr(self, '_http_session_id') and self._http_session_id:
             headers["mcp-session-id"] = self._http_session_id
         
@@ -893,14 +914,14 @@ class MCPClient:
         *,
         timeout: float = 60.0,
     ) -> Dict[str, object]:
-        """发送 JSON-RPC 请求"""
-        # HTTP 传输
+        """Send a JSON-RPC request"""
+        # HTTP transport.
         if self.config.transport == "streamable-http":
             return await self._send_http_request(method, params, timeout=timeout)
         if self.config.transport == "sse":
             return await self._send_sse_request(method, params, timeout=timeout)
         
-        # stdio 传输
+        # stdio transport.
         if not self.writer:
             raise Exception("Not connected")
         
@@ -914,23 +935,23 @@ class MCPClient:
             "params": params,
         }
         
-        # 创建 Future 等待响应
+        # Create a Future to await the response.
         future: asyncio.Future = asyncio.get_running_loop().create_future()
         self._pending_requests[request_id] = future
         
         try:
-            # 发送消息
+            # Send the message.
             data = json.dumps(message) + "\n"
             self.writer.write(data.encode())
             await self.writer.drain()
             
-            # 等待响应
+            # Await the response.
             return await future
         finally:
             self._pending_requests.pop(request_id, None)
     
     async def _send_notification(self, method: str, params: Dict[str, object]):
-        """发送 JSON-RPC 通知（无响应）"""
+        """Send a JSON-RPC notification (no response)"""
         if self.config.transport == "sse":
             import aiohttp
 
@@ -946,7 +967,7 @@ class MCPClient:
             async with session.post(
                 message_url,
                 json=message,
-                headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"},
+                headers={**self.config.headers, "Content-Type": "application/json", "Accept": "application/json, text/event-stream"},
                 timeout=aiohttp.ClientTimeout(total=30.0),
             ) as resp:
                 if resp.status >= 400:
@@ -967,7 +988,7 @@ class MCPClient:
         await self.writer.drain()
     
     async def _read_stderr(self):
-        """读取 stderr 输出（避免缓冲区满导致进程阻塞）"""
+        """Read stderr output to prevent a full buffer from blocking the process"""
         try:
             if not self.process or not self.process.stderr:
                 return
@@ -977,9 +998,9 @@ class MCPClient:
                 if not line:
                     break
                 
-                # 记录 stderr 输出 — 上游 MCP 进程的 stderr 可能含敏感数据，不写 logger。
-                # decode 用 errors="replace" 防止单行非 UTF-8 字节让整个 stderr
-                # 协程崩掉、子进程的 stderr buffer 后续被堵死。
+                # Record stderr output: upstream MCP stderr may contain sensitive data, so do not use logger.
+                # Decode with errors="replace" so one non-UTF-8 line cannot crash the entire stderr
+                # coroutine and subsequently block the subprocess's stderr buffer.
                 stderr_text = line.decode("utf-8", errors="replace").strip()
                 if stderr_text and self.logger:
                     self.logger.debug(f"MCP server '{self.config.name}' stderr (len={len(stderr_text)})")
@@ -991,17 +1012,17 @@ class MCPClient:
                 self.logger.debug(f"Error reading stderr: {e}")
     
     async def _read_loop(self):
-        """读取响应循环"""
+        """Response-reading loop"""
         try:
             while self.reader and not self._shutdown:
                 line = await self.reader.readline()
                 if not line:
-                    # 连接断开
+                    # Connection closed.
                     if not self._shutdown and self.connected:
                         self.connected = False
                         if self.logger:
                             self.logger.warning(f"MCP server '{self.config.name}' connection lost")
-                        # 触发断开回调
+                        # Trigger the disconnect callback.
                         if self._on_disconnect_callback:
                             asyncio.create_task(self._on_disconnect_callback(self.config.name))
                     break
@@ -1017,7 +1038,7 @@ class MCPClient:
         except Exception as e:
             if self.logger:
                 self.logger.exception(f"Error in read loop: {e}")
-            # 连接异常断开
+            # Connection closed unexpectedly.
             if not self._shutdown and self.connected:
                 self.connected = False
                 if self._on_disconnect_callback:
@@ -1078,11 +1099,11 @@ class MCPClient:
                 asyncio.create_task(self._on_disconnect_callback(self.config.name))
     
     async def _handle_message(self, message: Dict[str, object]):
-        """处理收到的消息"""
+        """Handle an incoming message"""
         request_id = message.get("id")
         
         if request_id is not None:
-            # 这是一个响应
+            # This is a response.
             req_id_int = int(request_id) if isinstance(request_id, (int, float, str)) else 0
             future = self._pending_requests.get(req_id_int)
             if future and not future.done():
@@ -1091,7 +1112,7 @@ class MCPClient:
                 else:
                     future.set_result({"result": message.get("result")})
         else:
-            # 这是一个通知
+            # This is a notification.
             method = message.get("method")
             if self.logger:
                 self.logger.debug(f"Received notification: {method}")
@@ -1100,13 +1121,13 @@ class MCPClient:
 @neko_plugin
 class MCPAdapterPlugin(NekoAdapterPlugin):
     """
-    MCP Adapter Plugin - 真正的 Adapter 类型插件
+    MCP Adapter Plugin - a genuine Adapter-type plugin
     
-    使用 Gateway Core 架构：
-    - MCPRouteEngine: 路由决策
-    - MCPPluginInvoker: 插件调用
-    - MCPRequestNormalizer: 请求规范化
-    - MCPResponseSerializer: 响应序列化
+    Uses the Gateway Core architecture:
+    - MCPRouteEngine: routing decisions
+    - MCPPluginInvoker: plugin invocation
+    - MCPRequestNormalizer: request normalization
+    - MCPResponseSerializer: response serialization
     """
     
     __freezable__ = ["_server_states"]
@@ -1120,14 +1141,24 @@ class MCPAdapterPlugin(NekoAdapterPlugin):
         self._pending_auto_connect: Dict[str, tuple[Dict[str, object], float]] = {}
         self._reconnect_tasks: Dict[str, asyncio.Task] = {}
         self._shutdown = False
-        # 重连配置缓存
+        # Cached reconnection configuration.
         self._auto_reconnect = True
         self._reconnect_interval = 5
         self._max_reconnect_attempts = 3
         self._tool_timeout = 60.0
         self._servers_config: Dict[str, Dict[str, object]] = {}
+        # MCP tools injected into chat context: tool_id -> {"llm_name", "server_name", "tool_name"}
+        self._chat_tools: Dict[str, Dict[str, str]] = {}
+        # Locally registered chat injections awaiting remote confirmation (same structure); move to _chat_tools after confirmation.
+        self._pending_chat_tools: Dict[str, Dict[str, str]] = {}
+        # Serialize chat-injection registration/removal and set_chat_injection's persistence + application,
+        # preventing concurrent toggles from interleaving (mapping overwrites or cleanup during registration).
+        self._chat_tools_lock = asyncio.Lock()
+        self._servers_config_lock = asyncio.Lock()
+        # Cross-plugin LLM tool-name duplicate-check cache: (fetched_at, foreign_names).
+        self._foreign_llm_names_cache: Optional[tuple[float, frozenset]] = None
         
-        # Gateway Core 组件
+        # Gateway Core components.
         self._route_engine: Optional[MCPRouteEngine] = None
         self._invoker: Optional[MCPPluginInvoker] = None
         self._normalizer: Optional[MCPRequestNormalizer] = None
@@ -1148,6 +1179,7 @@ class MCPAdapterPlugin(NekoAdapterPlugin):
                 connected=bool(client.connected),
                 tools_count=len(client.tools),
                 error=None,
+                inject_to_chat=self._is_chat_injection_enabled(name),
                 tools=[
                     {
                         "name": tool.name,
@@ -1166,6 +1198,7 @@ class MCPAdapterPlugin(NekoAdapterPlugin):
                 connected=bool(state.get("connected", False)),
                 tools_count=int(state.get("tools_count", 0) or 0),
                 error=str(state.get("error")) if state.get("error") else None,
+                inject_to_chat=self._is_chat_injection_enabled(name),
                 tools=[
                     {"name": str(tool_name), "description": ""}
                     for tool_name in state.get("tools", [])
@@ -1181,27 +1214,27 @@ class MCPAdapterPlugin(NekoAdapterPlugin):
     
     @lifecycle(id="startup")
     async def on_startup(self):
-        """插件启动时连接所有配置的 MCP servers"""
+        """Connect all configured MCP servers on plugin startup"""
         self.ctx.logger.info("MCP Adapter starting...")
         
-        # 初始化 Adapter 基类
+        # Initialize the Adapter base class.
         await self.adapter_startup()
         
-        # 加载配置
+        # Load configuration.
         config = await self.config.dump()
         servers_config = config.get("mcp_servers", {})
         adapter_config = config.get("mcp_adapter", {})
         
         connect_timeout = self._coerce_timeout(adapter_config.get("connect_timeout", 30), 30.0)
         
-        # 缓存重连配置
+        # Cache reconnection configuration.
         self._auto_reconnect = self._coerce_bool(adapter_config.get("auto_reconnect", True), True)
         self._reconnect_interval = self._coerce_int(adapter_config.get("reconnect_interval", 5), 5, minimum=0)
         self._max_reconnect_attempts = self._coerce_int(adapter_config.get("max_reconnect_attempts", 3), 3, minimum=0)
         self._tool_timeout = self._coerce_timeout(adapter_config.get("tool_timeout", 60), 60.0)
         self._servers_config = servers_config
         
-        # 先初始化 Gateway Core 组件（需要在连接服务器之前，因为 _register_mcp_tools 依赖它）
+        # Initialize Gateway Core components first, before server connections, because _register_mcp_tools depends on them.
         self._init_gateway_core()
         
         # Schedule enabled servers in the background. Startup must stay responsive
@@ -1235,35 +1268,16 @@ class MCPAdapterPlugin(NekoAdapterPlugin):
         display_name: str,
         description: str,
         schema: Optional[Dict[str, object]],
+        server_name: str,
+        tool_name: str,
     ) -> bool:
-        """Gateway Core 工具注册回调 - 注册为动态 entry。"""
-        def _parse_tool_id(value: str) -> tuple[str | None, str | None]:
-            # 优先按已连接 server 前缀解析，兼容 server 名含 "_"
-            for server_name in sorted(self._clients.keys(), key=len, reverse=True):
-                prefix = f"mcp_{server_name}_"
-                if value.startswith(prefix):
-                    tool_name = value[len(prefix):]
-                    if tool_name:
-                        return server_name, tool_name
-            # 兜底兼容老解析逻辑
-            parts = value.split("_", 2)
-            if len(parts) >= 3 and parts[1] and parts[2]:
-                return parts[1], parts[2]
-            return None, None
-
-        parsed_server_name, parsed_tool_name = _parse_tool_id(tool_id)
-
-        # 创建工具处理器
+        """Gateway Core tool registration callback - register a dynamic entry and inject into chat context as configured."""
+        # Create the tool handler.
         async def tool_handler(**kwargs: object) -> Dict[str, object]:
-            # 从 tool_id 解析 server_name 和 tool_name
-            server_name, tool_name = parsed_server_name, parsed_tool_name
-            if not server_name or not tool_name:
-                return Err(SdkError(f"Invalid tool_id: {tool_id}"))
-            
-            # 移除 NEKO 注入的参数
+            # Remove parameters injected by NEKO.
             arguments = {k: v for k, v in kwargs.items() if not k.startswith("_")}
-            
-            # 获取对应的 client
+
+            # Get the corresponding client.
             target_client = self._clients.get(server_name)
             if not target_client:
                 return Err(SdkError(f"Server '{server_name}' not connected"))
@@ -1282,8 +1296,8 @@ class MCPAdapterPlugin(NekoAdapterPlugin):
                 message=str(payload.get("summary") or ""),
             )
 
-        # 注册为动态 entry
-        return self.register_dynamic_entry(
+        # Register as a dynamic entry.
+        registered = self.register_dynamic_entry(
             entry_id=tool_id,
             handler=tool_handler,
             name=display_name,
@@ -1293,14 +1307,624 @@ class MCPAdapterPlugin(NekoAdapterPlugin):
             timeout=self._tool_timeout + 5.0,
             llm_result_fields=["summary"],
         )
-    
+
+        # Inject into chat context (LLM tool) per server configuration: register only locally
+        # as pending; _register_mcp_tools confirms remotely after registering the entire batch.
+        # Injection failures only log and do not affect the dynamic entry itself: the original POST /runs
+        # invocation path remains available.
+        if registered and self._is_chat_injection_enabled(server_name):
+            async with self._chat_tools_lock:
+                await self._register_chat_tool_local_locked(
+                    tool_id=tool_id,
+                    server_name=server_name,
+                    tool_name=tool_name,
+                    description=description,
+                    schema=schema,
+                )
+
+        return registered
+
     async def _on_tool_unregister(self, tool_id: str) -> bool:
-        """Gateway Core 工具注销回调 - 注销动态 entry。"""
+        """Gateway Core tool unregistration callback - remove the dynamic entry and chat injection."""
+        async with self._chat_tools_lock:
+            await self._unregister_chat_tool_locked(tool_id)
         return self.unregister_dynamic_entry(tool_id)
+
+    # ------------------------------------------------------------------
+    # Chat-context injection (LLM tool).
+    # ------------------------------------------------------------------
+    #
+    # Use the plugin SDK's register_llm_tool / unregister_llm_tool (see
+    # plugin/sdk/plugin/base.py) to dynamically inject/remove MCP tools in chat context:
+    # the SDK registers a dynamic entry with reserved ID __llm_tool__{name}, then
+    # LLM_TOOL_REGISTER IPC -> main_server /api/tools/register registers it as
+    # a model-callable tool. Chat LLM calls return through /api/llm-tools/callback to
+    # this plugin's handler, which forwards to POST /runs to reuse the original invocation path,
+    # placing calls in the plugin management UI's run history.
+
+    def _is_chat_injection_enabled(self, server_name: str) -> bool:
+        cfg = self._servers_config.get(server_name)
+        if not isinstance(cfg, dict):
+            return False
+        return self._coerce_bool(cfg.get("inject_to_chat", False), False)
+
+    def _chat_tool_timeout(self) -> float:
+        """Total chat-injected tool budget (seconds): MCP timeout + forwarding margin, bounded by main_server's
+        ``/api/tools/register`` 300s maximum. Registration timeout, polling deadline, and run-side
+        entry_timeout all derive from this budget, ensuring the run watchdog cancels before the
+        chat polling deadline, rather than chat timing out before the run later succeeds."""
+        return min(self._tool_timeout + _LLM_TOOL_TIMEOUT_SLACK_S, _LLM_TOOL_TIMEOUT_CAP_S)
+
+    async def _fetch_foreign_llm_tool_names(self) -> frozenset:
+        """Query LLM tool names occupied by other sources on main_server.
+
+        main_server's tool registry uses names as global keys with replacement semantics; cross-plugin
+        duplicates would evict others' tools and redirect model calls. ``/api/tools/register``
+        now rejects cross-source overwrites on the server (the authoritative defense); this preliminary check
+        is merely best-effort fail-fast optimization, avoiding queued registrations for doomed names and selecting numeric
+        suffixes early. Query failure returns an empty set (fail-open) without blocking injection. A short TTL cache
+        avoids repeated interface calls within one tool-registration batch.
+        """
+        from config import MAIN_SERVER_PORT
+
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        cached = self._foreign_llm_names_cache
+        if cached is not None and now - cached[0] < _FOREIGN_NAME_CACHE_TTL_S:
+            return cached[1]
+
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(5.0, connect=2.0),
+                proxy=None,
+                trust_env=False,
+            ) as client:
+                resp = await client.get(f"http://127.0.0.1:{int(MAIN_SERVER_PORT)}/api/tools")
+            body = resp.json() if resp.status_code == 200 else None
+        except (httpx.HTTPError, OSError, ValueError):
+            body = None
+
+        foreign: set[str] = set()
+        tools_by_role = body.get("tools_by_role") if isinstance(body, dict) else None
+        if isinstance(tools_by_role, dict):
+            own_source = f"plugin:{self.plugin_id}"
+            for role_tools in tools_by_role.values():
+                if not isinstance(role_tools, list):
+                    continue
+                for tool in role_tools:
+                    if not isinstance(tool, dict):
+                        continue
+                    name = tool.get("name")
+                    if not isinstance(name, str) or not name:
+                        continue
+                    if str(tool.get("source") or "") != own_source:
+                        foreign.add(name)
+
+        frozen = frozenset(foreign)
+        self._foreign_llm_names_cache = (now, frozen)
+        return frozen
+
+    def _alloc_llm_tool_name(self, tool_id: str, taken: frozenset = frozenset()) -> Optional[str]:
+        """Map an MCP tool_id to a valid, unique LLM tool name.
+
+        Chat providers require names matching ``[A-Za-z0-9_\\-]{1,64}``; server/tool
+        names may contain non-ASCII characters, all folded to "_". ``taken`` contains names occupied
+        across plugins (deduplicated with this plugin's registered names); append runtime numeric suffixes on conflict.
+        Return None if suffixes are exhausted and conflicts remain, letting the caller skip injection.
+        """
+        base = re.sub(r"[^A-Za-z0-9_\-]+", "_", tool_id).strip("_-")
+        if not base:
+            base = "mcp_tool"
+        base = base[:56]
+        candidate = base
+        suffix = 2
+        while candidate in self._llm_tools or candidate in taken:
+            if suffix > _LLM_TOOL_NAME_MAX_SUFFIX:
+                return None
+            candidate = f"{base}_{suffix}"
+            suffix += 1
+        return candidate
+
+    async def _confirm_pending_chat_tools_locked(self, server_name: str) -> int:
+        """Confirm a server's pending chat injections have taken effect on main_server in one batch.
+
+        ``register_llm_tool`` merely queues registration to the host asynchronously; only the host logs failures.
+        main_server unavailability and cross-source name rejection both occur on this path,
+        so local pending registration requires confirmation. The batch shares one deadline, preventing tool
+        count from multiplying connection stalls (at most one window). Confirmed entries move to
+        ``_chat_tools``; unconfirmed local registrations roll back. Match both (name,
+        source=plugin:{self}); a name belonging to another source can never
+        match. Requires ``_chat_tools_lock``.
+        """
+        pending_ids = [
+            tid for tid, info in self._pending_chat_tools.items()
+            if info.get("server_name") == server_name
+        ]
+        if not pending_ids:
+            return 0
+        from config import MAIN_SERVER_PORT
+
+        own_source = f"plugin:{self.plugin_id}"
+        names_by_id = {tid: str(self._pending_chat_tools[tid].get("llm_name") or "") for tid in pending_ids}
+        pending_names = {name for name in names_by_id.values() if name}
+        confirmed_names: set[str] = set()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _REMOTE_CONFIRM_TIMEOUT_S
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(2.0, connect=1.0),
+                proxy=None,
+                trust_env=False,
+            ) as client:
+                while pending_names and loop.time() < deadline:
+                    try:
+                        resp = await client.get(f"http://127.0.0.1:{int(MAIN_SERVER_PORT)}/api/tools")
+                        if resp.status_code == 200:
+                            body = resp.json()
+                            tools_by_role = body.get("tools_by_role") if isinstance(body, dict) else None
+                            if isinstance(tools_by_role, dict):
+                                for role_tools in tools_by_role.values():
+                                    if not isinstance(role_tools, list):
+                                        continue
+                                    for tool in role_tools:
+                                        if not isinstance(tool, dict):
+                                            continue
+                                        name = tool.get("name")
+                                        if (
+                                            name in pending_names
+                                            and str(tool.get("source") or "") == own_source
+                                        ):
+                                            confirmed_names.add(str(name))
+                            pending_names -= confirmed_names
+                    except (httpx.HTTPError, OSError, ValueError):
+                        pass
+                    if pending_names and loop.time() < deadline:
+                        await asyncio.sleep(min(_REMOTE_CONFIRM_INTERVAL_S, max(deadline - loop.time(), 0.0)))
+        except (httpx.HTTPError, OSError, ValueError):
+            pass
+
+        def _rollback(llm_name: str) -> None:
+            try:
+                self.unregister_llm_tool(llm_name)
+            except Exception:
+                pass
+
+        if not self._is_chat_injection_enabled(server_name):
+            # Configuration flipped during confirmation (e.g. concurrent disable persisted false): roll everything back.
+            for tid in pending_ids:
+                info = self._pending_chat_tools.pop(tid, None)
+                if info:
+                    _rollback(str(info.get("llm_name") or ""))
+            self.ctx.logger.info(
+                f"Chat injection disabled while confirming tools of server '{server_name}'; rolled back"
+            )
+            return 0
+
+        confirmed_count = 0
+        for tid in pending_ids:
+            info = self._pending_chat_tools.pop(tid, None)
+            if info is None:
+                continue
+            llm_name = str(info.get("llm_name") or "")
+            if llm_name in confirmed_names:
+                self._chat_tools[tid] = info
+                confirmed_count += 1
+            else:
+                _rollback(llm_name)
+        if confirmed_count < len(pending_ids):
+            self.ctx.logger.warning(
+                f"Remote registration confirmed for {confirmed_count}/{len(pending_ids)} "
+                f"chat tool(s) of server '{server_name}'; unconfirmed ones rolled back"
+            )
+        return confirmed_count
+
+    async def _register_chat_tool_local_locked(
+        self,
+        *,
+        tool_id: str,
+        server_name: str,
+        tool_name: str,
+        description: str,
+        schema: Optional[Dict[str, object]],
+    ) -> bool:
+        """Locally register one MCP tool for chat injection (pending batch confirmation).
+
+        Requires ``_chat_tools_lock``. Remote confirmation is batched by
+        ``_confirm_pending_chat_tools_locked``. Registration paths (connection callbacks,
+        enabling the toggle) must not await each tool's confirmation here, which would multiply stalls by tool count.
+        """
+        if tool_id in self._chat_tools or tool_id in self._pending_chat_tools:
+            return True
+        foreign = await self._fetch_foreign_llm_tool_names()
+        llm_name = self._alloc_llm_tool_name(tool_id, foreign)
+        if llm_name is None:
+            self.ctx.logger.warning(
+                f"Skip chat injection for MCP tool '{tool_id}': no free LLM tool name"
+            )
+            return False
+        try:
+            parameters = portable_chat_schema(
+                schema if isinstance(schema, dict) else {"type": "object", "properties": {}}
+            )
+            self.register_llm_tool(
+                name=llm_name,
+                description=description or f"MCP tool '{tool_name}' from server '{server_name}'.",
+                parameters=parameters,
+                handler=self._build_chat_tool_handler(
+                    tool_id=tool_id,
+                    server_name=server_name,
+                    tool_name=tool_name,
+                ),
+                timeout=self._chat_tool_timeout(),
+            )
+        except Exception as exc:
+            self.ctx.logger.warning(
+                f"Failed to inject MCP tool '{tool_id}' into chat context: {exc}"
+            )
+            return False
+        self._pending_chat_tools[tool_id] = {
+            "llm_name": llm_name,
+            "server_name": server_name,
+            "tool_name": tool_name,
+        }
+        return True
+
+    async def _remote_unregister_llm_tool(self, llm_name: str) -> str:
+        """Synchronously call main_server directly to unregister an LLM tool.
+
+        Return "removed" (removed or already absent), "refused" (name owned by another
+        source, so the server refused deletion and our registration never took effect), or "failed" (remote
+        temporarily unreachable). SDK ``unregister_llm_tool`` guarantees only local cleanup; remote
+        removal is asynchronous, failures are logged only by the host, and the plugin cannot observe results. Include
+        ``expected_source`` for server-side ownership verification, never accidentally deleting a same-named
+        tool owned by another plugin across sources.
+        """
+        from config import MAIN_SERVER_PORT
+
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(5.0, connect=2.0),
+                proxy=None,
+                trust_env=False,
+            ) as client:
+                resp = await client.post(
+                    f"http://127.0.0.1:{int(MAIN_SERVER_PORT)}/api/tools/unregister",
+                    json={
+                        "name": llm_name,
+                        "role": None,
+                        "expected_source": f"plugin:{self.plugin_id}",
+                    },
+                )
+            if resp.status_code >= 400:
+                return "failed"
+            body = resp.json()
+        except (httpx.HTTPError, OSError, ValueError):
+            return "failed"
+        if not isinstance(body, dict):
+            return "removed"
+        # Evaluate failed_roles before refused_roles: partial failure (some roles still carrying
+        # our tools) needs mapping retention for retry more than a name entirely owned by someone else.
+        if body.get("failed_roles"):
+            return "failed"
+        if body.get("refused_roles"):
+            return "refused"
+        return "removed"
+
+    async def _unregister_chat_tool_locked(self, tool_id: str) -> str:
+        """Remove one chat injection. Return "removed" / "absent" / "refused" / "failed".
+
+        Requires ``_chat_tools_lock``. Pending unconfirmed mappings use SDK unregistration (the host
+        removes remotely asynchronously with source verification); confirmed mappings synchronously confirm
+        remote removal first. "refused" means another source owns the name on main_server: invalidate local
+        mappings and registration without touching others' tools. "failed" means the remote is temporarily
+        unreachable; retain mappings for retry.
+        """
+        pending = self._pending_chat_tools.get(tool_id)
+        info = pending if pending is not None else self._chat_tools.get(tool_id)
+        if info is None:
+            return "absent"
+        llm_name = str(info.get("llm_name") or "")
+        if not llm_name:
+            self._chat_tools.pop(tool_id, None)
+            self._pending_chat_tools.pop(tool_id, None)
+            return "absent"
+        remote = await self._remote_unregister_llm_tool(llm_name)
+        if remote == "failed":
+            # Retain mappings until remote removal is confirmed, allowing retry on the next toggle/disconnect;
+            # avoid a zombie state where the panel shows disabled but main_server retains dead callback tools.
+            self.ctx.logger.warning(
+                f"Remote unregister not confirmed for chat tool '{llm_name}' "
+                f"(MCP tool '{tool_id}'); keeping mapping for retry"
+            )
+            return "failed"
+        self._chat_tools.pop(tool_id, None)
+        self._pending_chat_tools.pop(tool_id, None)
+        try:
+            self.unregister_llm_tool(llm_name)
+        except Exception as exc:
+            self.ctx.logger.warning(
+                f"Local cleanup after remote unregister failed for MCP tool '{tool_id}': {exc}"
+            )
+        if remote == "refused":
+            # Name ownership flipped to another source (e.g. claimed after main_server restarted):
+            # SDK unregistration above removes only our local registration and stops on remote refusal,
+            # never touching others' tools. Invalidate the mapping; next enable registers under a new name.
+            self.ctx.logger.info(
+                f"Chat tool '{llm_name}' is owned by another source on main_server; "
+                f"dropping local registration for MCP tool '{tool_id}'"
+            )
+            return "refused"
+        self.ctx.logger.info(
+            f"Removed chat injection for MCP tool '{tool_id}' (LLM tool '{llm_name}')"
+        )
+        return "removed"
+
+    def _build_chat_tool_handler(self, *, tool_id: str, server_name: str, tool_name: str) -> Callable[..., Any]:
+        """Build a chat-injected tool handler forwarding to POST /runs to produce run records."""
+
+        async def handler(**kwargs: object) -> Dict[str, object]:
+            arguments = {k: v for k, v in kwargs.items() if not k.startswith("_")}
+            outcome = await self._execute_chat_tool_via_run(
+                entry_id=tool_id,
+                server_name=server_name,
+                tool_name=tool_name,
+                arguments=arguments,
+            )
+            if not outcome.get("success"):
+                error_msg = str(
+                    outcome.get("error")
+                    or f"MCP tool '{tool_name}' failed (run status: {outcome.get('status')})"
+                )
+                return {
+                    "output": {"server_name": server_name, "tool_name": tool_name, "error": error_msg},
+                    "is_error": True,
+                    "error": error_msg,
+                }
+            payload = outcome.get("data")
+            # _build_mcp_tool_payload always returns dict (at least "result"); a None payload
+            # means export could not be read. Report an explicit error for model retry rather than a silent empty result.
+            if payload is None:
+                error_msg = "Tool call succeeded but the run result could not be read back"
+                return {
+                    "output": {"server_name": server_name, "tool_name": tool_name, "error": error_msg},
+                    "is_error": True,
+                    "error": error_msg,
+                }
+            summary = ""
+            if isinstance(payload, dict):
+                summary = str(payload.get("summary") or "")
+            if not summary:
+                summary = self._summarize_mcp_result(payload)
+            return {
+                "server_name": server_name,
+                "tool_name": tool_name,
+                "summary": summary,
+            }
+
+        return handler
+
+    def _resolve_plugin_server_origin(self) -> str:
+        """Resolve user_plugin_server's loopback origin.
+
+        Startup may rebind a conflicting port; the environment variable stores the actual port. Resolution order
+        matches llm_tool_registry / music_pusher.
+        """
+        from config import USER_PLUGIN_SERVER_PORT
+
+        raw = os.getenv("NEKO_USER_PLUGIN_SERVER_PORT", "").strip()
+        try:
+            port = int(raw) if raw else int(USER_PLUGIN_SERVER_PORT)
+        except ValueError:
+            port = int(USER_PLUGIN_SERVER_PORT)
+        return f"http://127.0.0.1:{port}"
+
+    @staticmethod
+    def _phase_timeout_within(deadline: float, *, cap: float = 10.0) -> httpx.Timeout:
+        """Build httpx phase timeouts from the remaining budget.
+
+        httpx.Timeout connect/read/write/pool values limit individual phases, not total request
+        duration. Any phase exceeding the remaining budget would cross the deadline and delay
+        ``_cancel_run_best_effort``. Cap every phase at the remaining budget; the caller's
+        ``asyncio.timeout_at(deadline)`` enforces the hard limit for the complete request.
+        """
+        remaining = deadline - asyncio.get_running_loop().time()
+        return httpx.Timeout(
+            max(min(remaining, cap), 1.0),
+            connect=max(min(remaining, 2.0), 0.1),
+        )
+
+    async def _execute_chat_tool_via_run(
+        self,
+        *,
+        entry_id: str,
+        server_name: str,
+        tool_name: str,
+        arguments: Dict[str, object],
+    ) -> Dict[str, object]:
+        """Execute a chat-injected MCP tool call through POST /runs.
+
+        This mirrors the original invocation path (brain task_executor -> POST /runs), so
+        the call appears with plugin_id=mcp_adapter, entry_id=mcp_{server}_{tool} in the plugin
+        management UI's run history. Return {"status", "success", "data", "error"}.
+        """
+        base = self._resolve_plugin_server_origin()
+        timeout_s = self._chat_tool_timeout()
+        # Creation and polling share one absolute deadline: creation may consume the entire remaining budget
+        # (no fixed 10s ceiling squeezing the polling window), keeping total processing within the timeout
+        # registered with main_server, so chat does not time out before our clean timeout error.
+        deadline = asyncio.get_running_loop().time() + timeout_s
+        run_args = dict(arguments) if isinstance(arguments, dict) else {}
+        # Preserve the configured MCP execution window with forwarding slack.
+        run_args["_ctx"] = {"entry_timeout": min(self._tool_timeout, max(timeout_s - 1.0, 0.1))}
+        run_id: Optional[str] = None
+
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(10.0, connect=2.0),
+                proxy=None,
+                trust_env=False,
+            ) as client:
+                try:
+                    # Hard deadline: even with httpx phase timeouts capped at remaining budget, a server's
+                    # slow trickle can cross the deadline. Ensure no request delays the timeout
+                    # decision and cancellation here.
+                    async with asyncio.timeout_at(deadline):
+                        create_resp = await client.post(
+                            f"{base}/runs",
+                            json={
+                                "plugin_id": self.plugin_id,
+                                "entry_id": entry_id,
+                                "args": run_args,
+                            },
+                            timeout=self._phase_timeout_within(deadline, cap=timeout_s),
+                        )
+                        if create_resp.status_code >= 400:
+                            return {
+                                "status": "failed",
+                                "success": False,
+                                "data": None,
+                                "error": f"POST /runs returned HTTP {create_resp.status_code}",
+                            }
+                        create_body = create_resp.json()
+                        candidate_id = create_body.get("run_id") if isinstance(create_body, dict) else None
+                        if not isinstance(candidate_id, str) or not candidate_id:
+                            return {
+                                "status": "failed",
+                                "success": False,
+                                "data": None,
+                                "error": "POST /runs response missing run_id",
+                            }
+                        run_id = candidate_id
+
+                        run_record: Dict[str, object] = {}
+                        while True:
+                            remaining = deadline - asyncio.get_running_loop().time()
+                            if remaining <= 0:
+                                # Best-effort cancel the run before giving up; otherwise an upstream retry may overlap
+                                # the still-running run and duplicate execution of MCP tools with side effects.
+                                # The run watchdog (entry_timeout) usually already canceled it; this is a fallback
+                                # when creation time consumes the guard window.
+                                await self._cancel_run_best_effort(base, run_id, tool_name)
+                                return {
+                                    "status": "timeout",
+                                    "success": False,
+                                    "data": None,
+                                    "error": f"Timed out waiting for run of MCP tool '{tool_name}'",
+                                }
+                            poll_resp = await client.get(
+                                f"{base}/runs/{run_id}",
+                                timeout=self._phase_timeout_within(deadline),
+                            )
+                            if poll_resp.status_code in (404, 410):
+                                return {
+                                    "status": "failed",
+                                    "success": False,
+                                    "data": None,
+                                    "error": f"Run {run_id} not found (HTTP {poll_resp.status_code})",
+                                }
+                            if poll_resp.status_code == 200:
+                                run_record = poll_resp.json()
+                                if run_record.get("status") in _RUN_TERMINAL_STATUSES:
+                                    break
+                            await asyncio.sleep(min(_RUN_POLL_INTERVAL_S, max(deadline - asyncio.get_running_loop().time(), 0.0)))
+
+                        status = str(run_record.get("status") or "failed")
+                        if status != "succeeded":
+                            error = run_record.get("error")
+                            if isinstance(error, dict):
+                                error_msg = str(error.get("message") or error.get("code") or status)
+                            elif isinstance(error, str) and error:
+                                error_msg = error
+                            else:
+                                error_msg = f"Run {status}"
+                            return {"status": status, "success": False, "data": None, "error": error_msg}
+
+                        export_resp = await client.get(
+                            f"{base}/runs/{run_id}/export",
+                            params={"limit": 50},
+                            timeout=self._phase_timeout_within(deadline),
+                        )
+                        if export_resp.status_code != 200:
+                            return {"status": status, "success": True, "data": None, "error": None}
+                        # The run succeeded; export parse failure only degrades to empty data and must not report failure.
+                        try:
+                            payload = self._extract_chat_tool_payload(export_resp.json())
+                        except ValueError:
+                            payload = None
+                        return {"status": status, "success": True, "data": payload, "error": None}
+                except TimeoutError:
+                    # Hard deadline triggered (a request crossed it): with a run_id, attempt cancellation
+                    # after the deadline to prevent continued execution after we give up.
+                    await self._cancel_run_best_effort(base, run_id, tool_name)
+                    return {
+                        "status": "timeout",
+                        "success": False,
+                        "data": None,
+                        "error": f"Timed out waiting for run of MCP tool '{tool_name}'",
+                    }
+        except (httpx.HTTPError, OSError, ValueError) as exc:
+            await self._cancel_run_best_effort(base, run_id, tool_name)
+            return {
+                "status": "failed",
+                "success": False,
+                "data": None,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+
+    async def _cancel_run_best_effort(self, base: str, run_id: Optional[str], tool_name: str) -> None:
+        """Best-effort cancel the run before polling gives up, swallowing all transport errors."""
+        if not run_id:
+            return
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(5.0, connect=2.0),
+                proxy=None,
+                trust_env=False,
+            ) as client:
+                await client.post(
+                    f"{base}/runs/{run_id}/cancel",
+                    json={"reason": f"chat tool '{tool_name}' polling deadline exceeded"},
+                )
+        except (httpx.HTTPError, OSError, ValueError):
+            pass
+
+    @staticmethod
+    def _extract_chat_tool_payload(export_json: object) -> object:
+        """Extract trigger_response business data from the run export response.
+
+        The export response is ``{"items": [ExportItem, ...], "next_after": ...}``;
+        a trigger_response item's json (serialization alias, also accepting json_data) is
+        the finish envelope returned by host.trigger (ok()/finish() shape). Its ``data``
+        field is the business payload for ``_build_mcp_tool_payload``. If trigger_response
+        is absent, fall back to the first item containing json.
+        """
+        if not isinstance(export_json, dict):
+            return None
+        items = export_json.get("items")
+        if not isinstance(items, list):
+            return None
+        fallback: object = None
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            raw = item.get("json")
+            if raw is None:
+                raw = item.get("json_data")
+            if not isinstance(raw, dict):
+                continue
+            metadata = item.get("metadata")
+            is_trigger_response = item.get("label") == "trigger_response" or (
+                isinstance(metadata, dict) and metadata.get("kind") == "trigger_response"
+            )
+            if is_trigger_response:
+                return raw.get("data")
+            if fallback is None:
+                fallback = raw.get("data")
+        return fallback
     
     def _init_gateway_core(self) -> None:
-        """初始化 Gateway Core 组件。"""
-        # 路由引擎（带回调，用于通知前端动态 entry 变化）
+        """Initialize Gateway Core components."""
+        # Routing engine with a callback notifying the frontend of dynamic-entry changes.
         self._route_engine = MCPRouteEngine(
             mcp_clients=self._clients,
             logger=self.ctx.logger,  # type: ignore[arg-type]
@@ -1309,25 +1933,25 @@ class MCPAdapterPlugin(NekoAdapterPlugin):
         )
         self._route_engine.rebuild_tool_index()
         
-        # 请求规范化器
+        # Request normalizer.
         self._normalizer = MCPRequestNormalizer()
         
-        # 响应序列化器
+        # Response serializer.
         self._serializer = MCPResponseSerializer()
         
-        # 插件调用器
+        # Plugin invoker.
         self._invoker = MCPPluginInvoker(
             mcp_clients=self._clients,
             plugin_call_fn=self._call_neko_plugin,
             logger=self.ctx.logger,  # type: ignore[arg-type]
         )
 
-        # 策略引擎
+        # Policy engine.
         self._policy = DefaultPolicyEngine()
 
-        # 统一 Gateway Core 编排器（P0 收敛）
+        # Unified Gateway Core orchestrator (P0 convergence).
         self._gateway_core = AdapterGatewayCore(
-            transport=_MCPInternalTransport(),  # gateway_invoke 走 handle_envelope，不依赖 transport 轮询
+            transport=_MCPInternalTransport(),  # gateway_invoke uses handle_envelope without relying on transport polling.
             normalizer=self._normalizer,
             policy=self._policy,
             router=self._route_engine,
@@ -1345,18 +1969,18 @@ class MCPAdapterPlugin(NekoAdapterPlugin):
         timeout_s: float = 30.0,
     ) -> object:
         """
-        调用 NEKO 插件 entry。
+        Invoke a NEKO plugin entry.
         
-        这是 MCPPluginInvoker 的回调函数。
-        返回协程，由调用方 await。
+        Callback for MCPPluginInvoker.
+        Return a coroutine for the caller to await.
         """
-        # 使用 PluginContext 的能力调用其他插件
-        # 注意：trigger_plugin_event 会自动检测环境，在事件循环中返回协程
+        # Use PluginContext capabilities to call other plugins.
+        # Note: trigger_plugin_event automatically detects the environment and returns a coroutine inside an event loop.
         return self.ctx.trigger_plugin_event(
             target_plugin_id=plugin_id,
             event_type="adapter_call",
             event_id=entry_id,
-            params=dict(params),  # 转换为 Dict[str, Any]
+            params=dict(params),  # Convert to Dict[str, Any].
             timeout=float(timeout_s),
         )
 
@@ -1428,11 +2052,14 @@ class MCPAdapterPlugin(NekoAdapterPlugin):
         args: Optional[List[str]] = None,
         url: Optional[str] = None,
         env: Optional[Dict[str, str]] = None,
+        headers: Optional[Dict[str, str]] = None,
         enabled: bool = True,
+        inject_to_chat: bool = False,
     ) -> Dict[str, object]:
         server_cfg: Dict[str, object] = {
             "transport": transport,
             "enabled": enabled,
+            "inject_to_chat": inject_to_chat,
         }
         if command:
             server_cfg["command"] = command
@@ -1442,18 +2069,23 @@ class MCPAdapterPlugin(NekoAdapterPlugin):
             server_cfg["url"] = url
         if env:
             server_cfg["env"] = dict(env)
+        if headers:
+            server_cfg["headers"] = dict(headers)
         return server_cfg
 
     def _is_same_server_config(self, current: object, incoming: Dict[str, object]) -> bool:
         if not isinstance(current, dict):
             return False
+        current_headers = current.get("headers")
         normalized_current = self._normalize_server_config_payload(
             transport=str(current.get("transport", "")),
             command=str(current["command"]) if isinstance(current.get("command"), str) else None,
             args=list(current["args"]) if isinstance(current.get("args"), list) else None,
             url=str(current["url"]) if isinstance(current.get("url"), str) else None,
             env=dict(current["env"]) if isinstance(current.get("env"), dict) else None,
+            headers=dict(current_headers) if isinstance(current_headers, dict) else None,
             enabled=self._coerce_bool(current.get("enabled", True), True),
+            inject_to_chat=self._coerce_bool(current.get("inject_to_chat", False), False),
         )
         return normalized_current == incoming
 
@@ -1555,14 +2187,19 @@ class MCPAdapterPlugin(NekoAdapterPlugin):
     
     async def _register_mcp_tools(self, server_name: str, client: MCPClient) -> None:
         """
-        使用 Gateway Core 注册 MCP tools。
-        
-        通过 MCPRouteEngine.register_server_tools 方法：
-        1. 更新路由引擎的工具索引
-        2. 触发回调注册为动态 entry（出现在前端管理面板）
+        Register MCP tools through Gateway Core.
+
+        Via MCPRouteEngine.register_server_tools:
+        1. Update the routing engine's tool index
+        2. Trigger callbacks to register dynamic entries (visible in the frontend management panel); injection-enabled
+           servers register local LLM tools as pending in the callback
+        3. Batch-confirm remote pending registrations with one shared deadline, preventing tool count from multiplying
+           connection stalls; roll back unconfirmed registrations
         """
         if self._route_engine:
             await self._route_engine.register_server_tools(server_name, client)
+        async with self._chat_tools_lock:
+            await self._confirm_pending_chat_tools_locked(server_name)
 
     def _cancel_reconnect_task(self, server_name: str) -> bool:
         task = self._reconnect_tasks.pop(server_name, None)
@@ -1582,11 +2219,11 @@ class MCPAdapterPlugin(NekoAdapterPlugin):
     
     async def _unregister_mcp_tools(self, server_name: str) -> None:
         """
-        使用 Gateway Core 注销 MCP tools。
+        Unregister MCP tools through Gateway Core.
         
-        通过 MCPRouteEngine.unregister_server_tools 方法：
-        1. 从路由引擎移除工具索引
-        2. 触发回调注销动态 entry
+        Via MCPRouteEngine.unregister_server_tools:
+        1. Remove the routing engine's tool index
+        2. Trigger callbacks to unregister dynamic entries
         """
         if self._route_engine:
             await self._route_engine.unregister_server_tools(server_name)
@@ -1633,7 +2270,7 @@ class MCPAdapterPlugin(NekoAdapterPlugin):
     
     @lifecycle(id="shutdown")
     async def on_shutdown(self):
-        """插件关闭时断开所有连接"""
+        """Disconnect all connections on plugin shutdown"""
         self.ctx.logger.info("MCP Adapter shutting down...")
         self._shutdown = True
 
@@ -1643,12 +2280,12 @@ class MCPAdapterPlugin(NekoAdapterPlugin):
             task.cancel()
         self._connect_tasks.clear()
 
-        # 取消所有重连任务
+        # Cancel all reconnection tasks.
         for task in self._reconnect_tasks.values():
             task.cancel()
         self._reconnect_tasks.clear()
         
-        # 断开所有连接
+        # Disconnect all connections.
         for server_name, client in list(self._clients.items()):
             try:
                 await client.disconnect()
@@ -1657,41 +2294,43 @@ class MCPAdapterPlugin(NekoAdapterPlugin):
                 self.ctx.logger.warning(f"Error disconnecting from {server_name}: {e}")
         
         self._clients.clear()
+        self._chat_tools.clear()
+        self._pending_chat_tools.clear()
         self._gateway_core = None
         self._policy = None
-        
-        # 清理 Adapter 基类
+
+        # Clean up the Adapter base class.
         await self.adapter_shutdown()
     
     async def _on_server_disconnect(self, server_name: str) -> None:
-        """服务器断开连接时的回调（用于自动重连）"""
+        """Server disconnect callback for automatic reconnection"""
         if self._shutdown:
             return
         
         self.ctx.logger.warning(f"MCP server '{server_name}' disconnected")
         
-        # 更新状态
+        # Update status.
         self._server_states[server_name] = {
             **self._server_states.get(server_name, {}),
             "connected": False,
             "error": "Connection lost",
         }
         
-        # 注销 MCP tools
+        # Unregister MCP tools.
         await self._unregister_mcp_tools(server_name)
         
-        # 从 clients 中移除
+        # Remove from clients.
         if server_name in self._clients:
             del self._clients[server_name]
         
-        # 如果启用了自动重连，启动重连任务
+        # Start a reconnection task if automatic reconnection is enabled.
         if self._auto_reconnect and server_name not in self._reconnect_tasks:
             self._reconnect_tasks[server_name] = asyncio.create_task(
                 self._reconnect_server(server_name)
             )
     
     async def _reconnect_server(self, server_name: str) -> None:
-        """尝试重连服务器"""
+        """Attempt to reconnect a server"""
         try:
             server_cfg = self._servers_config.get(server_name)
             if not server_cfg:
@@ -1706,19 +2345,19 @@ class MCPAdapterPlugin(NekoAdapterPlugin):
                     f"(attempt {attempts}/{self._max_reconnect_attempts})"
                 )
                 
-                # 更新状态
+                # Update status.
                 self._server_states[server_name] = {
                     **self._server_states.get(server_name, {}),
                     "reconnect_attempts": attempts,
                 }
                 
-                # 等待重连间隔
+                # Wait for the reconnection interval.
                 await asyncio.sleep(self._reconnect_interval)
                 
                 if self._shutdown:
                     break
                 
-                # 尝试重连
+                # Attempt reconnection.
                 config = await self.config.dump()
                 adapter_config = config.get("mcp_adapter", {})
                 timeout = self._coerce_timeout(adapter_config.get("connect_timeout", 30), 30.0)
@@ -1746,14 +2385,14 @@ class MCPAdapterPlugin(NekoAdapterPlugin):
         server_cfg: Dict[str, object],
         timeout: float = 30.0
     ) -> bool:
-        """连接到单个 MCP server"""
+        """Connect to one MCP server"""
         client: MCPClient | None = None
         try:
             if server_name not in self._servers_config:
                 self.ctx.logger.info(f"Skip connecting removed MCP server '{server_name}'")
                 return False
             timeout = self._coerce_timeout(timeout, 30.0)
-            # 提取配置字段并进行类型转换
+            # Extract configuration fields and convert their types.
             transport_raw = server_cfg.get("transport", "stdio")
             transport = str(transport_raw) if transport_raw else "stdio"
             
@@ -1769,6 +2408,9 @@ class MCPAdapterPlugin(NekoAdapterPlugin):
             env_raw = server_cfg.get("env", {})
             env = dict(env_raw) if isinstance(env_raw, dict) else {}
             
+            headers_raw = server_cfg.get("headers", {})
+            headers = dict(headers_raw) if isinstance(headers_raw, dict) else {}
+            
             enabled = self._coerce_bool(server_cfg.get("enabled", True), True)
             
             config = MCPServerConfig(
@@ -1778,12 +2420,13 @@ class MCPAdapterPlugin(NekoAdapterPlugin):
                 args=[str(a) for a in args],
                 url=url,
                 env={str(k): str(v) for k, v in env.items()},
+                headers={str(k): str(v) for k, v in headers.items()},
                 enabled=enabled,
             )
             
             client = MCPClient(config, logger=self.ctx.logger)
             
-            # 设置断开回调（用于自动重连）
+            # Set the disconnect callback for automatic reconnection.
             client.set_disconnect_callback(self._on_server_disconnect)
             
             if await client.connect(timeout=timeout):
@@ -1792,9 +2435,9 @@ class MCPAdapterPlugin(NekoAdapterPlugin):
                     self.ctx.logger.info(f"Discarded connection for removed MCP server '{server_name}'")
                     return False
                 self._clients[server_name] = client
-                client._reconnect_attempts = 0  # 重置重连计数
+                client._reconnect_attempts = 0  # Reset the reconnection counter.
                 
-                # 使用 Gateway Core 注册 tools
+                # Register tools through Gateway Core.
                 try:
                     await self._register_mcp_tools(server_name, client)
                 except Exception:
@@ -1802,7 +2445,7 @@ class MCPAdapterPlugin(NekoAdapterPlugin):
                     await client.disconnect()
                     raise
                 
-                # 更新状态
+                # Update status.
                 self._server_states[server_name] = {
                     "connected": True,
                     "tools_count": len(client.tools),
@@ -1842,11 +2485,11 @@ class MCPAdapterPlugin(NekoAdapterPlugin):
         llm_result_fields=["total"],
     )
     async def list_servers(self, **_):
-        """列出所有 MCP servers"""
+        """List all MCP servers"""
         servers = []
         seen_names = set()
         
-        # 已连接的服务器
+        # Connected servers.
         for server_name, client in self._clients.items():
             seen_names.add(server_name)
             servers.append({
@@ -1854,6 +2497,7 @@ class MCPAdapterPlugin(NekoAdapterPlugin):
                 "connected": client.connected,
                 "transport": client.config.transport,
                 "tools_count": len(client.tools),
+                "inject_to_chat": self._is_chat_injection_enabled(server_name),
                 "tools": [
                     {
                         "name": t.name,
@@ -1863,14 +2507,14 @@ class MCPAdapterPlugin(NekoAdapterPlugin):
                 ],
             })
         
-        # 有状态但未连接的服务器
+        # Servers with status but no connection.
         config = await self.config.dump()
         servers_config = config.get("mcp_servers", {})
         
         for server_name, state in self._server_states.items():
             if server_name not in seen_names:
                 seen_names.add(server_name)
-                # 从配置中获取 transport 信息
+                # Get transport information from configuration.
                 transport = "unknown"
                 if server_name in servers_config:
                     cfg = servers_config[server_name]
@@ -1881,9 +2525,10 @@ class MCPAdapterPlugin(NekoAdapterPlugin):
                     "connected": False,
                     "transport": transport,
                     "error": state.get("error"),
+                    "inject_to_chat": self._is_chat_injection_enabled(server_name),
                 })
         
-        # 配置中存在但从未尝试连接的服务器
+        # Configured servers with no connection attempt yet.
         self.ctx.logger.debug(f"list_servers: config has {len(servers_config)} servers: {list(servers_config.keys())}")
         for server_name, server_cfg in servers_config.items():
             if server_name not in seen_names:
@@ -1895,6 +2540,7 @@ class MCPAdapterPlugin(NekoAdapterPlugin):
                     "connected": False,
                     "transport": transport,
                     "configured": True,
+                    "inject_to_chat": self._is_chat_injection_enabled(server_name),
                 })
         
         return Ok({"servers": servers, "total": len(servers)})
@@ -1917,11 +2563,11 @@ class MCPAdapterPlugin(NekoAdapterPlugin):
         }
     )
     async def connect_server(self, server_name: str, **_):
-        """连接到指定的 MCP server"""
+        """Connect to the specified MCP server"""
         if server_name in self._clients:
             return Err(SdkError(f"Server '{server_name}' is already connected"))
         
-        # 从配置中获取 server 配置
+        # Get server configuration.
         config = await self.config.dump()
         servers_config = config.get("mcp_servers", {})
         
@@ -1955,26 +2601,167 @@ class MCPAdapterPlugin(NekoAdapterPlugin):
         }
     )
     async def disconnect_server(self, server_name: str, **_):
-        """断开与指定 MCP server 的连接"""
+        """Disconnect from the specified MCP server"""
         if server_name not in self._clients:
             return Err(SdkError(f"Server '{server_name}' is not connected"))
 
         self._cancel_reconnect_task(server_name)
         
-        # 注销 MCP tools
+        # Unregister MCP tools.
         await self._unregister_mcp_tools(server_name)
         
-        # 断开连接
+        # Disconnect.
         client = self._clients.pop(server_name)
         await client.disconnect()
         
-        # 更新状态
+        # Update status.
         self._server_states[server_name] = {
             "connected": False,
             "disconnected_manually": True,
         }
-        
+
         return Ok({"message": f"Disconnected from server '{server_name}'"})
+
+    @ui.action(label=tr("actions.setChatInjection.label", default="Toggle Chat Injection"), tone="primary", group="server", order=15, refresh_context=True)
+    @plugin_entry(
+        id="set_chat_injection",
+        name=tr("entries.setChatInjection.name", default="Set MCP Chat Injection"),
+        description=tr("entries.setChatInjection.description", default="Enable or disable injecting an MCP server's tools into the chat context."),
+        llm_result_fields=["message"],
+        input_schema={
+            "type": "object",
+            "properties": {
+                "server_name": {
+                    "type": "string",
+                    "description": tr("entries.common.fields.server_name.description", default="Server name")
+                },
+                "inject_to_chat": {
+                    "type": "boolean",
+                    "description": tr("entries.setChatInjection.fields.inject.description", default="Whether to inject this server's tools into the chat context")
+                }
+            },
+            "required": ["server_name", "inject_to_chat"]
+        }
+    )
+    async def set_chat_injection(self, server_name: str, inject_to_chat: bool, **_):
+        """Configure whether one MCP server injects tools into chat context"""
+        async with self._servers_config_lock:
+            inject_flag = self._coerce_bool(inject_to_chat, False)
+            # Hold the lock throughout persistence + application: concurrent enable/disable interleaving could
+            # overwrite registration mappings or let disable remove results while enable is registering.
+            # config.dump also stays under the lock. Rollback dumps fresh configuration before persisting, preventing
+            # stale dump deletion semantics from accidentally removing concurrent add_server changes.
+            async with self._chat_tools_lock:
+                config = await self.config.dump()
+                servers_config = config.get("mcp_servers", {})
+                server_cfg = servers_config.get(server_name)
+                if not isinstance(server_cfg, dict):
+                    return Err(SdkError(f"Server '{server_name}' not found in config"))
+
+                previous_flag = self._is_chat_injection_enabled(server_name)
+                server_cfg["inject_to_chat"] = inject_flag
+                try:
+                    await self._persist_servers_config(servers_config)
+                except Exception as exc:
+                    self.ctx.logger.exception(
+                        f"Failed to persist chat injection flag for MCP server '{server_name}': {exc}"
+                    )
+                    return Err(SdkError(f"Failed to save server config: {exc}"))
+                self._servers_config = servers_config
+
+                client = self._clients.get(server_name)
+                applied = 0
+                failed_tool_ids: List[str] = []
+                expected_tool_ids: set[str] = set()
+                if inject_flag and client is not None:
+                    for tool in client.tools:
+                        tool_id = f"mcp_{server_name}_{tool.name}"
+                        if self._route_engine is None or self._route_engine.get_tool_server(tool_id) != server_name:
+                            continue
+                        expected_tool_ids.add(tool_id)
+                        if tool_id in self._chat_tools or tool_id in self._pending_chat_tools:
+                            continue
+                        await self._register_chat_tool_local_locked(
+                            tool_id=tool_id, server_name=server_name, tool_name=tool.name,
+                            description=tool.description or f"MCP tool from {server_name}", schema=tool.input_schema,
+                        )
+                elif not inject_flag:
+                    mapped_ids = [
+                        tid for mapping in (self._chat_tools, self._pending_chat_tools)
+                        for tid, info in mapping.items() if info.get("server_name") == server_name
+                    ]
+                    for tool_id in dict.fromkeys(mapped_ids):
+                        outcome = await self._unregister_chat_tool_locked(tool_id)
+                        if outcome == "removed":
+                            applied += 1
+                        elif outcome == "failed":
+                            failed_tool_ids.append(tool_id)
+
+                if inject_flag:
+                    expected_tool_ids.update(
+                        tid for tid, info in self._pending_chat_tools.items()
+                        if info.get("server_name") == server_name
+                    )
+                    applied = await self._confirm_pending_chat_tools_locked(server_name)
+                    unconfirmed = expected_tool_ids - self._chat_tools.keys()
+                    if unconfirmed:
+                        # A failed enable must surface an error. When enabling
+                        # from disabled, remove the partial registration before
+                        # reverting the switch; preserve retry state on failure.
+                        rollback_flag = previous_flag
+                        if not previous_flag:
+                            mapped_ids = [
+                                tid for mapping in (self._chat_tools, self._pending_chat_tools)
+                                for tid, info in mapping.items()
+                                if info.get("server_name") == server_name
+                            ]
+                            for tool_id in dict.fromkeys(mapped_ids):
+                                if await self._unregister_chat_tool_locked(tool_id) == "failed":
+                                    rollback_flag = True
+                        server_cfg["inject_to_chat"] = rollback_flag
+                        try:
+                            await self._persist_servers_config(servers_config)
+                        except Exception as exc:
+                            self.ctx.logger.exception(f"Failed to roll back chat injection: {exc}")
+                            return Err(SdkError("Chat injection confirmation and config rollback failed; retry later"))
+                        return Err(SdkError(
+                            f"Failed to enable chat injection for server '{server_name}': "
+                            f"{len(unconfirmed)} tool(s) not confirmed; retry later"
+                        ))
+
+                if not inject_flag and failed_tool_ids:
+                    # Disable cleanup incomplete (e.g. remote temporarily unreachable): roll back the flag so the panel truthfully
+                    # shows still enabled, retaining failed tools' mappings for retry. Rollback uses a fresh dump,
+                    # preventing stale deletion semantics from erasing concurrent unlocked add/remove changes.
+                    if previous_flag != inject_flag:
+                        fresh_config = await self.config.dump()
+                        fresh_servers = fresh_config.get("mcp_servers", {})
+                        if isinstance(fresh_servers.get(server_name), dict):
+                            fresh_servers[server_name]["inject_to_chat"] = previous_flag
+                            try:
+                                await self._persist_servers_config(fresh_servers)
+                            except Exception:
+                                self.ctx.logger.exception(
+                                    f"Failed to roll back chat injection flag for MCP server '{server_name}'"
+                                )
+                        self._servers_config.get(server_name, {})["inject_to_chat"] = previous_flag
+                    self.ctx.logger.warning(
+                        f"Chat injection cleanup incomplete for server '{server_name}': "
+                        f"{len(failed_tool_ids)} tool(s) still active"
+                    )
+                    return Err(SdkError(
+                        f"Failed to disable chat injection for server '{server_name}': "
+                        f"{len(failed_tool_ids)} tool(s) still active (remote unregister not confirmed); retry later"
+                    ))
+
+                state_text = "enabled" if inject_flag else "disabled"
+                return Ok({
+                    "message": f"Chat injection {state_text} for server '{server_name}' ({applied} tool(s) updated)",
+                    "server_name": server_name,
+                    "inject_to_chat": inject_flag,
+                    "connected": client is not None,
+                    "applied": applied,
+                })
     
     @ui.action(label=tr("actions.addServer.label", default="Add Server"), tone="success", group="server", order=5, refresh_context=True)
     @plugin_entry(
@@ -2011,9 +2798,17 @@ class MCPAdapterPlugin(NekoAdapterPlugin):
                     "type": "object",
                     "description": tr("entries.addServer.fields.env.description", default="Environment variables")
                 },
+                "headers": {
+                    "type": "object",
+                    "description": tr("entries.addServer.fields.headers.description", default="Custom HTTP headers for SSE/HTTP transport")
+                },
                 "enabled": {
                     "type": "boolean",
                     "description": tr("entries.addServer.fields.enabled.description", default="Whether to enable this server")
+                },
+                "inject_to_chat": {
+                    "type": "boolean",
+                    "description": tr("entries.setChatInjection.fields.inject.description", default="Whether to inject this server's tools into the chat context")
                 },
                 "auto_connect": {
                     "type": "boolean",
@@ -2031,79 +2826,84 @@ class MCPAdapterPlugin(NekoAdapterPlugin):
         args: Optional[List[str]] = None,
         url: Optional[str] = None,
         env: Optional[Dict[str, str]] = None,
+        headers: Optional[Dict[str, str]] = None,
         enabled: bool = True,
+        inject_to_chat: bool = False,
         auto_connect: bool = True,
         **_
     ):
-        """添加新的 MCP server 配置"""
-        # 检查是否已存在
-        config = await self.config.dump()
-        servers_config = config.get("mcp_servers", {})
-        
-        # 验证配置
-        if transport == "stdio" and not command:
-            return Err(SdkError("Command is required for stdio transport"))
-        if transport in ("sse", "streamable-http") and not url:
-            return Err(SdkError("URL is required for sse/http transport"))
-        
-        # 构建配置
-        server_cfg = self._normalize_server_config_payload(
-            transport=transport,
-            command=command,
-            args=args,
-            url=url,
-            env=env,
-            enabled=enabled,
-        )
+        """Add new MCP server configuration"""
+        async with self._servers_config_lock:
+            # Check whether it already exists.
+            config = await self.config.dump()
+            servers_config = config.get("mcp_servers", {})
 
-        existing_cfg = servers_config.get(name)
-        if existing_cfg is not None:
-            if self._is_same_server_config(existing_cfg, server_cfg):
-                self.ctx.logger.info(f"Server '{name}' already exists with identical config")
-                if auto_connect and enabled and name not in self._clients:
-                    adapter_config = config.get("mcp_adapter", {})
-                    timeout_val = self._coerce_timeout(adapter_config.get("connect_timeout", 30), 30.0)
-                    scheduled = self._schedule_connect_server(name, server_cfg, timeout_val)
-                    return Ok({
-                        "message": f"Server '{name}' already exists; connection {'scheduled' if scheduled else 'already pending'}",
-                        "already_exists": True,
-                        "connecting": scheduled or name in self._connect_tasks,
-                    })
-                return Ok({
-                    "message": f"Server '{name}' already exists",
-                    "already_exists": True,
-                    "connected": name in self._clients,
-                })
-            return Err(SdkError(f"Server '{name}' already exists with different config"))
-        
-        # 保存到配置
-        servers_config[name] = server_cfg
-        self.ctx.logger.info(f"Saving mcp_servers config: {list(servers_config.keys())}")
-        try:
-            await self._persist_servers_config(servers_config)
-        except Exception as exc:
-            self.ctx.logger.exception(
-                f"Failed to persist MCP server config while adding server '{name}' "
-                f"(transport={transport}): {exc}"
+            # Validate configuration.
+            if transport == "stdio" and not command:
+                return Err(SdkError("Command is required for stdio transport"))
+            if transport in ("sse", "streamable-http") and not url:
+                return Err(SdkError("URL is required for sse/http transport"))
+
+            # Build configuration.
+            server_cfg = self._normalize_server_config_payload(
+                transport=transport,
+                command=command,
+                args=args,
+                url=url,
+                env=env,
+                headers=headers,
+                enabled=enabled,
+                inject_to_chat=self._coerce_bool(inject_to_chat, False),
             )
-            return Err(SdkError(f"Failed to save server config: {exc}"))
+
+            existing_cfg = servers_config.get(name)
+            if existing_cfg is not None:
+                if self._is_same_server_config(existing_cfg, server_cfg):
+                    self.ctx.logger.info(f"Server '{name}' already exists with identical config")
+                    if auto_connect and enabled and name not in self._clients:
+                        adapter_config = config.get("mcp_adapter", {})
+                        timeout_val = self._coerce_timeout(adapter_config.get("connect_timeout", 30), 30.0)
+                        scheduled = self._schedule_connect_server(name, server_cfg, timeout_val)
+                        return Ok({
+                            "message": f"Server '{name}' already exists; connection {'scheduled' if scheduled else 'already pending'}",
+                            "already_exists": True,
+                            "connecting": scheduled or name in self._connect_tasks,
+                        })
+                    return Ok({
+                        "message": f"Server '{name}' already exists",
+                        "already_exists": True,
+                        "connected": name in self._clients,
+                    })
+                return Err(SdkError(f"Server '{name}' already exists with different config"))
         
-        # 缓存配置
-        self._servers_config = servers_config
-        self.ctx.logger.info(f"Server '{name}' added to config")
+            # Save to configuration.
+            servers_config[name] = server_cfg
+            self.ctx.logger.info(f"Saving mcp_servers config: {list(servers_config.keys())}")
+            try:
+                await self._persist_servers_config(servers_config)
+            except Exception as exc:
+                self.ctx.logger.exception(
+                    f"Failed to persist MCP server config while adding server '{name}' "
+                    f"(transport={transport}): {exc}"
+                )
+                return Err(SdkError(f"Failed to save server config: {exc}"))
         
-        # 如果需要自动连接
-        if auto_connect and enabled:
-            adapter_config = config.get("mcp_adapter", {})
-            timeout_val = self._coerce_timeout(adapter_config.get("connect_timeout", 30), 30.0)
-            self._schedule_connect_server(name, server_cfg, timeout_val)
-            return Ok({
-                "message": f"Added server '{name}' and scheduled connection",
-                "connected": False,
-                "connecting": True,
-            })
+            # Cache configuration.
+            self._servers_config = servers_config
+            self.ctx.logger.info(f"Server '{name}' added to config")
         
-        return Ok({"message": f"Added server '{name}'"})
+            # If automatic connection is required.
+            if auto_connect and enabled:
+                adapter_config = config.get("mcp_adapter", {})
+                timeout_val = self._coerce_timeout(adapter_config.get("connect_timeout", 30), 30.0)
+                self._schedule_connect_server(name, server_cfg, timeout_val)
+                return Ok({
+                    "message": f"Added server '{name}' and scheduled connection",
+                    "connected": False,
+                    "connecting": True,
+                })
+        
+            return Ok({"message": f"Added server '{name}'"})
     
     @ui.action(label=tr("actions.removeServers.label", default="Remove Server"), tone="danger", group="server", order=30, confirm=tr("actions.removeServers.confirm", default="Remove these MCP Servers?"), refresh_context=True)
     @plugin_entry(
@@ -2124,52 +2924,61 @@ class MCPAdapterPlugin(NekoAdapterPlugin):
         }
     )
     async def remove_servers(self, server_names: List[str], **_):
-        """批量移除 MCP server 配置"""
-        config = await self.config.dump()
-        servers_config = config.get("mcp_servers", {})
-        
-        removed = []
-        not_found = []
-        
-        for name in server_names:
-            if name not in servers_config:
-                not_found.append(name)
-                continue
+        """Remove MCP server configurations in a batch"""
+        async with self._servers_config_lock:
+            config = await self.config.dump()
+            servers_config = config.get("mcp_servers", {})
 
-            self._cancel_connect_task(name)
-            self._cancel_reconnect_task(name)
+            removed = []
+            not_found = []
+
+            async with self._chat_tools_lock:
+                mapped_ids = [
+                    tid for mapping in (self._chat_tools, self._pending_chat_tools)
+                    for tid, info in mapping.items()
+                    if info.get("server_name") in server_names
+                ]
+                for tool_id in dict.fromkeys(mapped_ids):
+                    if await self._unregister_chat_tool_locked(tool_id) == "failed":
+                        return Err(SdkError("Failed to remove servers: chat tool cleanup incomplete; retry later"))
+
+            for name in server_names:
+                if name not in servers_config:
+                    not_found.append(name)
+                    continue
+
+                self._cancel_connect_task(name)
+                self._cancel_reconnect_task(name)
+                if name in self._clients:
+                    await self._unregister_mcp_tools(name)
+                    client = self._clients.pop(name)
+                    await client.disconnect()
+
+                # Remove from configuration.
+                del servers_config[name]
             
-            # 如果已连接，先断开
-            if name in self._clients:
-                await self._unregister_mcp_tools(name)
-                client = self._clients.pop(name)
-                await client.disconnect()
+                # Clean up status.
+                if name in self._server_states:
+                    del self._server_states[name]
             
-            # 从配置中移除
-            del servers_config[name]
-            
-            # 清理状态
-            if name in self._server_states:
-                del self._server_states[name]
-            
-            removed.append(name)
+                removed.append(name)
         
-        self.ctx.logger.info(f"Saving updated mcp_servers config: {list(servers_config.keys())}")
-        try:
-            await self._persist_servers_config(dict(servers_config))
-        except Exception as exc:
-            self.ctx.logger.exception(
-                "Failed to persist MCP server config while removing servers "
-                f"(requested={len(server_names)}, removed={len(removed)}): {exc}"
-            )
-            return Err(SdkError(f"Failed to save server config: {exc}"))
-        self._servers_config = servers_config
+            self.ctx.logger.info(f"Saving updated mcp_servers config: {list(servers_config.keys())}")
+            try:
+                await self._persist_servers_config(dict(servers_config))
+            except Exception as exc:
+                self.ctx.logger.exception(
+                    "Failed to persist MCP server config while removing servers "
+                    f"(requested={len(server_names)}, removed={len(removed)}): {exc}"
+                )
+                return Err(SdkError(f"Failed to save server config: {exc}"))
+            self._servers_config = servers_config
         
-        return Ok({
-            "removed": removed,
-            "not_found": not_found,
-            "message": f"Removed {len(removed)} server(s)",
-        })
+            return Ok({
+                "removed": removed,
+                "not_found": not_found,
+                "message": f"Removed {len(removed)} server(s)",
+            })
     
     @plugin_entry(
         id="call_tool",
@@ -2202,7 +3011,7 @@ class MCPAdapterPlugin(NekoAdapterPlugin):
         arguments: Optional[Dict[str, object]] = None,
         **_
     ):
-        """调用 MCP tool"""
+        """Invoke an MCP tool"""
         if server_name not in self._clients:
             return Err(SdkError(f"Server '{server_name}' is not connected"))
         
@@ -2232,7 +3041,7 @@ class MCPAdapterPlugin(NekoAdapterPlugin):
         llm_result_fields=["total"],
     )
     async def list_tools(self, server_name: Optional[str] = None, **_):
-        """列出所有 MCP tools"""
+        """List all MCP tools"""
         tools = []
         
         for name, client in self._clients.items():
@@ -2287,15 +3096,15 @@ class MCPAdapterPlugin(NekoAdapterPlugin):
         **_
     ):
         """
-        通过 Gateway Core 调用 MCP tool 或 NEKO 插件。
+        Invoke an MCP tool or NEKO plugin through Gateway Core.
         
-        这是新架构的统一入口，使用 Gateway Core 组件处理请求。
+        Unified entry point for the new architecture, using Gateway Core components to process requests.
         """
         import uuid
         if self._gateway_core is None:
             return Err(SdkError("Gateway Core components not initialized"))
         
-        # 构造 ExternalRequest
+        # Construct ExternalRequest.
         request_id = str(uuid.uuid4())
         try:
             payload: dict[str, object] = {

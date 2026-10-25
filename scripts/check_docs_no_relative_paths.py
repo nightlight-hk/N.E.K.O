@@ -1,4 +1,18 @@
 #!/usr/bin/env python3
+# Copyright 2025-2026 Project N.E.K.O. Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Static check: forbid markdown links inside ``docs/`` that VitePress can't resolve.
 
 Why this exists
@@ -44,9 +58,9 @@ Build-scope parity
 ------------------
 Only files VitePress actually builds are inspected:
 - ``node_modules/`` is skipped (third-party READMEs, never deployed).
-- The README translations in ``SRC_EXCLUDE`` are skipped to mirror the
-  ``srcExclude`` list in ``docs/.vitepress/config.ts`` — keep the two in
-  sync if that list changes.
+- Runtime-only pages and README translations in ``SRC_EXCLUDE`` are skipped
+  to mirror the ``srcExclude`` list in ``docs/.vitepress/config.ts`` — keep
+  the two in sync if that list changes.
 
 Suppression
 -----------
@@ -72,7 +86,17 @@ DOCS_DIR = REPO_ROOT / "docs"
 
 # Mirror `srcExclude` in docs/.vitepress/config.ts — these aren't built, so a
 # broken link in them can't break deploy.  Keep in sync if that list changes.
-SRC_EXCLUDE = {"README_en.md", "README_ja.md", "README_ru.md"}
+SRC_EXCLUDE = {
+    "README_en.md",
+    "README_ja.md",
+    "README_ru.md",
+    "zh-CN/guide/openclaw_guide.md",
+    "zh-CN/guide/openclaw_guide.en.md",
+    "zh-CN/guide/openclaw_guide.ja.md",
+    "zh-CN/guide/openclaw_guide.ko.md",
+    "zh-CN/guide/openclaw_guide.ru.md",
+    "zh-CN/guide/openclaw_guide.zh-TW.md",
+}
 
 # Any markdown inline link target.  Reference-style links (``[foo][bar]``) and
 # image-only refs aren't a vitepress page-resolution hazard, so only the URL
@@ -92,9 +116,18 @@ SRC_FILE_PATTERN = re.compile(
 # Targets that resolve fine and must never be flagged.
 _SAFE_PREFIXES = ("http://", "https://", "mailto:", "tel:", "#", "/")
 
+# Absolute paths on an author's machine look site-absolute (leading ``/``) but
+# VitePress cannot resolve them either, and they leak local usernames and
+# experiment directories onto the public docs site.
+LOCAL_PATH_PATTERN = re.compile(
+    r"^(?:file:|/(?:Users|home|private|tmp|var/folders|Volumes|mnt|root)/|[A-Za-z]:[\\/])"
+)
+
 
 def _classify(target: str) -> str | None:
     """Return a violation kind for an offending link target, else ``None``."""
+    if LOCAL_PATH_PATTERN.match(target):
+        return "local-path"
     if target.startswith(_SAFE_PREFIXES):
         return None
     if target.startswith(".."):
@@ -116,7 +149,8 @@ def main() -> int:
     for md_path in sorted(DOCS_DIR.rglob("*.md")):
         if "node_modules" in md_path.parts:
             continue
-        if md_path.name in SRC_EXCLUDE:
+        source_path = md_path.relative_to(DOCS_DIR).as_posix()
+        if source_path in SRC_EXCLUDE:
             continue
         try:
             text = md_path.read_text(encoding="utf-8")

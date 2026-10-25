@@ -1,7 +1,11 @@
 /**
  * 插件相关 API
  */
-import { del, get, post } from './index'
+import { del, get, post, put } from './index'
+import type { AxiosRequestConfig } from 'axios'
+import type { ErrorDisplayRequestConfig } from '@/utils/request'
+import { PLUGIN_LIFECYCLE_TIMEOUT, PLUGIN_RELOAD_ALL_TIMEOUT } from '@/utils/constants'
+import { setPendingReload } from '@/utils/pendingReload'
 import type {
   PluginMeta,
   PluginStatusData,
@@ -13,17 +17,78 @@ import type {
   PluginUiWarning,
 } from '@/types/api'
 
+/** The bounded projection used by the plugin list. The API deliberately keeps
+ * the small entry/dependency records needed by qualifiers and cards while
+ * omitting the full input schemas and other detail-only metadata. */
+export type PluginListSummary = Omit<PluginMeta, 'input_schema'> & {
+  entry_count?: number
+  dependency_count?: number
+  has_input_schema?: boolean
+}
+
+export type PluginListResponse<T = PluginMeta> = { plugins: T[]; message: string }
+
 /**
  * 获取插件列表
  */
-export function getPlugins(locale?: string): Promise<{ plugins: PluginMeta[]; message: string }> {
-  return get('/plugins', locale ? { params: { locale } } : undefined)
+export function getPlugins(
+  locale?: string,
+  config?: AxiosRequestConfig & { preserveMessagesOn404?: boolean },
+): Promise<PluginListResponse<PluginMeta>> {
+  if (typeof URLSearchParams !== 'undefined' && config?.params instanceof URLSearchParams) {
+    const params = new URLSearchParams(config.params)
+    if (locale) params.set('locale', locale)
+    return get('/plugins', {
+      ...(config || {}),
+      params,
+    })
+  }
+
+  const params = {
+    ...(config?.params || {}),
+    ...(locale ? { locale } : {}),
+  }
+  return get('/plugins', {
+    ...(config || {}),
+    params,
+  })
+}
+
+export function getPluginSummaries(
+  locale?: string,
+  config?: AxiosRequestConfig & { preserveMessagesOn404?: boolean },
+): Promise<PluginListResponse<PluginListSummary>> {
+  const params = config?.params instanceof URLSearchParams
+    ? new URLSearchParams(config.params)
+    : { ...(config?.params || {}) }
+  if (locale) {
+    if (params instanceof URLSearchParams) params.set('locale', locale)
+    else (params as Record<string, unknown>).locale = locale
+  }
+  if (params instanceof URLSearchParams) params.set('summary', 'true')
+  else (params as Record<string, unknown>).summary = true
+  return get('/plugins', { ...(config || {}), params })
+}
+
+export async function getPlugin(
+  pluginId: string,
+  locale?: string,
+  config?: ErrorDisplayRequestConfig,
+): Promise<PluginMeta> {
+  const safeId = encodeURIComponent(pluginId)
+  const response = await get<{ plugin?: PluginMeta } | PluginMeta>(
+    `/plugins/${safeId}`,
+    locale ? { ...config, params: { ...config?.params, locale } } : config,
+  )
+  return (response && typeof response === 'object' && 'plugin' in response
+    ? response.plugin
+    : response) as PluginMeta
 }
 
 /**
  * 刷新插件注册表
  */
-export function refreshPluginsRegistry(): Promise<{
+export function refreshPluginsRegistry(config?: AxiosRequestConfig & { preserveMessagesOn404?: boolean }): Promise<{
   success: boolean
   added: string[]
   updated: string[]
@@ -33,7 +98,10 @@ export function refreshPluginsRegistry(): Promise<{
   failed: Array<{ plugin_id: string; config_path: string; error: string }>
   scanned_count: number
 }> {
-  return post('/plugins/refresh')
+  return post('/plugins/refresh', undefined, {
+    ...config,
+    headers: { ...config?.headers, 'X-Neko-Development': '1' },
+  })
 }
 
 /**
@@ -55,9 +123,14 @@ export function getPluginHealth(pluginId: string): Promise<PluginHealth> {
 /**
  * 启动插件
  */
-export function startPlugin(pluginId: string): Promise<{ success: boolean; plugin_id: string; message: string }> {
+export function startPlugin(
+  pluginId: string
+): Promise<{ success: boolean; plugin_id: string; message: string; already_running?: boolean }> {
   const safeId = encodeURIComponent(pluginId)
-  return post(`/plugin/${safeId}/start`)
+  return post(`/plugin/${safeId}/start`, undefined, {
+    timeout: PLUGIN_LIFECYCLE_TIMEOUT,
+    timeoutErrorMessageKey: 'messages.pluginLifecycleTimeout',
+  })
 }
 
 /**
@@ -69,15 +142,29 @@ export function stopPlugin(pluginId: string): Promise<{ success: boolean; plugin
 }
 
 /**
+ * 设置插件是否随宿主自动启动（只写偏好，不启停进程）
+ */
+export function setPluginAutoStart(
+  pluginId: string,
+  autoStart: boolean,
+): Promise<{ success: boolean; plugin_id: string; auto_start: boolean; message: string }> {
+  const safeId = encodeURIComponent(pluginId)
+  return put(`/plugin/${safeId}/auto-start`, { auto_start: autoStart })
+}
+
+/**
  * 重载插件
  */
 export function reloadPlugin(pluginId: string): Promise<{ success: boolean; plugin_id: string; message: string }> {
   const safeId = encodeURIComponent(pluginId)
-  return post(`/plugin/${safeId}/reload`)
+  return post(`/plugin/${safeId}/reload`, undefined, {
+    timeout: PLUGIN_LIFECYCLE_TIMEOUT,
+    timeoutErrorMessageKey: 'messages.pluginLifecycleTimeout',
+  })
 }
 
 /**
- * 重载所有插件（批量 API，后端并行处理）
+ * 重载所有插件（批量 API，后端按依赖顺序启动）
  */
 export function reloadAllPlugins(): Promise<{
   success: boolean
@@ -86,22 +173,37 @@ export function reloadAllPlugins(): Promise<{
   skipped: string[]
   message: string
 }> {
-  return post('/plugins/reload')
+  return post('/plugins/reload', undefined, {
+    timeout: PLUGIN_RELOAD_ALL_TIMEOUT,
+    headers: { 'X-Neko-Development': '1' },
+  })
 }
 
 /**
  * 删除插件目录并刷新注册表
  */
-export function deletePlugin(pluginId: string): Promise<{
+export interface DeletePluginResult {
   success: boolean
   plugin_id: string
   plugin_dir: string
   deleted_from_disk: boolean
-  host_plugin_id?: string
+  restored_builtin: boolean
+  restored_builtin_started: boolean
+  restored_builtin_restart_error: {
+    code: string
+    message: string
+    error_type: string
+  } | null
   message: string
-}> {
+}
+
+export async function deletePlugin(pluginId: string): Promise<DeletePluginResult> {
   const safeId = encodeURIComponent(pluginId)
-  return del(`/plugin/${safeId}`)
+  const result = await del<DeletePluginResult>(`/plugin/${safeId}`)
+  // Uninstalling removes the profiles, and a restored built-in or later reinstall under
+  // the same id starts from the resolved configuration, so nothing is left to apply.
+  setPendingReload(pluginId, false)
+  return result
 }
 
 /**
@@ -134,6 +236,7 @@ function normalizeSurface(raw: any, fallbackKind: PluginUiSurface['kind'] = 'pan
     context: typeof raw.context === 'string' ? raw.context : undefined,
     permissions: Array.isArray(raw.permissions) ? raw.permissions.filter((item: unknown) => typeof item === 'string') : undefined,
     available: typeof raw.available === 'boolean' ? raw.available : undefined,
+    legacy_static_compat: raw.legacy_static_compat === true,
   }
 }
 
@@ -146,7 +249,7 @@ export async function getPluginUiSurfaces(pluginId: string, locale?: string): Pr
   return result.surfaces
 }
 
-export async function getPluginUiSurfaceInfo(pluginId: string, locale?: string): Promise<{
+export async function getPluginUiSurfaceInfo(pluginId: string, locale?: string, config?: ErrorDisplayRequestConfig): Promise<{
   surfaces: PluginUiSurface[]
   warnings: PluginUiWarning[]
 }> {
@@ -154,7 +257,7 @@ export async function getPluginUiSurfaceInfo(pluginId: string, locale?: string):
   try {
     const response = await get<{ surfaces?: any[]; warnings?: any[] } | any[]>(
       `/plugin/${safeId}/surfaces`,
-      locale ? { params: { locale } } : undefined,
+      locale ? { ...config, params: { ...config?.params, locale } } : config,
     )
     const rawSurfaces = Array.isArray(response) ? response : response?.surfaces
     const rawWarnings = Array.isArray(response) ? [] : response?.warnings
@@ -187,7 +290,7 @@ export async function getPluginUiSurfaceInfo(pluginId: string, locale?: string):
   // Keep this fallback until backend surfaces normalize it as:
   // [[plugin.ui.panel]] mode = "static", entry = "static/index.html".
   try {
-    const info = await get<PluginUiInfo>(`/plugin/${safeId}/ui-info`)
+    const info = await get<PluginUiInfo>(`/plugin/${safeId}/ui-info`, config)
     if (!info?.has_ui) {
       return { surfaces: [], warnings: [] }
     }
@@ -202,6 +305,7 @@ export async function getPluginUiSurfaceInfo(pluginId: string, locale?: string):
         ui_path: info.ui_path || `/plugin/${safeId}/ui/`,
         open_in: 'iframe',
         available: true,
+        legacy_static_compat: true,
       }],
       warnings: [],
     }
@@ -217,22 +321,26 @@ export async function getPluginUiSurfaceInfo(pluginId: string, locale?: string):
 export function getPluginHostedSurfaceSource(pluginId: string, params: {
   kind: PluginUiSurface['kind']
   id: string
-}): Promise<{
+  locale?: string
+}, config?: ErrorDisplayRequestConfig): Promise<{
   plugin_id: string
   kind: string
   surface_id: string
   mode: string
   entry: string
   source: string
+  dependencies?: Array<{ path: string; source: string }>
   source_locale?: string
   translations?: Record<string, Record<string, string>>
   warnings?: PluginUiWarning[]
 }> {
   const safeId = encodeURIComponent(pluginId)
   return get(`/plugin/${safeId}/hosted-ui/source`, {
+    ...config,
     params: {
       kind: params.kind,
       id: params.id,
+      locale: params.locale,
     },
   })
 }
@@ -241,9 +349,10 @@ export function getPluginHostedSurfaceContext(pluginId: string, params: {
   kind: PluginUiSurface['kind']
   id: string
   locale?: string
-}): Promise<PluginUiContext> {
+}, config?: ErrorDisplayRequestConfig): Promise<PluginUiContext> {
   const safeId = encodeURIComponent(pluginId)
   return get(`/plugin/${safeId}/hosted-ui/context`, {
+    ...config,
     params: {
       kind: params.kind,
       id: params.id,
@@ -255,6 +364,11 @@ export function getPluginHostedSurfaceContext(pluginId: string, params: {
 export function callPluginHostedSurfaceAction(pluginId: string, actionId: string, args?: Record<string, any>, surface?: {
   kind: PluginUiSurface['kind']
   id: string
+  locale?: string
+  timeoutMs?: number
+  signal?: AbortSignal
+  /** True only when the request originates from a user action in the hosted iframe. */
+  userInitiated?: boolean
 }): Promise<{
   plugin_id: string
   action_id: string
@@ -262,27 +376,50 @@ export function callPluginHostedSurfaceAction(pluginId: string, actionId: string
 }> {
   const safeId = encodeURIComponent(pluginId)
   const safeActionId = encodeURIComponent(actionId)
+  const requestedTimeoutMs = Number(surface?.timeoutMs)
+  const timeoutMs = Number.isFinite(requestedTimeoutMs) && requestedTimeoutMs > 0 ? requestedTimeoutMs : undefined
+  // Initial hosted-panel calls may probe actions while a manual-start plugin
+  // is stopped. Suppress only that expected response; all other failures keep
+  // the standard global error handling.
+  const requestConfig = {
+    suppressPluginNotRunningMessage: !surface?.userInitiated,
+    ...(timeoutMs ? { timeout: timeoutMs } : {}),
+    ...(surface?.signal ? { signal: surface.signal } : {}),
+  }
   return post(`/plugin/${safeId}/hosted-ui/action/${safeActionId}`, {
     args: args || {},
     kind: surface?.kind,
     surface_id: surface?.id,
+    locale: surface?.locale,
+    timeout_ms: timeoutMs,
+  }, requestConfig)
+}
+
+export type ParsedHostedDocument = {
+  name: string
+  sourceType: 'pdf' | 'docx'
+  mime: string
+  originalSize: number
+  chars: number
+  encoding: string
+  truncated: boolean
+  content: string
+  meta?: Record<string, any>
+}
+
+/** Upload one document for transient text extraction. The original file is not persisted. */
+export function parseHostedDocument(file: File, options?: {
+  timeoutMs?: number
+  signal?: AbortSignal
+}): Promise<{ ok: boolean; document: ParsedHostedDocument }> {
+  const form = new FormData()
+  form.append('file', file, file.name)
+  const requestedTimeoutMs = Number(options?.timeoutMs)
+  const timeoutMs = Number.isFinite(requestedTimeoutMs) && requestedTimeoutMs > 0 ? requestedTimeoutMs : undefined
+  return post('/api/documents/parse', form, {
+    ...(timeoutMs ? { timeout: timeoutMs } : {}),
+    ...(options?.signal ? { signal: options.signal } : {}),
   })
-}
-
-/**
- * 禁用 Extension（热切换）
- */
-export function disableExtension(extId: string): Promise<{ success: boolean; ext_id: string; host_plugin_id: string; data?: any; message?: string }> {
-  const safeId = encodeURIComponent(extId)
-  return post(`/plugin/${safeId}/extension/disable`)
-}
-
-/**
- * 启用 Extension（热切换）
- */
-export function enableExtension(extId: string): Promise<{ success: boolean; ext_id: string; host_plugin_id: string; data?: any; message?: string }> {
-  const safeId = encodeURIComponent(extId)
-  return post(`/plugin/${safeId}/extension/enable`)
 }
 
 /**

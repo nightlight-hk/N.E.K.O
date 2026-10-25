@@ -224,3 +224,88 @@ def test_entry_runtime_internal_dump_and_injection_helpers() -> None:
 
     signature = entry_runtime.inspect.signature(lambda *items, model: None)
     assert entry_runtime._resolve_model_injection_name(signature, object, {"name": "alice"}) == "model"
+
+
+def _no_params_meta() -> EventMeta:
+    """A meta shaped like `@plugin_entry(input_schema=...)` — no params model."""
+    return EventMeta(event_type="plugin_entry", id="run", params=None)
+
+
+@pytest.mark.parametrize("meta_factory", [lambda: None, _no_params_meta], ids=["no_meta", "no_params_model"])
+def test_prepare_entry_kwargs_drops_host_ctx_for_handlers_that_cannot_take_it(meta_factory) -> None:
+    """The host supplies `_ctx` on every call; handlers that do not declare it must not raise TypeError."""
+
+    async def handler(danmaku_texts: list[str]) -> list[str]:
+        return danmaku_texts
+
+    kwargs = prepare_entry_kwargs(
+        plugin_id="demo",
+        entry_id="run",
+        handler=handler,
+        meta=meta_factory(),
+        args={"danmaku_texts": ["hi"], "_ctx": {"run_id": "r1"}},
+    )
+
+    assert kwargs == {"danmaku_texts": ["hi"]}
+    # The actual criterion is the call site: filtered kwargs must unpack directly into the handler.
+    handler(**kwargs).close()
+
+
+@pytest.mark.parametrize("meta_factory", [lambda: None, _no_params_meta], ids=["no_meta", "no_params_model"])
+def test_prepare_entry_kwargs_keeps_host_ctx_for_handlers_that_opt_in(meta_factory) -> None:
+    """Handlers explicitly declaring `_ctx` or `**kwargs` still receive it."""
+
+    async def named(name: str, _ctx: dict | None = None) -> str:
+        return name
+
+    async def var_keyword(name: str, **kwargs: object) -> str:
+        return name
+
+    args = {"name": "alice", "_ctx": {"run_id": "r1"}}
+    for handler in (named, var_keyword):
+        kwargs = prepare_entry_kwargs(
+            plugin_id="demo",
+            entry_id="run",
+            handler=handler,
+            meta=meta_factory(),
+            args=args,
+        )
+        assert kwargs["_ctx"] == {"run_id": "r1"}
+        handler(**kwargs).close()
+
+
+@pytest.mark.parametrize("meta_factory", [lambda: None, _no_params_meta], ids=["no_meta", "no_params_model"])
+def test_prepare_entry_kwargs_drops_host_ctx_for_positional_only_parameter(meta_factory) -> None:
+    """The host always passes `_ctx` by keyword; a same-named positional-only parameter cannot receive it."""
+
+    async def positional_only(_ctx, /) -> object:
+        return _ctx
+
+    kwargs = prepare_entry_kwargs(
+        plugin_id="demo",
+        entry_id="run",
+        handler=positional_only,
+        meta=meta_factory(),
+        args={"_ctx": {"run_id": "r1"}},
+    )
+
+    # Match the existing adjacent _filter_supported_kwargs criterion: accept only
+    # POSITIONAL_OR_KEYWORD / KEYWORD_ONLY, or method(**call_args) still raises TypeError.
+    assert kwargs == {}
+
+
+def test_prepare_entry_kwargs_keeps_host_ctx_when_signature_is_unavailable() -> None:
+    """Preserve old behavior when signatures are unavailable; do not remove arguments by guessing."""
+
+    class _NoSignature:
+        __call__ = None
+
+    kwargs = prepare_entry_kwargs(
+        plugin_id="demo",
+        entry_id="run",
+        handler=_NoSignature(),
+        meta=None,
+        args={"_ctx": {"run_id": "r1"}},
+    )
+
+    assert kwargs == {"_ctx": {"run_id": "r1"}}

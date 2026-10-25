@@ -2,7 +2,7 @@
  * 泛型网格工作台（过滤 + 分组 + 选择 + 布局）
  *
  * 提供与业务无关的"过滤栏 + 网格"状态管理，支撑：
- * - 简单文本搜索 / 正则搜索 / 白名单-黑名单模式
+ * - 文本搜索（`-` 前缀排除）
  * - 进阶 `key:value` 限定词（例如 `is:running -author:foo`），由调用方注入 matcher
  * - 分组可见性切换（支持重叠 predicate，item 可同时属于多个分组）
  * - 多选、全选、反选、按可见项裁剪
@@ -11,13 +11,10 @@
  * 状态按 `scope` 在模块级缓存，同 scope 共享，不同 scope 隔离。业务相关语义全部
  * 通过 predicate / qualifier / spec 注入，composable 本身不知业务。
  */
-import { computed, ref, toValue, type MaybeRefOrGetter, type Ref } from 'vue'
-import { pinyin } from 'pinyin-pro'
-
-import { tryCompileSafeRegex, warnReDoSOnce } from '@/utils/safeRegex'
+import { computed, getCurrentScope, onScopeDispose, ref, toValue, watch, type MaybeRefOrGetter, type Ref } from 'vue'
+import type { PinyinSearch } from '@/utils/pinyinSearch'
 
 export type LayoutMode = 'list' | 'single' | 'double' | 'compact'
-export type FilterMode = 'whitelist' | 'blacklist'
 export type GroupSelectionMode = 'single' | 'multiple'
 
 export interface GridWorkbenchItemBase {
@@ -54,23 +51,21 @@ export interface GridWorkbenchConfig<T extends GridWorkbenchItemBase> {
   groupSelection?: GroupSelectionMode
   /** 默认选中分组 id 列表（默认全选）。 */
   defaultSelectedGroupIds?: readonly string[]
-  /** 构建搜索索引（用于正则搜索和默认 term 匹配）。 */
+  /** 构建基础搜索索引（不包含可选的拼音索引）。 */
   buildSearchIndex?: (item: T) => string
+  /** 构建按需加载的拼音索引；首次搜索时才加载 pinyin-pro。 */
+  buildPinyinSearchIndex?: (item: T, search: PinyinSearch) => string
   /** `key:value` 限定词匹配器。未注册的 key 默认不匹配。 */
   qualifierMatchers?: Record<string, QualifierMatcher<T>>
   /** 初始默认值。 */
   defaults?: {
     filterText?: string
-    useRegex?: boolean
-    filterMode?: FilterMode
     layoutMode?: LayoutMode
   }
 }
 
 interface ScopedState {
   filterText: Ref<string>
-  useRegex: Ref<boolean>
-  filterMode: Ref<FilterMode>
   selectedGroupIds: Ref<string[]>
   layoutMode: Ref<LayoutMode>
   selectedIds: Ref<string[]>
@@ -83,8 +78,6 @@ function getOrCreateScope(
   scope: string,
   initial: {
     filterText: string
-    useRegex: boolean
-    filterMode: FilterMode
     selectedGroupIds: string[]
     layoutMode: LayoutMode
   },
@@ -93,8 +86,6 @@ function getOrCreateScope(
   if (cached) return cached
   const created: ScopedState = {
     filterText: ref(initial.filterText),
-    useRegex: ref(initial.useRegex),
-    filterMode: ref(initial.filterMode),
     selectedGroupIds: ref([...initial.selectedGroupIds]),
     layoutMode: ref(initial.layoutMode),
     selectedIds: ref([]),
@@ -105,28 +96,6 @@ function getOrCreateScope(
 }
 
 // ─── 纯工具函数（导出供业务层复用）─────────────────────────────────
-
-function isCjkText(value: string): boolean {
-  return /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/.test(value)
-}
-
-export function safePinyin(value: string, pattern: 'pinyin' | 'first'): string {
-  if (!value.trim() || !isCjkText(value)) {
-    return ''
-  }
-  try {
-    return pinyin(value, {
-      toneType: 'none',
-      type: 'string',
-      pattern,
-      nonZh: 'consecutive',
-      v: true,
-      traditional: true,
-    }).trim()
-  } catch {
-    return ''
-  }
-}
 
 export function normalizeSearchPart(value?: string | null): string {
   return (value || '').trim().toLowerCase()
@@ -165,8 +134,6 @@ export function useGridWorkbench<T extends GridWorkbenchItemBase>(
 ) {
   const defaults = {
     filterText: config.defaults?.filterText ?? '',
-    useRegex: config.defaults?.useRegex ?? false,
-    filterMode: config.defaults?.filterMode ?? ('whitelist' as FilterMode),
     layoutMode: config.defaults?.layoutMode ?? ('compact' as LayoutMode),
     selectedGroupIds: [
       ...(config.defaultSelectedGroupIds ?? config.groups.map((g) => g.id)),
@@ -176,6 +143,58 @@ export function useGridWorkbench<T extends GridWorkbenchItemBase>(
   const state = getOrCreateScope(config.scope, defaults)
   const qualifierMatchers = config.qualifierMatchers ?? {}
   const groupSelection: GroupSelectionMode = config.groupSelection ?? 'multiple'
+  const pinyinSearch = ref<PinyinSearch | null>(null)
+  let pinyinLoad: Promise<void> | null = null
+  let pinyinRetryAfter = 0
+  let pinyinRetryTimer: ReturnType<typeof setTimeout> | null = null
+  let pinyinAutoRetries = 0
+  let pinyinDisposed = false
+  // `baseItems` creates an immutable snapshot only when this workbench owns
+  // the search index. Keeping that snapshot independent from query state is
+  // important: typing in the filter must not clone every item, while an
+  // in-place mutation of a reactive source item must still publish fresh
+  // status/action/display fields even when its search text is unchanged.
+  const pinyinIndexCache = new WeakMap<object, { key: string; value: T }>()
+
+  function ensurePinyinSearch() {
+    if (pinyinDisposed || !config.buildPinyinSearchIndex || pinyinSearch.value || pinyinLoad || Date.now() < pinyinRetryAfter) return pinyinLoad
+    pinyinLoad = import('@/utils/pinyinSearch')
+      .then(({ safePinyin }) => {
+        if (!pinyinDisposed) pinyinSearch.value = safePinyin
+      })
+      .catch(() => {
+        // Dispose can win the race: the import fails after the scope cleanup
+        // already ran, and a timer created here would otherwise keep retrying.
+        if (pinyinDisposed) return
+        // The watcher only runs when the query text changes. A failed import
+        // would otherwise stay failed for as long as the user keeps typing nothing.
+        pinyinRetryAfter = Date.now() + 5000
+        if (pinyinRetryTimer || pinyinAutoRetries >= 3) return
+        pinyinAutoRetries += 1
+        pinyinRetryTimer = setTimeout(() => {
+          pinyinRetryTimer = null
+          pinyinRetryAfter = 0
+          if (!pinyinDisposed && state.filterText.value.trim()) void ensurePinyinSearch()
+        }, 5000)
+      })
+      .finally(() => { pinyinLoad = null })
+    return pinyinLoad
+  }
+
+  if (getCurrentScope()) {
+    onScopeDispose(() => {
+      pinyinDisposed = true
+      if (pinyinRetryTimer) clearTimeout(pinyinRetryTimer)
+      pinyinRetryTimer = null
+    })
+  }
+
+  if (config.buildPinyinSearchIndex) {
+    watch(() => state.filterText.value.trim(), (text) => {
+      pinyinAutoRetries = 0
+      if (text) void ensurePinyinSearch()
+    }, { immediate: true })
+  }
 
   const groupMap = computed(() => {
     const map = new Map<string, GridWorkbenchGroupSpec<T>>()
@@ -183,27 +202,41 @@ export function useGridWorkbench<T extends GridWorkbenchItemBase>(
     return map
   })
 
-  const items = computed<T[]>(() => {
+  const baseItems = computed<T[]>(() => {
     const raw = toValue(source)
     const builder = config.buildSearchIndex
-    if (!builder) return raw
-    return raw.map((item) => ({
-      ...item,
-      searchIndex: item.searchIndex || builder(item),
-    })) as T[]
+    const pinyinBuilder = config.buildPinyinSearchIndex
+    if (!builder && !pinyinBuilder) return raw
+    return raw.map((item) => {
+      const base = item.searchIndex || builder?.(item) || ''
+      return { ...item, searchIndex: base } as T
+    }) as T[]
+  })
+
+  // A separate boolean computed keeps keystrokes from re-walking every item:
+  // only entering/leaving search (or a source change) rebuilds pinyin indexes.
+  const searching = computed(() => state.filterText.value.trim().length > 0)
+
+  const items = computed<T[]>(() => {
+    const base = baseItems.value
+    const pinyinBuilder = config.buildPinyinSearchIndex
+    const search = pinyinSearch.value
+    if (!searching.value || !search || !pinyinBuilder) return base
+
+    return base.map((item) => {
+      const pinyinIndex = pinyinBuilder(item, search)
+      if (!pinyinIndex) return item
+      const baseSearchIndex = item.searchIndex || ''
+      const key = `${baseSearchIndex}\u0000${pinyinIndex}`
+      const cached = pinyinIndexCache.get(item as object)
+      if (cached?.key === key) return cached.value
+      const value = { ...item, searchIndex: `${baseSearchIndex}\n${pinyinIndex}` } as T
+      pinyinIndexCache.set(item as object, { key, value })
+      return value
+    })
   })
 
   const availableIdSet = computed(() => new Set(items.value.map((item) => item.id)))
-
-  const regexError = computed(() => {
-    if (!state.useRegex.value || !state.filterText.value.trim()) return false
-    try {
-      new RegExp(state.filterText.value.trim(), 'i')
-      return false
-    } catch {
-      return true
-    }
-  })
 
   function matchQualifier(item: T, key: string, value: string): boolean {
     const matcher = qualifierMatchers[key]
@@ -211,8 +244,7 @@ export function useGridWorkbench<T extends GridWorkbenchItemBase>(
     return matcher(item, value, { selectedIds: state.selectedIds.value })
   }
 
-  function matchesAdvancedQuery(item: T, input: string): boolean {
-    const tokens = tokenizeQuery(input)
+  function matchesAdvancedQuery(item: T, tokens: QueryToken[]): boolean {
     if (tokens.length === 0) return true
     return tokens.every((token) => {
       const matches = token.kind === 'term'
@@ -234,35 +266,15 @@ export function useGridWorkbench<T extends GridWorkbenchItemBase>(
 
   const filteredItems = computed(() => {
     const text = state.filterText.value.trim()
+    // Avoid walking the complete source when the type/group filter has no
+    // selections. This state is reachable from the type filter UI and is a
+    // useful fast path for large plugin registries.
+    if (state.selectedGroupIds.value.length === 0) return []
     const visibleByGroup = items.value.filter((item) => belongsToAnySelectedGroup(item))
     if (!text) return visibleByGroup
 
-    if (state.useRegex.value) {
-      const re = tryCompileSafeRegex(text, 'i')
-      if (!re) {
-        // ReDoS guard or compile error — fall back to case-insensitive
-        // substring matching so the user still gets *some* filtering
-        // instead of an unfiltered list (or a frozen UI on adversarial
-        // input). One-time console warn keeps devs aware without
-        // spamming the console on every keystroke.
-        warnReDoSOnce(text)
-        const lowered = text.toLowerCase()
-        const matches = (item: T) => (item.searchIndex || '').toLowerCase().includes(lowered)
-        return state.filterMode.value === 'blacklist'
-          ? visibleByGroup.filter((item) => !matches(item))
-          : visibleByGroup.filter(matches)
-      }
-      const matches = (item: T) => re.test(item.searchIndex || '')
-      return state.filterMode.value === 'blacklist'
-        ? visibleByGroup.filter((item) => !matches(item))
-        : visibleByGroup.filter(matches)
-    }
-
-    const lowered = text.toLowerCase()
-    const matches = (item: T) => matchesAdvancedQuery(item, lowered)
-    return state.filterMode.value === 'blacklist'
-      ? visibleByGroup.filter((item) => !matches(item))
-      : visibleByGroup.filter(matches)
+    const tokens = tokenizeQuery(text.toLowerCase())
+    return visibleByGroup.filter((item) => matchesAdvancedQuery(item, tokens))
   })
 
   // 每个分组的总数（不受 filterText / selectedGroupIds 影响，用于显示徽标）
@@ -346,14 +358,11 @@ export function useGridWorkbench<T extends GridWorkbenchItemBase>(
   return {
     items,
     filterText: state.filterText,
-    useRegex: state.useRegex,
-    filterMode: state.filterMode,
     selectedGroupIds: state.selectedGroupIds,
     layoutMode: state.layoutMode,
     multiSelectEnabled: state.multiSelectEnabled,
     selectedIds,
     selectedCount,
-    regexError,
     groupCounts,
     filteredItems,
     filteredByGroup,

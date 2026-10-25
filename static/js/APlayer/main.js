@@ -28,7 +28,8 @@ import {
 import { formatTime } from './utils.js';
 
 const APLAYER_CONFIG = {
-    defaultVolume: 0.6,
+    // 兜底默认音量放低，避免自动播放/主动分享突然大声；用户调过的值由 APlayer 持久化覆盖。
+    defaultVolume: 0.2,
     theme: '#44b7fe',
     position: 'bottom-right',
     ui: {
@@ -47,7 +48,7 @@ const APLAYER_CONFIG = {
         loop: 'none',
         order: 'random',
         preload: 'metadata',
-        volume: 0.6,
+        volume: 0.2,
         mutex: true,
         listFolded: true,
         listMaxHeight: 200,
@@ -134,6 +135,10 @@ export async function initializeAPlayer(options = {}, onReady = null) {
         console.error('[APlayer] Cannot initialize, library load failed.', e);
         return null;
     }
+
+    // The music request may have been dismissed while the library was loading.
+    // Check before touching a newer global player, creating DOM or starting media.
+    if (typeof options.isCurrentRequest === 'function' && !options.isCurrentRequest()) return null;
 
     if (window.aplayer) {
         const existingContainer = window.aplayer.container;

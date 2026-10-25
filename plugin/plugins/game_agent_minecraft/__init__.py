@@ -40,7 +40,11 @@ from plugin.sdk.plugin import (
 )
 
 from . import prompts
-from .service import GameAgentService
+from .service import (
+    GameAgentService,
+    task_looks_like_identifier,
+    text_signals_blocked,
+)
 
 # JSON Schema reused by the @llm_tool decorator below. Pulled into a
 # module-level constant so the plugin's introspection (status entry,
@@ -50,7 +54,17 @@ MINECRAFT_TASK_SCHEMA: Dict[str, Any] = {
     "properties": {
         "task": {
             "type": "string",
-            "description": "A concrete, directly executable Minecraft goal in English.",
+            "description": (
+                "A plain-language Minecraft instruction. For a master-directed "
+                "action, copy only master's most recent message: it must be a new "
+                "explicit game instruction that has not already been dispatched, "
+                "using the exact original wording without added details. During "
+                "keep-going, a genuinely new autonomous action may instead be "
+                "formed from the current game state, but never by recovering or "
+                "replaying an older instruction or tool call. Never add in-game "
+                "coordinates unless master explicitly asked for coordinates in "
+                "the most recent message."
+            ),
         },
         "overwrite": {
             "type": "boolean",
@@ -73,19 +87,53 @@ MINECRAFT_TASK_DESCRIPTION = (
     "(cue). "
     "Do not infer or claim results from the task text itself — only from "
     "actually-observed cues and screenshots.\n\n"
-    "Use this tool when the user asks the character to do something in "
-    "the game, or when continuing an in-game activity that needs another "
-    "concrete step. Do NOT use it for chat, status questions, or "
-    "abstract intent — see ``query_inventory`` for inventory lookups.\n\n"
+    "CRITICAL — this tool dispatches actions; it is not an awareness or heartbeat "
+    "tool. A screenshot, log, state update, idle reminder, or task-completion cue "
+    "is context only and is NEVER by itself a task to dispatch. Before "
+    "dispatching, account for the current task and recent feedback. If an action "
+    "may still be running, do not send another one.\n\n"
+    "TASK SOURCE AUTHORITY — for a master-directed action, use only master's most "
+    "recent message, and only when it contains a new explicit in-game instruction "
+    "that has not already been dispatched. The task must not come from an earlier "
+    "master message, an earlier tool call, task history, logs, screenshots, "
+    "telemetry, or a completion cue. During keep-going, you may instead form one "
+    "genuinely new autonomous action from the current game state when there is an "
+    "obvious next step. NEVER call back, recover, retry, or re-dispatch an older "
+    "master instruction or tool call, even if it failed or is mentioned by a "
+    "state reminder.\n\n"
+    "MASTER INSTRUCTION FIDELITY — when master (the user) gives an explicit "
+    "instruction in that most recent message, relay the exact original wording "
+    "in ``task``. Do not translate, "
+    "paraphrase, split, optimize, clarify on master's behalf, or add targets, "
+    "quantities, steps, tools, directions, or other details. The exact request "
+    "takes priority over the usual preference for a concrete single-step goal.\n\n"
+    "COORDINATE SAFETY — NEVER invent, infer, choose, or include in-game "
+    "coordinates unless master explicitly asked you to use or provide coordinates. "
+    "Coordinates visible in screenshots, logs, telemetry, or earlier agent output "
+    "do not count as master's request. Preserve relative wording such as 'come "
+    "here' exactly instead of turning it into coordinates.\n\n"
+    "CRITICAL — never parrot the game's own logs. The Minecraft feed you see is "
+    "the agent's internal telemetry: function-call lines (goToCoordinates(...), "
+    "attackEntity(...)), '!commands', 'admin movement request', and coordinates it "
+    "picked itself. NEVER copy any of that into a task — echoing a log line back "
+    "as a task creates a dispatch loop. A task must come from master's most recent "
+    "spoken request or a genuinely new autonomous choice based on current game "
+    "state, written as a plain-language goal, never "
+    "the game's raw command syntax or a coordinate you only saw in a log. If the "
+    "user asked for a specific thing, do THAT — not whatever the log happens to say.\n\n"
+    "Use this tool when master's most recent message asks the character to do "
+    "something new and that request has not already been dispatched, or when a "
+    "keep-going turn identifies a genuinely obvious new action from current game "
+    "state. Do NOT dispatch merely because a task finished or new awareness "
+    "context arrived. Do NOT use it for chat, status questions, abstract intent, "
+    "or inventory checks — the inventory is reported to you separately, never "
+    "dispatch a lookup as a task.\n\n"
     "Parameters:\n"
-    "  task (string, required): one concrete executable action in "
-    "English with specific targets — exact coordinates, specific block "
-    "or entity types, specific quantities. Vague intents ('find a good "
-    "place to build a house', 'find a blue block', 'come over here') "
-    "are not executable. Prefer single-step actions (one mine / one "
-    "craft / one walk) over long compound chains; chains complete "
-    "piece by piece and each step's real outcome must be observed "
-    "before claiming the next.\n"
+    "  task (string, required): master's exact original new instruction when "
+    "master-directed; otherwise one genuinely new autonomous action based on "
+    "current game state. Never source it from an older message or tool call, and "
+    "never repeat an already-dispatched command. Never add coordinates unless "
+    "master explicitly requested them in the most recent message.\n"
     "  overwrite (bool, default false): if a previous task is still in "
     "flight, false rejects this call with a 'busy' summary and the "
     "previous task keeps running. Set true when:\n"
@@ -118,16 +166,16 @@ class GameAgentMinecraftPlugin(NekoPluginBase):
 
     def __init__(self, ctx):
         super().__init__(ctx)
-        # 跟随全局 NEKO_LOG_LEVEL（默认 INFO）。此前硬编码 "INFO" 会把
-        # 自主 nudge loop 的 fire 决策（_log_debug "firing keep_going/
-        # in_progress/general nudge"）和其它 DEBUG 诊断永久吞掉——排查
-        # 「任务结束后猫娘不再开口 / self-prompt 没了」时根本看不到 nudge
-        # 到底有没有 fire、有没有走到 push。改成跟随环境变量，开 DEBUG 即可见。
+        # Follow global NEKO_LOG_LEVEL (default INFO). Hardcoded "INFO" previously hid
+        # autonomous nudge-loop firing decisions (_log_debug "firing keep_going/
+        # in_progress/general nudge") and other DEBUG diagnostics permanently; when investigating
+        # 'the catgirl stops speaking after task completion / self-prompt disappeared', it was impossible to see whether nudges
+        # fired or reached push. Following the environment variable exposes them when DEBUG is enabled.
         _log_level = (os.environ.get("NEKO_LOG_LEVEL") or "INFO").strip().upper()
         try:
             self.file_logger = self.enable_file_logging(log_level=_log_level)
         except ValueError:
-            # 未知级别（理论上不会发生）兜底回 INFO，别让插件因日志配置崩在 __init__。
+            # Unknown levels, theoretically impossible, fall back to INFO rather than crashing plugin __init__ over logging configuration.
             self.file_logger = self.enable_file_logging(log_level="INFO")
         self.logger = self.file_logger
         self._cfg: Dict[str, Any] = {}
@@ -227,7 +275,7 @@ class GameAgentMinecraftPlugin(NekoPluginBase):
             else {}
         )
         # Resolve user language now (it reads Steam / system locale via
-        # ``utils.language_utils.get_global_language``, which lazy-inits
+        # ``utils.language_utils.get_global_language_full``, which lazy-inits
         # on first call) and propagate to the service so its autonomous
         # nudge loop and task_finished cues match the user's locale.
         self._lang = prompts.user_lang()
@@ -318,6 +366,15 @@ class GameAgentMinecraftPlugin(NekoPluginBase):
                 "summary": prompts.t("TASK_SCHEMA_ERROR", lang=self._lang),
             }
         task_text = task.strip()
+        # Bare identifier (``mine_block``, ``query_inventory``,
+        # ``goToCoordinates(...)``) instead of a sentence — refuse with a
+        # structured hint so the token never reaches mc-agent nor the
+        # in-progress cue that would echo it back (see
+        # ``service.task_looks_like_identifier``).
+        if task_looks_like_identifier(task_text):
+            return {
+                "summary": prompts.t("TASK_IDENTIFIER_ERROR", lang=self._lang),
+            }
         # Some LLMs pass ``"true"`` / ``"1"`` / ``1`` as overwrite. Strict
         # ``is True`` keeps the destructive interrupt path off-by-default;
         # anything other than the canonical Python bool ``True`` is treated
@@ -408,14 +465,14 @@ class GameAgentMinecraftPlugin(NekoPluginBase):
             return
         try:
             # ai_behavior="respond" + priority=7: the action just
-            # finished; the dialog LLM should immediately narrate the
-            # outcome to {MASTER_NAME} and (if appropriate) decide a
-            # next concrete action. Without ``respond`` the cue would
-            # only land in context as silent reading material; the
-            # human-facing report would be deferred to the next user
-            # turn, which feels unresponsive. Importance scale is
-            # HIGHER=more important (repo-wide): alert=9 (most important)
-            # > completion=7 > in_progress=4 > keep_going=3.
+            # finished, so the dialog LLM should immediately absorb and, when
+            # useful, narrate the outcome to {MASTER_NAME}. The prompt frames
+            # this as awareness rather than a command to dispatch another task;
+            # the later keep-going turn remains responsible for any genuinely
+            # new autonomous next action. Importance scale is HIGHER=more
+            # important (repo-wide):
+            # alert=9 (most important) > completion=7 > in_progress=4 >
+            # keep-going=3.
             self.push_message(
                 source="game_agent_minecraft",
                 visibility=[],
@@ -432,14 +489,14 @@ class GameAgentMinecraftPlugin(NekoPluginBase):
 
     def _format_completion_cue(self, result: Dict[str, Any]) -> str:
         """Render the ``run_claimed_task`` return into a short cue for the
-        dialog LLM. Goal: tell猫娘 what just happened in as few words as
+        dialog LLM. Goal: tell the catgirl what just happened in as few words as
         possible — she should *know* the outcome, not parrot it. Long
-        instructional preambles got复述 verbatim in our earlier testing
-        ("【当前持有 ground truth】" became a literal台词)，which is
-        exactly the "像个机器人一直念" problem we're fixing.
+        instructional preambles were repeated verbatim in earlier testing
+        ('current inventory ground truth' became literal dialogue), which is
+        exactly the robotic repeated narration problem being fixed.
 
         Transport-level errors get rewritten to body/sensation language
-        so the dialog LLM never sees "agent server is not connected" and
+        so the dialog LLM never sees \"agent server is not connected\" and
         starts narrating about reconnection.
         """
         if result.get("is_error"):
@@ -465,38 +522,35 @@ class GameAgentMinecraftPlugin(NekoPluginBase):
         # Re-label transport/blocked statuses into localized phrases the
         # dialog LLM can paraphrase. The "received status string" stays
         # the surface text the LLM sees; routing logic below still keys
-        # off the original ``ok`` / ``受阻`` sentinel values via the
-        # same-language label, so the three-way branch survives
-        # localization without growing brittle "if any locale of 受阻"
+        # off the original ``ok`` / ``受阻`` ('blocked') sentinel values via the
+        # same-language label, so the status branches below survive
+        # localization without growing brittle 'if any locale of blocked'
         # checks.
         blocked_label = prompts.t("STATUS_LABEL_BLOCKED", lang=self._lang)
-        if status == "AGENT_DISCONNECTED" or "not connected" in detail.lower():
+        # Gate the "not connected" text sniff on an actual error envelope.
+        # The genuine transport failure already arrives as
+        # status=="AGENT_DISCONNECTED" (is_error path above), so the substring
+        # is only a belt-and-suspenders for error results whose text says
+        # "not connected". Firing it on ANY detail containing that phrase
+        # would hijack a legitimate completion (e.g. status="ok",
+        # text="the lever is not connected to the piston") — or a new
+        # interrupted/superseded frame — into the disconnect bucket.
+        if status == "AGENT_DISCONNECTED" or (
+            result.get("is_error") and "not connected" in detail.lower()
+        ):
             status = prompts.t("STATUS_LABEL_DISCONNECTED", lang=self._lang)
             detail = prompts.t("STATUS_DETAIL_DISCONNECTED", lang=self._lang)
         # mc-agent quirk: chat-loop returns ``status="ok"`` even when the
         # in-game action was blocked (mineflayer couldn't resolve target,
         # missing tool, path obstructed, etc.) — the failure is buried in
         # the text message. Without re-labeling, the dialog LLM reads
-        # "结果 ok" + "find player not found" and concludes "task done"
-        # (cf. user-reported "她以为找博士成功了，没改用真 username"
+        # "结果 ok" ('result ok') + "find player not found" and concludes "task done"
+        # (cf. the user report: 'she thought finding Doctor succeeded and never used the real username'
         # bug). Surface the blocked-ness explicitly so she has to plan
-        # around it.
-        elif status.lower() == "ok" and detail:
-            blocked_markers = (
-                "obstacle", "obstructed", "not found", "could not", "couldn't",
-                "unable", "failed", "no path", "blocked", "missing",
-                "cannot", "can't",
-                # status=ok 但实际没目标 / 要更多信息也算受阻：mc-agent 对
-                # 「过来」「跟着我」这类缺玩家名/坐标的指令会回 status=ok +
-                # "Target unavailable. Please provide the exact player name or
-                # coordinates."，旧标记词表漏了 unavailable，导致被当成功 →
-                # 猫娘叙述「我来啦」其实化身没动。
-                "unavailable", "please provide", "provide the exact",
-                "no target", "target not",
-            )
-            d_lower = detail.lower()
-            if any(m in d_lower for m in blocked_markers):
-                status = blocked_label
+        # around it. Marker list is shared with the retroactive cue via
+        # ``text_signals_blocked`` so the two can't drift apart.
+        elif status.strip().lower() == "ok" and text_signals_blocked(detail):
+            status = blocked_label
 
         inv = result.get("inventory")
         inv_line = ""
@@ -513,17 +567,35 @@ class GameAgentMinecraftPlugin(NekoPluginBase):
         elif isinstance(inv, dict):
             inv_line = prompts.t("COMPLETION_INV_CURRENT_EMPTY", lang=self._lang)
 
-        # Three-way: actual success ("ok", case-insensitive), rebadged
-        # success-but-blocked (status == blocked_label), or anything
-        # else (disconnect, timeout, interrupted, error, "unknown",
-        # arbitrary is_error strings). The else branch previously cue'd
-        # everything that wasn't 受阻 as "做完 ... 派下一步" which told
-        # the dialog LLM the action succeeded when it actually
-        # disconnected / timed out / crashed — Codex review on PR
-        # #1395 caught this. Whitelist "ok" as success instead of
-        # trying to enumerate every failure.
+        # Four-way: actual success ("ok", case-insensitive), rebadged
+        # success-but-blocked (status == blocked_label), neutral
+        # interrupted/superseded (task stopped short but nothing went
+        # wrong), or genuine failure (disconnect, timeout, "failed",
+        # error, "unknown", arbitrary is_error strings). The catch-all
+        # branch previously cued everything other than 'blocked' as 'completed ...',
+        # 'dispatch the next step', telling the dialog LLM the action succeeded when it
+        # actually disconnected / timed out / crashed — Codex review on
+        # PR #1395 caught this, so we whitelist "ok" as success instead
+        # of enumerating every failure. ``interrupted`` (our overwrite/
+        # shutdown/bounce verdict) and ``superseded`` (mc-agent's "a newer
+        # task replaced this") are carved out of the failure bucket: they
+        # are non-completions, not failures, and narrating them as
+        # 'Failed — determine why' is wrong (there is no cause; she simply moved on).
+        # Normalize once for the buckets: tolerate case + stray whitespace
+        # from mc-agent (e.g. "ok " / " SUPERSEDED" must still classify).
+        # ``is_blocked`` keeps the exact-label compare — blocked_label is a
+        # localized display string set by the rewrite above, never padded.
+        status_lc = status.strip().lower()
         is_blocked = status == blocked_label
-        is_success = status.lower() == "ok"
+        is_success = status_lc == "ok"
+        is_interrupted = status_lc in ("interrupted", "superseded")
+        # [NO-SWITCH-CUE] interrupted/superseded means a newer task already
+        # replaced this one — the LLM (or user) did that on purpose and knows.
+        # Reporting "your task got switched (re-dispatch if you want)" just makes
+        # it fire another minecraft_task → the observed task-switch retry storm.
+        # Emit nothing; the fresh task's own cues/screenshots carry the story.
+        if is_interrupted:
+            return ""
         if is_blocked:
             head_verb = prompts.t("HEAD_VERB_BLOCKED", lang=self._lang)
         elif is_success:
@@ -555,17 +627,17 @@ class GameAgentMinecraftPlugin(NekoPluginBase):
 
     @ui.context(id="quickstart")
     async def quickstart_ui_context(self, **_):
-        """quickstart guide surface 的只读上下文 provider。
+        """Read-only context provider for the quickstart guide surface.
 
-        必须存在：hosted-surface 的 ``api.call`` 走 ``call_surface_action`` →
-        ``host.get_ui_context(<surface 的 context_id>)``。surface 没声明
-        ``context`` 时 context_id 取 surface id（这里 "quickstart"），缺了对应
-        provider 会让 get_ui_context 直接报 "UI context not found"，连带
-        ``_collect_ui_actions()`` 暴露的 action 列表也拿不到，``api.call`` 必败。
+        Required: hosted-surface ``api.call`` uses ``call_surface_action`` →
+        ``host.get_ui_context(<surface context_id>)``. Without declared
+        ``context``, context_id defaults to the surface ID (\"quickstart\" here); missing the corresponding
+        provider makes get_ui_context raise \"UI context not found\", also preventing
+        access to ``_collect_ui_actions()``'s action list, so ``api.call`` always fails.
 
-        surface 自身通过 ``props.api.call("game_agent_status")`` 拉实时状态，
-        所以这里返回轻量快照即可（不强制 lazy-start，避免每次取 context 都阻塞
-        3s 等 WS 握手）。返回值会和 host 注入的 ``actions`` 合并下发。
+        The surface itself fetches live state through ``props.api.call(\"game_agent_status\")``,
+        so a lightweight snapshot suffices here; avoid forced lazy-start and its
+        3s WS-handshake wait on every context fetch. The host merges injected ``actions`` into this result.
         """
         try:
             return {"status": self._service.get_status()}
@@ -648,8 +720,8 @@ class GameAgentMinecraftPlugin(NekoPluginBase):
             connected = connected or source == "live"
 
             # Short, fact-only summaries. The dialog LLM only needs to
-            # *know* the inventory, not复述 a long preamble — the old
-            # version had her quoting "【ground truth — 完整且唯一】"
+            # *know* the inventory, not repeat a long preamble — the old
+            # version had her quoting 'ground truth — complete and exclusive'
             # verbatim like a robot.
             if inv_at == 0:
                 summary = prompts.t("INV_NO_DATA", lang=self._lang)

@@ -33,14 +33,17 @@ from __future__ import annotations
 import asyncio
 import os
 from collections import defaultdict
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
-import httpx
+if TYPE_CHECKING:
+    import httpx
 
 from config import MAIN_SERVER_PORT, USER_PLUGIN_SERVER_PORT
 from plugin.logging_config import get_logger
+from plugin.utils.http_imports import ensure_httpx, load_httpx
 
 logger = get_logger("server.messaging.llm_tool_registry")
+
 
 # ---------------------------------------------------------------------------
 # Process-global state
@@ -62,6 +65,7 @@ _HTTP_CLIENT: Optional[httpx.AsyncClient] = None
 def _get_http_client() -> httpx.AsyncClient:
     global _HTTP_CLIENT
     if _HTTP_CLIENT is None:
+        httpx = load_httpx()
         _HTTP_CLIENT = httpx.AsyncClient(
             timeout=httpx.Timeout(10.0, connect=2.0),
             limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
@@ -143,6 +147,7 @@ async def register_remote_tool(
     parameters: Dict[str, Any],
     timeout_seconds: float,
     role: Optional[str] = None,
+    reply_tail: bool = False,
 ) -> Dict[str, Any]:
     """Register a plugin-owned LLM tool with ``main_server``.
 
@@ -156,6 +161,7 @@ async def register_remote_tool(
     IPC.
     """
     callback_url = build_callback_url(plugin_id, name)
+    httpx = await ensure_httpx()
     payload = {
         "name": name,
         "description": description,
@@ -164,6 +170,7 @@ async def register_remote_tool(
         "role": role,
         "source": _source_tag(plugin_id),
         "timeout_seconds": float(timeout_seconds),
+        **({"reply_tail": True} if reply_tail else {}),
     }
 
     client = _get_http_client()
@@ -232,8 +239,15 @@ async def unregister_remote_tool(
     half-registered on some role; pruning local tracking in that case
     means a later ``clear_plugin_tools`` can't catch the stragglers and
     the model would still see them.
+
+    The payload carries ``expected_source`` so ``main_server`` refuses to
+    remove the name when it is owned by a different source (e.g. our own
+    registration was rejected by the cross-source guard and the name
+    actually belongs to another plugin) — a plugin can never unregister
+    another plugin's tool by name collision.
     """
-    payload = {"name": name, "role": role}
+    payload = {"name": name, "role": role, "expected_source": _source_tag(plugin_id)}
+    httpx = await ensure_httpx()
     client = _get_http_client()
     url = f"{_main_server_base_url()}/api/tools/unregister"
     try:
@@ -255,6 +269,14 @@ async def unregister_remote_tool(
             f"main_server /api/tools/unregister returned {resp.status_code}: {text[:500]}"
         )
     body = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+    refused_roles = body.get("refused_roles") if isinstance(body, dict) else None
+    if refused_roles:
+        # Another source owns the name: our registration never took effect on main_server (cross-source
+        # guard rejection, cache races, etc.). Discard local tracking without touching others' tools.
+        logger.warning(
+            "unregister_remote_tool refused foreign-owned name: plugin_id={}, name={}, refused_roles={}",
+            plugin_id, name, refused_roles,
+        )
     failed_roles = body.get("failed_roles") if isinstance(body, dict) else None
     if failed_roles:
         logger.warning(
@@ -277,7 +299,14 @@ async def unregister_remote_tool(
     return body if isinstance(body, dict) else {"ok": True}
 
 
-async def clear_plugin_tools(plugin_id: str, *, role: Optional[str] = None) -> Dict[str, Any]:
+# Remote-tool cleanup timeout on plugin stop: much shorter than the default 2.0s connect timeout,
+# because this is best-effort cleanup under the cross-process lock; every extra second delays all plugin operations.
+# The default timeout is constructed with the backend on first cleanup.
+
+
+async def clear_plugin_tools(
+    plugin_id: str, *, role: Optional[str] = None, timeout: float | None = None
+) -> Dict[str, Any]:
     """Remove every LLM tool a plugin has registered on ``main_server``.
 
     Called from the plugin shutdown path so a stopped plugin doesn't
@@ -285,14 +314,45 @@ async def clear_plugin_tools(plugin_id: str, *, role: Optional[str] = None) -> D
     swallows HTTP errors (the plugin is already going away; a noisy
     failure here would mask the real shutdown reason).
     """
+    httpx = await ensure_httpx()
     async with _lock:
         owned = list(_plugin_tools.pop(plugin_id, {}).keys())
 
     payload = {"source": _source_tag(plugin_id), "role": role}
     client = _get_http_client()
     url = f"{_main_server_base_url()}/api/tools/clear"
+    # This await holds stop_plugin's cross-process lock. If main_server is not listening, local
+    # loopback refusal consumes the full default 2.0s connect timeout; reloading eight plugins creates
+    # over ten seconds of pure dead time in the lock chain.
+    #
+    # Skipping when no local record exists is wrong: after process restart _plugin_tools is empty,
+    # but main_server may still hold tools registered by this plugin. Skipping leaves ghost tools
+    # callable by the model. Local records are not authoritative for remote state, so send cleanup
+    # anyway, with a shorter best-effort timeout.
     try:
-        resp = await client.post(url, json=payload)
+        # Honor caller budgets: plugin stop is on the critical path and still holds the operation lock;
+        # a separate timeout would extend shutdown beyond the overall budget (Codex).
+        #
+        # httpx.Timeout limits individual connect/read/write/pool phases, not total duration: a slowly
+        # trickling chunked response can avoid every phase timeout while exceeding the overall budget
+        # (CodeRabbit verified this with a real chunked server). Retain phase limits and wrap
+        # the call in asyncio.wait_for for a total-duration limit.
+        request = client.post(
+            url,
+            json=payload,
+            timeout=(
+                httpx.Timeout(2.0, connect=0.3)
+                if timeout is None
+                else httpx.Timeout(timeout, connect=min(0.3, timeout))
+            ),
+        )
+        resp = await (request if timeout is None else asyncio.wait_for(request, timeout))
+    except asyncio.TimeoutError:
+        logger.debug(
+            "clear_plugin_tools exceeded its budget (best-effort): plugin_id={}, timeout={}",
+            plugin_id, timeout,
+        )
+        return {"ok": False, "removed": 0, "error": "timeout", "owned_count": len(owned)}
     except httpx.HTTPError as exc:
         logger.debug(
             "clear_plugin_tools HTTP error (best-effort): plugin_id={}, err={}",

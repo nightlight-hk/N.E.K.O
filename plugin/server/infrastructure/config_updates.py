@@ -7,12 +7,12 @@ from pathlib import Path
 from fastapi import HTTPException
 
 from plugin.logging_config import get_logger
-from plugin.server.infrastructure.config_locking import file_lock, get_plugin_update_lock
+from plugin.server.infrastructure.config_locking import file_lock, get_plugin_update_lock, plugin_config_file_lock
 from plugin.server.infrastructure.config_merge import deep_merge
-from plugin.server.infrastructure.config_paths import get_plugin_config_path
+from plugin.server.infrastructure.config_paths import ensure_plugin_runtime_config
 from plugin.server.infrastructure.config_protected import validate_protected_fields_unchanged
 from plugin.server.infrastructure.config_queries import load_plugin_config
-from plugin.server.infrastructure.config_storage import atomic_write_bytes, atomic_write_text
+from plugin.server.infrastructure.config_storage import ConfigCommitGuard, atomic_write_bytes, atomic_write_text
 from plugin.server.infrastructure.config_toml import (
     dump_toml_bytes,
     load_toml_from_stream,
@@ -147,7 +147,7 @@ def _log_config_update_failure(
 
 def _resolve_config_path_for_update(*, operation: str, plugin_id: str) -> Path:
     try:
-        return get_plugin_config_path(plugin_id)
+        return ensure_plugin_runtime_config(plugin_id)
     except HTTPException as exc:
         _log_config_path_resolution_failure(operation=operation, plugin_id=plugin_id, exc=exc)
         raise
@@ -162,38 +162,45 @@ def _resolve_config_path_for_update(*, operation: str, plugin_id: str) -> Path:
         ) from exc
 
 
-def replace_plugin_config(plugin_id: str, new_config: dict[str, object]) -> dict[str, object]:
+def replace_plugin_config(
+    plugin_id: str,
+    new_config: dict[str, object],
+    *,
+    commit_guard: ConfigCommitGuard | None = None,
+) -> dict[str, object]:
     normalized_new_config = _ensure_string_key_mapping(new_config, field="config")
-    lock = get_plugin_update_lock(plugin_id)
     operation = "replace"
+    config_path = _resolve_config_path_for_update(operation=operation, plugin_id=plugin_id)
+    lock = get_plugin_update_lock(plugin_id)
     with lock:
-        config_path = _resolve_config_path_for_update(operation=operation, plugin_id=plugin_id)
         stage = "open"
         _log_config_update_start(operation=operation, plugin_id=plugin_id, config_path=config_path)
         try:
-            with config_path.open("r+b") as file_obj:
-                stage = "lock"
-                with file_lock(file_obj):
-                    stage = "read"
-                    current_config = load_toml_from_stream(file_obj, context=f"{plugin_id}.plugin.toml")
-                    stage = "validate"
-                    validate_protected_fields_unchanged(
-                        current_config=current_config,
-                        new_config=normalized_new_config,
-                    )
-                    stage = "fill_protected_fields"
-                    completed_config = _fill_plugin_protected_fields(
-                        current_config=current_config,
-                        incoming_config=normalized_new_config,
-                    )
-                    stage = "serialize"
-                    payload = dump_toml_bytes(completed_config)
-                    stage = "atomic_write"
-                    atomic_write_bytes(
-                        target=config_path,
-                        payload=payload,
-                        prefix=".plugin_config_",
-                    )
+            with plugin_config_file_lock(config_path):
+                with config_path.open("r+b") as file_obj:
+                    stage = "lock"
+                    with file_lock(file_obj):
+                        stage = "read"
+                        current_config = load_toml_from_stream(file_obj, context=f"{plugin_id}.plugin.toml")
+                        stage = "validate"
+                        validate_protected_fields_unchanged(
+                            current_config=current_config,
+                            new_config=normalized_new_config,
+                        )
+                        stage = "fill_protected_fields"
+                        completed_config = _fill_plugin_protected_fields(
+                            current_config=current_config,
+                            incoming_config=normalized_new_config,
+                        )
+                        stage = "serialize"
+                        payload = dump_toml_bytes(completed_config)
+                stage = "atomic_write"
+                atomic_write_bytes(
+                    target=config_path,
+                    payload=payload,
+                    prefix=".plugin_config_",
+                    commit_guard=commit_guard,
+                )
             _log_config_update_success(operation=operation, plugin_id=plugin_id, config_path=config_path)
         except HTTPException as exc:
             _log_config_update_failure(
@@ -256,35 +263,42 @@ def replace_plugin_config(plugin_id: str, new_config: dict[str, object]) -> dict
     }
 
 
-def update_plugin_config(plugin_id: str, updates: dict[str, object]) -> dict[str, object]:
+def update_plugin_config(
+    plugin_id: str,
+    updates: dict[str, object],
+    *,
+    commit_guard: ConfigCommitGuard | None = None,
+) -> dict[str, object]:
     normalized_updates = _ensure_string_key_mapping(updates, field="updates")
-    lock = get_plugin_update_lock(plugin_id)
     operation = "update"
+    config_path = _resolve_config_path_for_update(operation=operation, plugin_id=plugin_id)
+    lock = get_plugin_update_lock(plugin_id)
     with lock:
-        config_path = _resolve_config_path_for_update(operation=operation, plugin_id=plugin_id)
         stage = "open"
         _log_config_update_start(operation=operation, plugin_id=plugin_id, config_path=config_path)
         try:
-            with config_path.open("r+b") as file_obj:
-                stage = "lock"
-                with file_lock(file_obj):
-                    stage = "read"
-                    current_config = load_toml_from_stream(file_obj, context=f"{plugin_id}.plugin.toml")
-                    stage = "merge"
-                    merged = deep_merge(current_config, normalized_updates)
-                    stage = "validate"
-                    validate_protected_fields_unchanged(
-                        current_config=current_config,
-                        new_config=merged,
-                    )
-                    stage = "serialize"
-                    payload = dump_toml_bytes(merged)
-                    stage = "atomic_write"
-                    atomic_write_bytes(
-                        target=config_path,
-                        payload=payload,
-                        prefix=".plugin_config_",
-                    )
+            with plugin_config_file_lock(config_path):
+                with config_path.open("r+b") as file_obj:
+                    stage = "lock"
+                    with file_lock(file_obj):
+                        stage = "read"
+                        current_config = load_toml_from_stream(file_obj, context=f"{plugin_id}.plugin.toml")
+                        stage = "merge"
+                        merged = deep_merge(current_config, normalized_updates)
+                        stage = "validate"
+                        validate_protected_fields_unchanged(
+                            current_config=current_config,
+                            new_config=merged,
+                        )
+                        stage = "serialize"
+                        payload = dump_toml_bytes(merged)
+                stage = "atomic_write"
+                atomic_write_bytes(
+                    target=config_path,
+                    payload=payload,
+                    prefix=".plugin_config_",
+                    commit_guard=commit_guard,
+                )
             _log_config_update_success(operation=operation, plugin_id=plugin_id, config_path=config_path)
         except HTTPException as exc:
             _log_config_update_failure(
@@ -352,29 +366,30 @@ def update_plugin_config_toml(plugin_id: str, toml_text: str) -> dict[str, objec
         raise HTTPException(status_code=400, detail="toml_text cannot be None")
 
     parsed_new = parse_toml_text(toml_text, context=f"{plugin_id}.plugin.toml")
-    lock = get_plugin_update_lock(plugin_id)
     operation = "toml_update"
+    config_path = _resolve_config_path_for_update(operation=operation, plugin_id=plugin_id)
+    lock = get_plugin_update_lock(plugin_id)
     with lock:
-        config_path = _resolve_config_path_for_update(operation=operation, plugin_id=plugin_id)
         stage = "open"
         _log_config_update_start(operation=operation, plugin_id=plugin_id, config_path=config_path)
         try:
-            with config_path.open("r+b") as file_obj:
-                stage = "lock"
-                with file_lock(file_obj):
-                    stage = "read"
-                    current_config = load_toml_from_stream(file_obj, context=f"{plugin_id}.plugin.toml")
-                    stage = "validate"
-                    validate_protected_fields_unchanged(
-                        current_config=current_config,
-                        new_config=parsed_new,
-                    )
-                    stage = "atomic_write"
-                    atomic_write_text(
-                        target=config_path,
-                        text=toml_text,
-                        prefix=".plugin_config_",
-                    )
+            with plugin_config_file_lock(config_path):
+                with config_path.open("r+b") as file_obj:
+                    stage = "lock"
+                    with file_lock(file_obj):
+                        stage = "read"
+                        current_config = load_toml_from_stream(file_obj, context=f"{plugin_id}.plugin.toml")
+                        stage = "validate"
+                        validate_protected_fields_unchanged(
+                            current_config=current_config,
+                            new_config=parsed_new,
+                        )
+                stage = "atomic_write"
+                atomic_write_text(
+                    target=config_path,
+                    text=toml_text,
+                    prefix=".plugin_config_",
+                )
             _log_config_update_success(operation=operation, plugin_id=plugin_id, config_path=config_path)
         except HTTPException as exc:
             _log_config_update_failure(

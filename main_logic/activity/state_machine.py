@@ -1,3 +1,17 @@
+# Copyright 2025-2026 Project N.E.K.O. Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """User-activity state machine.
 
 Pure-rules engine: takes signals (system snapshot, window observations,
@@ -88,6 +102,18 @@ FOCUSED_WORK_RECENT_INPUT_SECONDS = 5 * 60
 # fast enough to react to genuine browsing.
 CASUAL_BROWSING_MIN_DWELL_SECONDS = 30.0
 
+# focused_video: how long a video/live entertainment window must hold the
+# foreground *continuously* before we treat the user as immersed (and cut
+# music/meme/web externals while keeping screen snark). The dwell is
+# ``now - _current_window_started_at``, which resets to zero whenever the
+# foreground window changes category/subcategory/canonical — so switching
+# to a work/chat window and back restarts the clock. 120s (2 min) is well
+# above casual_browsing's 30s so "just opened a clip" stays on the open
+# side; only sustained watching crosses into focused_video. Same video
+# site moving to the next video does NOT reset (update_window ignores
+# title), but flipping to a non-video window does.
+FOCUSED_VIDEO_MIN_DWELL_SECONDS = 120.0
+
 # transitioning: # of distinct window observations in the lookback that
 # signals the user is rapidly task-switching. The lookback is
 # ``WINDOW_HISTORY_LOOKBACK_SECONDS``. Tuned for "5 windows in 5 min" —
@@ -121,17 +147,20 @@ GAMING_GPU_MAX_IDLE_SECONDS = 60.0
 # cap on follow-ups prevents the AI from harassing the user about the
 # same hanging question.
 UNFINISHED_THREAD_WINDOW_SECONDS = 5 * 60
-UNFINISHED_THREAD_MAX_FOLLOWUPS = 2
+UNFINISHED_THREAD_MAX_FOLLOWUPS = 1
 
 # Question-detection heuristic: only the last N chars of the AI message
-# are scanned. Mid-sentence question marks (e.g. "你说『你好吗』我没听清")
+# are scanned. Mid-sentence question marks (e.g. "你说『你好吗』我没听清", an embedded "how are you" quote)
 # don't count as the message itself ending with a question.
 _QUESTION_TAIL_LEN = 60
 _QUESTION_MARKS: tuple[str, ...] = ('?', '？')
 # Sentence-final particles in CJK that imply a question even without a
 # punctuation mark. Checked against the trailing few chars (after
 # stripping trailing whitespace and one optional punctuation).
-_CN_QUESTION_PARTICLES: tuple[str, ...] = ('吗', '呢', '么', '吧')
+# Add only "嗎" (question particle). The other particles 呢/吧 have identical simplified/traditional forms, so this was the only omission.
+# Do NOT add "麼": the check uses trail[-1] (the final character), while "什麼 / 怎麼" (what/how) are very common
+# away from sentence endings; including them would misclassify "我不知道該說什麼" (I do not know what to say) as a question.
+_CN_QUESTION_PARTICLES: tuple[str, ...] = ('吗', '嗎', '呢', '么', '吧')
 
 
 def _strip_emotion_tags(text: str) -> str:
@@ -387,6 +416,9 @@ class ActivityStateMachine:
         self._casual_browsing_min_dwell_seconds = prefs.thresholds.get(
             'casual_browsing_min_dwell_seconds', CASUAL_BROWSING_MIN_DWELL_SECONDS,
         )
+        self._focused_video_min_dwell_seconds = prefs.thresholds.get(
+            'focused_video_min_dwell_seconds', FOCUSED_VIDEO_MIN_DWELL_SECONDS,
+        )
         # Count-shaped thresholds need integer semantics — bare ``int(...)``
         # would silently truncate ``0.9`` → ``0`` or ``1.7`` → ``1``,
         # producing surprising behaviour (transitioning never trips,
@@ -553,6 +585,44 @@ class ActivityStateMachine:
             self._current_window = obs
             self._current_window_started_at = ts
             self._window_history.append(_WindowEntry(timestamp=ts, observation=obs))
+
+    def recent_window_trail(
+        self, *, now: float, limit: int = 3, max_age_seconds: float | None = None,
+    ) -> list[tuple[str, float]]:
+        """Recent foreground windows as ``(canonical_name, dwell_seconds)``, oldest
+        first and the still-active current window last.
+
+        Built from ``_window_history`` (one entry per genuine window change). Each
+        window's dwell is the time until the *next* change, or ``now`` for the
+        current window. Lets a caller describe activity FLOW ("coded, then
+        browsed, now chatting") instead of only the instantaneous window.
+
+        Two kinds of window are excluded from the OUTPUT: those with no canonical
+        name, and ``private``-category ones. The loop's private-mode bail is
+        downstream of ``update_window``, so private windows still land in the
+        history and would otherwise resurface here after the user leaves private
+        mode. App names only — never window titles — so the sensitive surface is
+        no wider than the single ``active_window`` already exposes.
+
+        Dwell boundaries come from the RAW history order, computed *before* those
+        exclusions: a skipped window in the middle of the sequence drops its own
+        time instead of folding it into the previous app's dwell.
+        """
+        # max_age trims old switches off the front (which never affects a newer
+        # window's boundary); then walk the raw history in order so each kept
+        # window's dwell stops at the next RAW switch, not the next *kept* one.
+        raw_entries = list(self._window_history)
+        if max_age_seconds is not None:
+            raw_entries = [e for e in raw_entries if now - e.timestamp <= max_age_seconds]
+        if limit <= 0:
+            return []
+        trail: list[tuple[str, float]] = []
+        for i, entry in enumerate(raw_entries):
+            end = raw_entries[i + 1].timestamp if i + 1 < len(raw_entries) else now
+            obs = entry.observation
+            if obs is not None and obs.canonical and obs.category != 'private':
+                trail.append((obs.canonical, max(0.0, end - entry.timestamp)))
+        return trail[-limit:]
 
     def update_system(self, sys_snap: SystemSnapshot) -> None:
         """Cache the latest system snapshot (idle / CPU)."""
@@ -851,9 +921,19 @@ class ActivityStateMachine:
             if dwell >= self._focused_work_min_dwell_seconds and (recent_input or recent_system_active):
                 return 'focused_work'
 
-        # 6. casual_browsing — entertainment dominates with reasonable dwell.
+        # 6. focused_video / casual_browsing — entertainment dominates with
+        # reasonable dwell. A video/live window held continuously past the
+        # (higher) focused_video threshold means the user is immersed in
+        # watching — keep screen snark but cut external sources. Anything
+        # below that, or non-video entertainment (social/music/etc), stays
+        # casual_browsing once it clears the smaller casual dwell bar.
         if win is not None and win.category == 'entertainment':
             dwell = now - self._current_window_started_at
+            if (
+                win.subcategory in ('video', 'live')
+                and dwell >= self._focused_video_min_dwell_seconds
+            ):
+                return 'focused_video'
             if dwell >= self._casual_browsing_min_dwell_seconds:
                 return 'casual_browsing'
 
@@ -925,6 +1005,9 @@ class ActivityStateMachine:
         elif state == 'casual_browsing':
             name = (win.canonical if win and win.canonical else None) or '?'
             reasons.append(('state_casual_browsing', {'app': name}))
+        elif state == 'focused_video':
+            name = (win.canonical if win and win.canonical else None) or '?'
+            reasons.append(('state_focused_video', {'app': name}))
         elif state == 'chatting':
             name = (win.canonical if win and win.canonical else None) or '?'
             reasons.append(('state_chatting', {'app': name}))

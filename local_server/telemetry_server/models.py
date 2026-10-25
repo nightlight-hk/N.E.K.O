@@ -1,42 +1,56 @@
 # -*- coding: utf-8 -*-
-"""
-Telemetry Server — 数据模型
+# Copyright 2025-2026 Project N.E.K.O. Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
-数据最小化：仅 token 计数，零对话内容、零 PII。
-兼容 Pydantic v1 和 v2。
+"""
+Telemetry Server — data models
+
+Data minimization: token counts only, zero conversation content, zero PII.
+Compatible with both Pydantic v1 and v2.
 """
 from __future__ import annotations
 
 from pydantic import BaseModel, Field
 from typing import Dict, List, Optional
 
-# Pydantic v1/v2 兼容
+# Pydantic v1/v2 compatibility.
 PYDANTIC_V2 = int(getattr(__import__('pydantic'), 'VERSION', '1.0').split('.')[0]) >= 2
 
 
 def model_to_dict(obj):
-    """兼容 .model_dump() (v2) / .dict() (v1)。"""
+    """Compat for .model_dump() (v2) / .dict() (v1)."""
     if hasattr(obj, 'model_dump'):
         return obj.model_dump()
     return obj.dict()
 
 
 def model_to_json(obj):
-    """兼容 .model_dump_json() (v2) / .json() (v1)。"""
+    """Compat for .model_dump_json() (v2) / .json() (v1)."""
     if hasattr(obj, 'model_dump_json'):
         return obj.model_dump_json()
     return obj.json()
 
 
 def model_from_json(cls, data: str):
-    """兼容 .model_validate_json() (v2) / .parse_raw() (v1)。"""
+    """Compat for .model_validate_json() (v2) / .parse_raw() (v1)."""
     if hasattr(cls, 'model_validate_json'):
         return cls.model_validate_json(data)
     return cls.parse_raw(data)
 
 
 class ModelBucket(BaseModel):
-    """按模型/调用类型聚合的统计桶。"""
+    """Stats bucket aggregated by model/call type."""
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
@@ -45,7 +59,7 @@ class ModelBucket(BaseModel):
 
 
 class DailyStats(BaseModel):
-    """一天的聚合统计。"""
+    """Aggregated stats for one day."""
     total_prompt_tokens: int = 0
     total_completion_tokens: int = 0
     total_tokens: int = 0
@@ -57,11 +71,11 @@ class DailyStats(BaseModel):
 
 
 class RecentRecord(BaseModel):
-    """单次 LLM 调用记录（脱敏）。"""
+    """A single LLM call record (redacted)."""
     ts: float
     model: str = "unknown"
-    pt: int = 0          # prompt_tokens（含 cached）
-    ct: int = 0          # completion_tokens（生成）
+    pt: int = 0          # prompt_tokens, including cached tokens.
+    ct: int = 0          # completion_tokens, generated tokens.
     tt: int = 0          # total_tokens
     cch: int = 0         # cached_tokens
     type: str = "unknown"
@@ -69,29 +83,30 @@ class RecentRecord(BaseModel):
 
 
 class HistogramStat(BaseModel):
-    """单个 histogram 指标的桶分布。"""
+    """Bucket distribution of a single histogram metric."""
     count: int = 0
     sum: float = 0.0
     buckets: List[int] = Field(default_factory=list)
 
 
 class InstrumentSnapshot(BaseModel):
-    """客户端 utils/instrument 的 60s 窗口 snapshot。
+    """60s-window snapshot from the client's utils/instrument.
 
-    counters / histograms 的 key 是 ``name`` 或 ``name|k1=v1,k2=v2``。
-    bounds 是 histogram 桶边界数组，len == 任一 histogram.buckets 长度 - 1
-    （多出来的那个桶是溢出桶）。
+    Keys of counters / histograms are ``name`` or ``name|k1=v1,k2=v2``.
+    bounds is the histogram bucket-boundary array, len == length of any
+    histogram.buckets - 1 (the extra bucket is the overflow bucket).
 
-    服务端当前不强 schema 化（events.payload 列原样保存 JSON），dashboard /
-    aggregation 是后续 Batch 的工作。这里声明只是为了让 server 代码能从
-    submission.payload.instruments 类型安全地访问字段，不被当成 unknown
-    field 静默忽略。
+    The server currently does not enforce a schema (the events.payload column stores
+    the JSON verbatim); dashboards / aggregation are later Batch work. This
+    declaration only exists so server code can access fields on
+    submission.payload.instruments type-safely instead of having them silently
+    dropped as unknown fields.
     """
     window_start: float = 0.0
     window_end: float = 0.0
-    # 客户端本地日历天（``YYYY-MM-DD``）。服务端按这个落 stat_date，跟
-    # ``daily_stats`` 的 key 同口径；老客户端缺失时服务端按 window_end
-    # 时间戳回退（见 storage.py ``_apply_instruments``）。
+    # Client-local calendar day (``YYYY-MM-DD``). The server uses it as stat_date, matching
+    # ``daily_stats`` keys; when absent in older clients, fall back to window_end's
+    # timestamp (see storage.py ``_apply_instruments``).
     stat_date: str = ""
     bounds: List[float] = Field(default_factory=list)
     counters: Dict[str, float] = Field(default_factory=dict)
@@ -99,34 +114,34 @@ class InstrumentSnapshot(BaseModel):
 
 
 class TelemetryEvent(BaseModel):
-    """客户端上报的遥测负载。"""
+    """Telemetry payload reported by the client."""
     device_id: str = Field(..., min_length=16, max_length=128)
     app_version: str = Field(default="unknown", max_length=64)
-    # 三个用户维度字段。`branch` 在客户端首次启动时随机抽签后落盘，后续保持稳
-    # 定，用于 A/B test 分流；`locale` / `timezone` 每次上报取实时值，同设备
-    # 不同 locale/tz 仍视为同一 device，server 端覆写最新值即可。
+    # Three user-dimension fields. `branch` is randomly assigned and persisted on first client launch, then remains
+    # stable for A/B routing. `locale` / `timezone` use current values on every report; different locales/time zones
+    # still identify the same device, so the server simply overwrites them with the latest values.
     branch: str = Field(default="unknown", max_length=64)
     locale: str = Field(default="unknown", max_length=32)
     timezone: str = Field(default="unknown", max_length=64)
-    # 发行渠道：steam（Steam 启动）/ release（编译版直启）/ source（源码运行）/ unknown
+    # Distribution: steam (Steam launch) / release (direct compiled launch) / source (source execution) / unknown.
     distribution: str = Field(default="unknown", max_length=32)
-    # Steam64 user id（string，避免 u64 在 JS 等消费方精度丢失）。仅在
-    # Steamworks SDK 起来 + 拿到 Users.GetSteamID 时填值，否则为空 string。
-    # max_length=24 给 u64 十进制（20 位）留余量，防止异常长串攻击。
+    # Steam64 user ID as string to avoid u64 precision loss in JavaScript and other consumers. Set only when
+    # Steamworks SDK initializes and Users.GetSteamID succeeds; otherwise leave an empty string.
+    # max_length=24 leaves headroom for 20-digit u64 decimals while blocking abnormally long strings.
     steam_user_id: str = Field(default="", max_length=24)
-    # 设备硬件画像（低基数 enum 复合串，形如 "win|x86_64|16to32|9to16" =
-    # os|arch|ram_tier|cpu_tier）。设备属性，server preserve-known UPSERT；
-    # 空 string 不覆写。max_length=64 挡异常长串。
+    # Device hardware profile: low-cardinality composite enums, e.g. "win|x86_64|16to32|9to16" =
+    # os|arch|ram_tier|cpu_tier. Device property; server preserve-known UPSERT
+    # does not overwrite with empty strings. max_length=64 blocks abnormally long input.
     device_hw: str = Field(default="", max_length=64)
     daily_stats: Dict[str, DailyStats] = Field(default_factory=dict)
     recent_records: List[RecentRecord] = Field(default_factory=list)
-    # 通用 counter / histogram 累积窗口（utils/instrument）。Optional —
-    # 客户端只在窗口非空时发送，老客户端完全不会带这个字段。
+    # General counter/histogram accumulation window (utils/instrument). Optional:
+    # clients send only nonempty windows; older clients omit this field entirely.
     instruments: Optional[InstrumentSnapshot] = None
 
 
 class TelemetrySubmission(BaseModel):
-    """带 HMAC 签名信封的上报请求。"""
+    """Submission request with an HMAC-signed envelope."""
     timestamp: float
     signature: str = Field(..., min_length=64, max_length=64)
     payload: TelemetryEvent

@@ -41,6 +41,29 @@ export interface PluginProfileConfig {
   config: Record<string, any>
 }
 
+export type PluginConfigApplicationStateName =
+  | 'matched'
+  | 'pending'
+  | 'not_running'
+  | 'unknown'
+
+/**
+ * Authoritative comparison between the persisted effective configuration and
+ * the configuration most recently loaded by the running plugin host.
+ *
+ * The fingerprint fields are intentionally opaque to the frontend. They are
+ * useful for diagnostics, while `config_state` is the only value the UI uses
+ * to decide whether a reload warning is needed.
+ */
+export interface PluginConfigApplicationState {
+  plugin_id: string
+  lifecycle_status?: string
+  config_state: PluginConfigApplicationStateName
+  persisted_fingerprint?: string | null
+  applied_fingerprint?: string | null
+  observed_at?: string
+}
+
 /**
  * 获取插件配置
  */
@@ -56,10 +79,18 @@ export function getPluginConfigToml(pluginId: string): Promise<PluginConfigToml>
 }
 
 /**
- * 获取插件基础配置（直接来自 plugin.toml，不包含 profile 叠加）
+ * 获取运行时插件基础配置（不包含 profile 叠加）
  */
 export function getPluginBaseConfig(pluginId: string): Promise<PluginBaseConfig> {
   return get(`/plugin/${encodeURIComponent(pluginId)}/config/base`)
+}
+
+/**
+ * 获取用于编辑 profile 的配置基线：插件清单默认值与运行时配置合并，
+ * 不包含任何 profile 覆盖项。
+ */
+export function getPluginEffectiveBaseConfig(pluginId: string): Promise<PluginBaseConfig> {
+  return get(`/plugin/${encodeURIComponent(pluginId)}/config/base/effective`)
 }
 
 /**
@@ -138,6 +169,17 @@ export function getPluginProfileConfig(
 }
 
 /**
+ * Get the server-side application state for a plugin's effective config.
+ * Older plugin servers may return 404/405; callers should preserve their
+ * existing in-memory hint when that happens instead of treating it as matched.
+ */
+export function getPluginConfigApplicationState(
+  pluginId: string
+): Promise<PluginConfigApplicationState> {
+  return get(`/plugin/${encodeURIComponent(pluginId)}/config/application-state`)
+}
+
+/**
  * 创建或更新 profile 配置
  */
 export function upsertPluginProfileConfig(
@@ -211,4 +253,3 @@ export function hotUpdatePluginConfig(
     profile: profile ?? null
   })
 }
-

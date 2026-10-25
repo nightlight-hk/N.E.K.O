@@ -55,12 +55,12 @@ import { emit, on, store } from '../../core/state.js';
 import { el } from '../_dom.js';
 
 // ─────────────────────────────────────────────────────────────
-// Payload 白名单 (和 config/prompts/prompts_avatar_interaction.py 对齐)
+// Payload 白名单 (和 config/prompts/avatar_interaction_contract.py 对齐)
 // ─────────────────────────────────────────────────────────────
 //
 // L30: 这是 pure helper 的 "表单白名单" 拷贝, 不是逻辑拷贝. 主程序常量
 // 表真变了, 面板 dropdown 过滤规则会和后端不同步, 但后端 payload
-// 校验 (_normalize_avatar_interaction_payload) 会兜底 400. 本文件仅做
+// 校验 (normalize_avatar_interaction_payload) 会兜底 400. 本文件仅做
 // "让 tester 少看不合法的选项"层的引导; 不做独立语义层.
 const AVATAR_TOOLS = ['lollipop', 'fist', 'hammer'];
 const AVATAR_ACTIONS_BY_TOOL = {
@@ -90,6 +90,7 @@ const PROACTIVE_KINDS = [
   'screenshot',
   'window',
   'news',
+  'community',
   'video',
   'personal',
   'music',
@@ -218,12 +219,9 @@ export function mountExternalEventsPanel(host) {
     const rows = [];
     const a = state.avatar;
 
-    // 开头一行 hint — 2026-04-23 r3 polish: tester 反馈 "text_context /
-    // reward_drop / easter_egg 看起来像没作用". 实际 config/prompts/prompts_avatar_
-    // interaction.py::_build_avatar_interaction_instruction 已把这些字段拼进
-    // instruction (运行时已验证), 但 UI 默认折叠 "Instruction preview", tester
-    // 可能没展开 → 直觉认为字段被吞. 加一行显式 hint 指向结果区的 instruction
-    // 预览, 让 tester 先看 wire 再判断 LLM 行为.
+    // 开头一行 hint: avatar prompt 只发送直接事件事实。
+    // reward_drop/easter_egg 通过事件事实体现；text_context 仅为历史 payload
+    // 兼容和诊断预览保留，不发送给模型，也不参与运行时反应。
     rows.push(el('p', { className: 'form-hint' },
       i18n('chat.external_events.avatar.instruction_integration_hint'),
     ));

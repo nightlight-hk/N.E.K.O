@@ -1,4 +1,18 @@
 # -*- coding: utf-8 -*-
+# Copyright 2025-2026 Project N.E.K.O. Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 Two-stage plugin filtering for agent assessment.
 
@@ -220,13 +234,3 @@ def annotate_keyword_hits(
             f"- {pid} [KEYWORD MATCH]:",
         )
     return plugins_desc
-
-
-def generate_short_description_prompt(plugin_id: str, full_description: str) -> str:
-    """Build a prompt to generate a short_description from a full description."""
-    return (
-        f"Generate a concise summary (under 300 characters, English) for this plugin.\n"
-        f"Plugin ID: {plugin_id}\n"
-        f"Full description: {full_description}\n\n"
-        f"Return ONLY the summary text, nothing else."
-    )

@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.node_harness import run_node_stdin
+
 
 COMMON_DIALOGS_PATH = Path(__file__).resolve().parents[2] / "static" / "common_dialogs.js"
 
@@ -307,15 +309,13 @@ runScenario()
   }});
 """
 
-    result = subprocess.run(
-        [node_executable, "-"],
-        input=node_harness,
-        text=True,
+    result = run_node_stdin(
+        node_executable,
+        node_harness,
         capture_output=True,
         check=False,
         timeout=10,
     )
-
     if result.returncode != 0:
         raise AssertionError(
             "Node common_dialogs scenario failed:\n"
@@ -463,6 +463,30 @@ def test_decision_prompt_lifecycle_events_do_not_fire_for_alerts():
 
 
 @pytest.mark.unit
+def test_dialogs_only_keeps_page_shortcuts_and_still_allows_escape_cancellation():
+    result = _run_common_dialogs_node_scenario(
+        """
+    let prevented = 0;
+    const shortcut = { type: 'keydown', key: 'w', metaKey: true,
+      preventDefault() { prevented++; } };
+    document.dispatchEvent(shortcut);
+    assert.strictEqual(prevented, 1, 'Existing consumers retain their shortcut policy');
+    document._listeners.clear();
+    document.currentScript = { dataset: { dialogsOnly: 'true' } };
+    vm.runInThisContext(source);
+    document.dispatchEvent(shortcut);
+    assert.strictEqual(prevented, 1, 'Dialog reuse must not take over page shortcuts');
+    const pending = window.showConfirm('Delete across devices?', 'Delete', { danger: true });
+    document.dispatchEvent({ type: 'keydown', key: 'Escape' });
+    const cancelled = await pending;
+    assert.strictEqual(cancelled, false);
+    assert.strictEqual(overlayCount(), 0);
+    return { prevented, cancelled };
+        """
+    )
+    assert result == {'prevented': 1, 'cancelled': False}
+
+
 def test_show_confirm_implicit_dismiss_returns_false():
     result = _run_common_dialogs_node_scenario(
         """
@@ -510,6 +534,97 @@ def test_show_confirm_implicit_dismiss_returns_false():
         "overlayCountAfterOutside": 0,
         "overlayCountAfterEscape": 0,
     }
+
+
+@pytest.mark.unit
+def test_theater_confirm_registers_compact_hit_island_and_refreshes_geometry():
+    result = _run_common_dialogs_node_scenario(
+        """
+    // Keep the 320ms fallback separate from the 200ms close animation even
+    // when a busy runner cannot resume a real 10ms wait before that fallback.
+    let clock = 0;
+    let nextTimerId = 1;
+    const timers = new Map();
+    global.setTimeout = function (callback, delay = 0, ...args) {
+      const id = nextTimerId++;
+      timers.set(id, { at: clock + Number(delay), callback, args });
+      return id;
+    };
+    global.clearTimeout = function (id) { timers.delete(id); };
+    function advanceTime(milliseconds) {
+      const end = clock + milliseconds;
+      while (true) {
+        const due = [...timers.entries()]
+          .filter(([, timer]) => timer.at <= end)
+          .sort(([leftId, left], [rightId, right]) => left.at - right.at || leftId - rightId)[0];
+        if (!due) break;
+        const [id, timer] = due;
+        timers.delete(id);
+        clock = timer.at;
+        timer.callback(...timer.args);
+      }
+      clock = end;
+    }
+    const state = {
+      geometryRefreshes: 0,
+      resolved: [],
+      overlayClasses: '',
+      dialogClasses: '',
+      geometryOwner: '',
+      geometryItem: '',
+      dialogTabIndex: null,
+      resolveCallbacks: [],
+    };
+    window.addEventListener('neko:compact-interaction-geometry-refresh', () => {
+      state.geometryRefreshes += 1;
+    });
+
+    window.showConfirm('End the current performance?', 'End performance', {
+      okText: 'Confirm',
+      cancelText: 'Cancel',
+      danger: true,
+      skin: 'theater',
+      onResolve(value) {
+        state.resolveCallbacks.push(value);
+      },
+    }).then((value) => {
+      state.resolved.push(value);
+    });
+
+    advanceTime(10);
+    const overlay = document.querySelectorAll('.modal-overlay')[0];
+    const dialog = overlay.querySelector('.modal-dialog');
+    state.overlayClasses = overlay.className;
+    state.dialogClasses = dialog.className;
+    state.geometryOwner = dialog.attributes['data-compact-geometry-owner'];
+    state.geometryItem = dialog.attributes['data-compact-geometry-item'];
+    state.dialogTabIndex = dialog.tabIndex;
+
+    const buttons = overlay.querySelectorAll('.modal-btn');
+    buttons[0].onclick();
+    advanceTime(250);
+    await Promise.resolve();
+
+    assert.strictEqual(overlayCount(), 0);
+    assert.deepStrictEqual(state.resolved, [false]);
+    assert.strictEqual(state.geometryRefreshes, 2);
+    assert.deepStrictEqual(state.resolveCallbacks, [false]);
+    state.geometryRefreshesAfterClose = state.geometryRefreshes;
+    advanceTime(60);
+    assert.strictEqual(state.geometryRefreshes, 3);
+    return state;
+        """
+    )
+
+    assert "modal-overlay-theater" in result["overlayClasses"].split()
+    assert "modal-dialog-theater" in result["dialogClasses"].split()
+    assert result["geometryOwner"] == "surface"
+    assert result["geometryItem"] == "theaterModal"
+    assert result["dialogTabIndex"] == -1
+    assert result["geometryRefreshesAfterClose"] == 2
+    assert result["geometryRefreshes"] == 3
+    assert result["resolveCallbacks"] == [False]
+    assert result["resolved"] == [False]
 
 
 @pytest.mark.unit
@@ -714,3 +829,104 @@ def test_autostart_retention_button_style_contract_is_scoped():
     )
     hover = _rule_bodies(source, hover_sel)
     _assert_in_any(hover, "translateY(-2px)", hover_sel)
+
+
+_OPEN_OR_FOCUS_WINDOW_SETUP = """
+    const state = { opened: [], broadcasts: [], geometry: [] };
+    const storage = new Map();
+    global.localStorage = {
+      getItem(key) { return storage.has(key) ? storage.get(key) : null; },
+      setItem(key, value) { storage.set(key, String(value)); },
+      removeItem(key) { storage.delete(key); },
+    };
+    global.BroadcastChannel = class FakeBroadcastChannel {
+      postMessage(message) { state.broadcasts.push(message); }
+      close() {}
+    };
+    // A null handle keeps openOrFocusWindow from starting its close-poll interval.
+    window.open = function (url, name) {
+      state.opened.push({ url, name });
+      return null;
+    };
+    const editorName = 'neko_avatar_tool_editor_singleton';
+    const targetUrl = 'http://localhost/avatar_tool_editor?mode=edit&toolId=local-b';
+    function markSharedWindowActive() {
+      localStorage.setItem('neko:named-window:' + editorName, JSON.stringify({ timestamp: Date.now() }));
+    }
+    function fakeLiveWindow() {
+      return {
+        closed: false,
+        location: { href: 'http://localhost/avatar_tool_editor?mode=edit&toolId=local-a', replace(url) { this.href = url; } },
+        resizeTo(width, height) { state.geometry.push(['resize', width, height]); },
+        moveTo(left, top) { state.geometry.push(['move', left, top]); },
+        postMessage() {},
+        focus() {},
+      };
+    }
+    const features = 'width=1280,height=900,left=40,top=30';
+"""
+
+
+@pytest.mark.unit
+def test_open_or_focus_window_preserves_reused_geometry_only_when_opted_in():
+    result = _run_common_dialogs_node_scenario(
+        _OPEN_OR_FOCUS_WINDOW_SETUP
+        + """
+    window._openedWindows[editorName] = fakeLiveWindow();
+    window.openOrFocusWindow(targetUrl, editorName, features, {
+      navigateOnReuse: true,
+      preserveGeometryOnReuse: true,
+    });
+    const preserved = state.geometry.slice();
+
+    window.openOrFocusWindow(targetUrl, editorName, features, { navigateOnReuse: true });
+    return { preserved, defaultGeometry: state.geometry, opened: state.opened.length };
+        """
+    )
+
+    assert result == {
+        "preserved": [],
+        "defaultGeometry": [["resize", 1280, 900], ["move", 40, 30]],
+        "opened": 0,
+    }
+
+
+@pytest.mark.unit
+def test_open_or_focus_window_delegates_navigation_to_active_shared_window_when_opted_in():
+    result = _run_common_dialogs_node_scenario(
+        _OPEN_OR_FOCUS_WINDOW_SETUP
+        + """
+    markSharedWindowActive();
+    const proxy = window.openOrFocusWindow(targetUrl, editorName, features, {
+      navigateOnReuse: true,
+      delegateNavigationToSharedWindow: true,
+    });
+    const delegated = {
+      opened: state.opened.slice(),
+      broadcasts: state.broadcasts.map((message) => ({
+        type: message.type,
+        windowName: message.windowName,
+        payload: message.payload,
+      })),
+      proxyClosed: proxy.closed,
+      stored: JSON.parse(localStorage.getItem('neko:named-window-focus:' + editorName)).payload,
+    };
+
+    // Callers that did not opt in keep the old "navigate through window.open" behavior.
+    window.openOrFocusWindow(targetUrl, editorName, features, { navigateOnReuse: true });
+    return { delegated, legacyOpened: state.opened };
+        """
+    )
+
+    payload = {"type": "neko:navigate-on-reuse", "url": "http://localhost/avatar_tool_editor?mode=edit&toolId=local-b"}
+    assert result["delegated"] == {
+        "opened": [],
+        "broadcasts": [{
+            "type": "neko:named-window-message",
+            "windowName": "neko_avatar_tool_editor_singleton",
+            "payload": payload,
+        }],
+        "proxyClosed": False,
+        "stored": payload,
+    }
+    assert result["legacyOpened"] == [{"url": payload["url"], "name": "neko_avatar_tool_editor_singleton"}]

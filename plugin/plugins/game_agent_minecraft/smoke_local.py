@@ -4,10 +4,10 @@ Purpose
 -------
 Validate the full integration **without** booting the rest of N.E.K.O:
 - spin up `GameAgentService` directly,
-- feed it a fake "push_message" (stdout) + stdlib logger,
+- feed it a fake \"push_message\" (stdout) + stdlib logger,
 - send a single `minecraft_task` and report the verdict shape.
 
-Why this exists: the repo has no shared "mock 猫娘" harness — each plugin
+Why this exists: the repo has no shared \"mock catgirl\" harness — each plugin
 hand-rolls its own fake context (see test_mcp_adapter_runtime.py `_Ctx`).
 This file is the equivalent for game_agent_minecraft, but instead of a
 fake WebSocket fixture it talks to a real running mc-agent at the
@@ -17,7 +17,7 @@ status changes on the mc-agent side: prove the round-trip end-to-end.
 Usage
 -----
     uv run python -m plugin.plugins.game_agent_minecraft.smoke_local
-    uv run python -m plugin.plugins.game_agent_minecraft.smoke_local "go mine 4 oak logs"
+    uv run python -m plugin.plugins.game_agent_minecraft.smoke_local \"go mine 4 oak logs\"
     NEKO_GAME_AGENT_WS=ws://localhost:48909 uv run python -m plugin.plugins.game_agent_minecraft.smoke_local
 
 The autonomous nudge loop runs at default cadence (5s); for a 60s task
@@ -235,7 +235,10 @@ async def run(
         print(f"[smoke] ← result after {elapsed:.1f}s: {result}")
 
         status = result.get("status") if isinstance(result, dict) else None
-        rc = 0 if status in ("ok", "timeout", "interrupted") else 1
+        # ``superseded`` is mc-agent's "a newer task replaced this one" —
+        # a neutral non-completion, same class as ``interrupted``, not a
+        # failure. ``failed`` (genuine failure) still maps to rc=1.
+        rc = 0 if status in ("ok", "timeout", "interrupted", "superseded") else 1
         # ``timeout`` is a clean structured outcome (LLM-visible) — keep
         # exit 0 so CI doesn't read it as a hard failure; the elapsed
         # time + the printed result are enough for a human reader.

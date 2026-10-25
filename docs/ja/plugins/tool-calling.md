@@ -5,6 +5,10 @@ LLM が会話中にプラグインの機能を「呼び出せる」ようにし�
 天気は？」と聞いたときに LLM が自動的に呼び出し、結果を待って最終
 応答を生成します。
 
+::: warning plugin entry とは別です
+`@llm_tool(name="get_weather")` は conversation-time tool を main_server の `/api/tools` registry に登録します。`@plugin_entry(id="get_weather")` は Plugin Manager、cross-plugin call、別系統の user-plugin Agent route 用 runtime entry です。SDK 内部は IPC reuse のため LLM tool handler を reserved dynamic entry（`__llm_tool__...`）として保持しますが、この実装詳細によって 2 つの public API が同じになるわけではありません。
+:::
+
 このメカニズムは `main_logic/tool_calling.py` の `ToolRegistry` に
 よって支えられ、ツール呼び出しをサポートする全ての provider
 （OpenAI / Gemini / GLM / Qwen Omni / StepFun など）に対して統一的に
@@ -80,7 +84,7 @@ helper が **やらない** こと：`main_server` の再起動や初回起動�
 
 この層を直接叩くのは SDK helper で済まないケースのみ — プラグインプロセス
 の外で独自の HTTP server を立てる場合や、NekoPluginBase 以外のコンテキスト
-（外部スクリプト、extension モジュール等）から登録する場合など。
+（外部スクリプト等）から登録する場合など。
 
 ### 第 2 層 — `@llm_tool` SDK helper（プラグインの推奨）
 
@@ -267,9 +271,9 @@ async def unregister_on_shutdown():
 プラグインのライフサイクルフックにバインド：
 
 ```python
-from plugin.sdk.plugin import NekoPluginBase, plugin
+from plugin.sdk.plugin import NekoPluginBase, neko_plugin
 
-@plugin
+@neko_plugin
 class WeatherPlugin(NekoPluginBase):
     async def on_start(self):
         # 非同期で登録（プラグイン起動メインフローをブロックしない）
@@ -309,8 +313,7 @@ class WeatherPlugin(NekoPluginBase):
 
 ## 同プロセス登録（高度な使い方）
 
-プラグインが同じ Python プロセスで動く場合（extension モード、
-組み込み機能など）は、HTTP をバイパスして `LLMSessionManager.register_tool(...)`
+コードが同じ Python process で動く場合（組み込み機能など）は、HTTP をバイパスして `LLMSessionManager.register_tool(...)`
 を直接呼び、`handler` をローカルの callable にできます：
 
 ```python
@@ -324,7 +327,7 @@ mgr.register_tool(ToolDefinition(
     description="指定都市の天気を検索する",
     parameters={...},
     handler=handle_get_weather,             # in-process callable
-    metadata={"source": "my_extension"},    # source タグは metadata へ
+    metadata={"source": "builtin_weather"}, # source タグは metadata へ
 ))
 ```
 
@@ -335,6 +338,7 @@ wire 同期完了まで `await` したい場合は
 
 - **ツール名に機密情報を含めない**：LLM が `tool_calls` にツール名を
   書き込み、最終的に会話履歴に永続化されます
+- **secret を return/raise しない**：tool output と error text は LLM に戻され、conversation history に残る場合があります。redacted stable error code を返し、raw private payload を logger に書かないでください。
 - **`callback_url` はローカル loopback でなければならない**：サーバー
   は `urlparse` + `ipaddress.ip_address` で host が `127.0.0.0/8` /
   `::1` / 字面 `localhost` の範囲内かを検証し、それ以外は 422 で

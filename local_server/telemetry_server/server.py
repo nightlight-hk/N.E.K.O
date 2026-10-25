@@ -1,25 +1,41 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# Copyright 2025-2026 Project N.E.K.O. Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 N.E.K.O Telemetry Collection Server
 
-匿名 LLM token 用量收集。安全机制：HMAC 签名 + 时间戳防重放 + 速率限制。
+Anonymous LLM token usage collection. Security: HMAC signature + timestamp
+anti-replay + rate limiting.
 
-部署：
+Deployment:
     pip install -r requirements.txt
     python server.py --port 8099 --admin-token YOUR_TOKEN
 
-    # 或 Docker
+    # or Docker
     docker-compose up -d
 
-容量：20k DAU × 3 进程 × 6 req/h × 8h ≈ 2.88M req/day ≈ 33 req/s peak
-      SQLite WAL 可承载 ~500 write/s，单实例足够。
+Capacity: 20k DAU × 3 processes × 6 req/h × 8h ≈ 2.88M req/day ≈ 33 req/s peak
+      SQLite WAL sustains ~500 write/s; a single instance is enough.
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
 import gzip
+import hmac
 import io
 import json
 import logging
@@ -36,19 +52,19 @@ from security import verify_signature, verify_timestamp, RateLimiter, DEFAULT_HM
 from storage import TelemetryStorage, normalize_steam_id, normalize_device_hw
 
 # ---------------------------------------------------------------------------
-# 配置
+# Configuration.
 # ---------------------------------------------------------------------------
 
 HMAC_SECRET = os.getenv("TELEMETRY_HMAC_SECRET", DEFAULT_HMAC_SECRET)
 DB_PATH = os.getenv("TELEMETRY_DB_PATH", "./data/telemetry.db")
 ADMIN_TOKEN = os.getenv("TELEMETRY_ADMIN_TOKEN", "")
-MAX_BODY_SIZE = 512 * 1024  # 512 KB（线路上的字节上限，gzip 后通常 ≤50KB）
-# 解压后的字节上限。客户端典型 payload 5-50KB raw，未来加埋点也压得住 1MB；
-# 设 2MB 给余量，同时挡 zip bomb（gzip 比 1:1000 也只能撑到 2MB）。
+MAX_BODY_SIZE = 512 * 1024  # 512 KB wire-byte limit, usually <=50 KB after gzip.
+# Decompressed-byte limit. Typical client payloads are 5-50 KB raw, and future telemetry still fits 1 MB;
+# allow 2 MB headroom while bounding gzip bombs, even with 1:1000 ratios, to 2 MB.
 MAX_DECOMPRESSED_SIZE = 2 * 1024 * 1024
 
 # ---------------------------------------------------------------------------
-# 初始化
+# Initialization.
 # ---------------------------------------------------------------------------
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -58,10 +74,10 @@ Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
 storage = TelemetryStorage(DB_PATH)
 rate_limiter = RateLimiter(max_requests=120, window=3600.0)
 
-# 串行化 canonical 边构建 + 重算：部署是单 worker（Dockerfile --workers 1 /
-# systemd 单进程），但手动 /admin/canonical/rebuild 仍可能与后台
-# _periodic_canonical_rebuild 在同一进程并发跑，两个 build_edges 抢同一游标会
-# 重复处理、把 observe_count 翻倍。进程内 asyncio.Lock 即可消除这条真实路径。
+# Serialize canonical edge construction/recomputation: deployment uses one worker (Dockerfile --workers 1 /
+# single-process systemd), but manual /admin/canonical/rebuild can still overlap background
+# _periodic_canonical_rebuild in that process. Competing build_edges calls share a cursor,
+# duplicate processing, and double observe_count; an in-process asyncio.Lock removes this real race.
 _canonical_lock = asyncio.Lock()
 
 app = FastAPI(
@@ -70,17 +86,29 @@ app = FastAPI(
     docs_url="/docs" if os.getenv("TELEMETRY_ENABLE_DOCS") == "1" else None,
     redoc_url=None,
 )
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["POST", "GET"], allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        origin.strip()
+        for origin in os.environ.get(
+            "NEKO_TELEMETRY_CORS_ORIGINS", "http://localhost,http://127.0.0.1"
+        ).split(",")
+        if origin.strip()
+    ],
+    allow_methods=["POST", "GET"],
+    allow_headers=["*"],
+)
 
 
 def _decompress_if_gzip(body_bytes: bytes, content_encoding: str) -> bytes:
-    """按 ``Content-Encoding`` header 解压请求体。
+    """Decompress the request body according to the ``Content-Encoding`` header.
 
-    向下兼容：header 缺失或为 'identity' 时透传原始 bytes，让老客户端
-    （v1 一直发的是裸 JSON）继续工作。
+    Backward compat: when the header is missing or 'identity', pass the raw bytes
+    through so old clients (v1 always sent bare JSON) keep working.
 
-    防 zip bomb：流式 read，看到超过 MAX_DECOMPRESSED_SIZE 立刻拒绝，
-    不让 gzip.decompress 在内存里展开任意大小的数据。
+    Zip-bomb defense: streamed read; reject immediately once the output exceeds
+    MAX_DECOMPRESSED_SIZE, never letting gzip.decompress expand arbitrarily large
+    data in memory.
     """
     enc = (content_encoding or "").strip().lower()
     if enc in ("", "identity"):
@@ -89,8 +117,8 @@ def _decompress_if_gzip(body_bytes: bytes, content_encoding: str) -> bytes:
         raise HTTPException(415, f"Unsupported Content-Encoding: {enc}")
     try:
         with gzip.GzipFile(fileobj=io.BytesIO(body_bytes), mode="rb") as gz:
-            # 多读 1 字节用来判定是否超过 cap —— 超了直接 413，省得把整个
-            # bomb 解到内存里。
+            # Read one byte beyond cap to detect overflow and return 413 immediately rather than decompressing an entire
+            # bomb into memory.
             decompressed = gz.read(MAX_DECOMPRESSED_SIZE + 1)
         if len(decompressed) > MAX_DECOMPRESSED_SIZE:
             raise HTTPException(413, "Decompressed payload too large")
@@ -102,12 +130,12 @@ def _decompress_if_gzip(body_bytes: bytes, content_encoding: str) -> bytes:
 
 
 def _extract_token(request: Request) -> str:
-    """从 Header 或 URL ?token= 中提取 admin token。"""
-    # 优先 URL 参数（方便浏览器直接访问仪表盘）
+    """Extract the admin token from the header or the URL ?token= param."""
+    # Prefer URL parameters for direct browser dashboard access.
     url_token = request.query_params.get("token", "").strip()
     if url_token:
         return url_token
-    # 其次 Authorization Header
+    # Then try the Authorization header.
     auth = request.headers.get("Authorization", "")
     return (auth[len("Bearer "):] if auth.startswith("Bearer ") else auth).strip()
 
@@ -116,23 +144,27 @@ def require_admin(request: Request):
     if not ADMIN_TOKEN:
         raise HTTPException(503, "Admin API not configured (set TELEMETRY_ADMIN_TOKEN env var on server)")
     token = _extract_token(request)
-    if not token or token != ADMIN_TOKEN:
+    # Constant-time comparison: the admin endpoint exposes device_id / steam_user_id,
+    # and a plain != leaks byte-by-byte match progress to a timing side channel.
+    # compare_digest eliminates that. Guard non-ASCII first: compare_digest raises
+    # TypeError on non-ASCII str, otherwise ?token=é turns a 401 into a 500.
+    if not token or not token.isascii() or not ADMIN_TOKEN.isascii() or not hmac.compare_digest(token, ADMIN_TOKEN):
         raise HTTPException(401, "Invalid admin token")
 
 
 # ---------------------------------------------------------------------------
-# 客户端上报（公开，HMAC 验证）
+# Public client reporting with HMAC verification.
 # ---------------------------------------------------------------------------
 
 @app.post("/api/v1/telemetry", response_model=SubmitResponse)
 async def submit_telemetry(request: Request):
-    """接收遥测数据。验证流程：body 大小 → 解压 → 时间戳 → HMAC 签名 → 速率限制 → 存储。"""
-    # Body 大小（wire size，gzip 后通常 ≤50KB，给 512KB 余量）
+    """Receive telemetry. Validation flow: body size → decompress → timestamp → HMAC signature → rate limit → store."""
+    # Wire-body limit: usually <=50 KB gzipped, with 512 KB headroom.
     body_bytes = await request.body()
     if len(body_bytes) > MAX_BODY_SIZE:
         raise HTTPException(413, "Payload too large")
 
-    # 解压（如 Content-Encoding: gzip）；老客户端不带 header 直接透传
+    # Decompress Content-Encoding: gzip; pass older clients without the header through unchanged.
     body_bytes = _decompress_if_gzip(body_bytes, request.headers.get("Content-Encoding", ""))
 
     try:
@@ -141,12 +173,12 @@ async def submit_telemetry(request: Request):
     except Exception as e:
         raise HTTPException(400, f"Invalid request: {e}")
 
-    # 时间戳
+    # Timestamp.
     if not verify_timestamp(submission.timestamp):
         raise HTTPException(403, "Timestamp out of range")
 
-    # HMAC — 使用与客户端相同的 canonical JSON（sort_keys=True）验签，
-    # 而非 Pydantic model_to_json（其序列化器可能改变 key 顺序/float 格式）
+    # HMAC: verify using the same canonical JSON as clients, with sort_keys=True,
+    # not Pydantic model_to_json, whose serializer may change key order/float formatting.
     try:
         body_dict = json.loads(body_bytes)
         payload_json = json.dumps(body_dict["payload"], ensure_ascii=False, sort_keys=True)
@@ -155,30 +187,30 @@ async def submit_telemetry(request: Request):
     if not verify_signature(payload_json, submission.timestamp, submission.signature, HMAC_SECRET):
         raise HTTPException(403, "Invalid signature")
 
-    # 速率限制
+    # Rate limit.
     device_id = submission.payload.device_id
     if not rate_limiter.is_allowed(device_id):
         raise HTTPException(429, "Rate limit exceeded")
 
-    # 幂等去重：相同 batch_id 不重复累加
+    # Idempotent deduplication: never accumulate the same batch_id twice.
     batch_id = submission.batch_id
     if storage.is_duplicate_batch(batch_id):
         return SubmitResponse(ok=True, message="duplicate, skipped")
 
-    # steam_user_id 边界校验 + 归一化：复用 storage.normalize_steam_id，与 canonical
-    # 边构建（扫 events.payload）共用同一份规则——否则两条写路径漂移会把同账号
-    # 拆成两个 device↔account 维度。规则细节见该函数 docstring（u64 范围 / 去前导零 /
-    # 排哨兵 / 类型守卫）。HMAC secret 在开源客户端可读，伪造请求是有概率事件，故必校验。
+    # Validate/normalize steam_user_id at the boundary using storage.normalize_steam_id, shared with canonical
+    # edge construction from events.payload; divergent write paths would split one account across two
+    # device/account identities. See its docstring for u64 limits, leading-zero removal,
+    # sentinel exclusion, and type guards. Open-source clients expose HMAC secrets, making forged requests plausible and validation mandatory.
     steam_user_id = normalize_steam_id(submission.payload.steam_user_id)
-    # device_hw 同样在 ingest 边界白名单化：客户端串不可信，非法/伪造一律归 ''，
-    # 守"设备画像"低基数 + 零 PII 契约（见 normalize_device_hw）。
+    # Also allowlist device_hw at ingest: client strings are untrusted; normalize invalid/forged values to '',
+    # maintaining low cardinality and zero PII for device profiles (see normalize_device_hw).
     device_hw = normalize_device_hw(submission.payload.device_hw)
 
-    # 存储
+    # Storage.
     try:
         daily_stats_dict = {k: model_to_dict(v) for k, v in submission.payload.daily_stats.items()}
-        # instruments 是 Optional —— 老客户端不带这个字段时 submission.payload.instruments
-        # 为 None。Pydantic v1/v2 兼容：用 model_to_dict 拆掉嵌套 model。
+        # instruments is optional; older clients omit it, yielding submission.payload.instruments=None.
+        # For Pydantic v1/v2 compatibility, flatten nested models with model_to_dict.
         instruments_dict = (
             model_to_dict(submission.payload.instruments)
             if submission.payload.instruments is not None
@@ -207,7 +239,7 @@ async def submit_telemetry(request: Request):
 
 
 # ---------------------------------------------------------------------------
-# 健康检查（公开）
+# Public health check.
 # ---------------------------------------------------------------------------
 
 @app.get("/health")
@@ -216,24 +248,24 @@ async def health():
 
 
 # ---------------------------------------------------------------------------
-# 管理端 API（需 admin token）
+# Admin API, requiring an admin token.
 # ---------------------------------------------------------------------------
 
 @app.get("/api/v1/admin/stats", dependencies=[Depends(require_admin)])
 async def admin_global_stats(days: int = 30):
-    """全局统计 JSON。"""
+    """Global stats JSON."""
     return storage.get_global_stats(days=min(days, 365))
 
 
 @app.get("/api/v1/admin/devices", dependencies=[Depends(require_admin)])
 async def admin_devices(days: int = 7):
-    """活跃设备列表。"""
+    """Active device list."""
     return storage.get_active_devices(days=min(days, 90))
 
 
 @app.post("/api/v1/admin/prune", dependencies=[Depends(require_admin)])
 async def admin_prune(max_days: int = 180):
-    """清理旧事件日志 + instrument 聚合（daily_aggregates 永久保留）。"""
+    """Prune old event logs + instrument aggregates (daily_aggregates are kept forever)."""
     days = max(max_days, 30)
     deleted_events = storage.prune_old_events(max_days=days)
     deleted_instruments = storage.prune_old_instruments(max_days=days)
@@ -241,12 +273,12 @@ async def admin_prune(max_days: int = 180):
 
 
 # ---------------------------------------------------------------------------
-# 导出（需 admin token）
+# Export, requiring an admin token.
 # ---------------------------------------------------------------------------
 
 @app.get("/api/v1/admin/export/daily.csv", dependencies=[Depends(require_admin)])
 async def export_daily_csv(days: int = 90):
-    """按日汇总导出 CSV。"""
+    """Export per-day aggregated CSV."""
     csv_text = storage.export_daily_csv(days=min(days, 365))
     return PlainTextResponse(csv_text, media_type="text/csv",
                              headers={"Content-Disposition": "attachment; filename=daily_stats.csv"})
@@ -254,7 +286,7 @@ async def export_daily_csv(days: int = 90):
 
 @app.get("/api/v1/admin/export/model.csv", dependencies=[Depends(require_admin)])
 async def export_model_csv(days: int = 90):
-    """按模型汇总导出 CSV。"""
+    """Export per-model aggregated CSV."""
     csv_text = storage.export_model_csv(days=min(days, 365))
     return PlainTextResponse(csv_text, media_type="text/csv",
                              headers={"Content-Disposition": "attachment; filename=model_stats.csv"})
@@ -262,11 +294,12 @@ async def export_model_csv(days: int = 90):
 
 @app.get("/api/v1/admin/instruments", dependencies=[Depends(require_admin)])
 async def admin_instruments(days: int = 7):
-    """instrument 埋点数据 JSON：top counters + histogram p50/p95 摘要。
+    """Instrument metrics JSON: top counters + histogram p50/p95 summaries.
 
-    公开 repo 不再内置 HTML 看板（见 README）；这是给内部看板的数据接口，
-    运维据此自建可视化。counter/histogram 的口径见 storage.get_top_counters /
-    get_histogram_summary。
+    The public repo no longer ships an HTML dashboard (see README); this is the data
+    endpoint for internal dashboards, on which operators build their own
+    visualization. Counter/histogram semantics: see storage.get_top_counters /
+    get_histogram_summary.
     """
     days = min(days, 365)
     return {
@@ -276,12 +309,12 @@ async def admin_instruments(days: int = 7):
 
 
 # ---------------------------------------------------------------------------
-# canonical identity（需 admin token）
+# Canonical identity, requiring an admin token.
 # ---------------------------------------------------------------------------
 
 @app.get("/api/v1/admin/canonical/metrics", dependencies=[Depends(require_admin)])
 async def admin_canonical_metrics(days: int = 30):
-    """用户指标 JSON：device 口径（装机量）与 canonical 口径（按真人去重）并列。"""
+    """User metrics JSON: device-based (install count) and canonical (deduped per real person) side by side."""
     days = min(days, 365)
     return {
         "device": storage.get_user_metrics(days=days),
@@ -291,9 +324,9 @@ async def admin_canonical_metrics(days: int = 30):
 
 @app.post("/api/v1/admin/canonical/rebuild", dependencies=[Depends(require_admin)])
 async def admin_canonical_rebuild():
-    """手动触发：扫 events 产边（drain 到追平）+ 重算 canonical 连通分量。"""
-    # 同步 SQLite/union-find 丢线程池，别卡住事件循环（拖慢公开上报接口）。
-    # _canonical_lock 串行化，避免与后台周期任务并发抢游标重复处理。
+    """Manual trigger: scan events to build edges (drain until caught up) + recompute canonical connected components."""
+    # Offload synchronous SQLite/union-find to the thread pool to avoid blocking the loop and slowing public ingest.
+    # Serialize with _canonical_lock to avoid concurrent cursor consumption with background maintenance.
     async with _canonical_lock:
         processed = await asyncio.to_thread(storage.build_all_pending_edges)
         canonicals = await asyncio.to_thread(storage.recompute_canonical)
@@ -302,7 +335,7 @@ async def admin_canonical_rebuild():
 
 @app.post("/api/v1/admin/canonical/denylist", dependencies=[Depends(require_admin)])
 async def admin_canonical_denylist(steam_user_id: str):
-    """删号：Steam64 入 denylist（防复活）+ 脱敏源数据 + 删边 + 重算。"""
+    """Account deletion: Steam64 into denylist (prevents resurrection) + redact source data + delete edges + recompute."""
     async with _canonical_lock:
         sid = await asyncio.to_thread(storage.add_steam_id_to_denylist, steam_user_id)
         if not sid:
@@ -312,11 +345,11 @@ async def admin_canonical_denylist(steam_user_id: str):
 
 
 # ---------------------------------------------------------------------------
-# 定期维护
+# Periodic maintenance.
 # ---------------------------------------------------------------------------
 
 async def _periodic_rate_limiter_cleanup():
-    """每小时清理不活跃设备的速率限制记录，防止内存缓慢膨胀。"""
+    """Hourly cleanup of rate-limit records for inactive devices, preventing slow memory bloat."""
     while True:
         await asyncio.sleep(3600)
         try:
@@ -326,24 +359,26 @@ async def _periodic_rate_limiter_cleanup():
 
 
 async def _periodic_canonical_rebuild():
-    """每 5 分钟增量扫 events 产边 + 重算 canonical 落表。
+    """Every 5 minutes, incrementally scan events to build edges + recompute canonical and persist.
 
-    阻塞 SQLite 调用丢线程池跑，避免占着事件循环。用 need_recompute 脏标记保证
-    "边产出后必须落到一次成功的 recompute"：build_all_pending_edges 已推进游标，
-    若紧接着 recompute 抛异常（如瞬时 SQLite 锁），脏标记保持 True，下个 tick
-    即便没有新事件也会重试——不会让 canonical_map 永久停在 build 已推进、recompute
-    没跟上的不一致态。
+    Blocking SQLite calls run in the thread pool to keep off the event loop. The
+    need_recompute dirty flag guarantees "edge production must be followed by one
+    successful recompute": build_all_pending_edges has already advanced the cursor,
+    so if the recompute right after it throws (e.g. a transient SQLite lock), the
+    dirty flag stays True and the next tick retries even without new events — the
+    canonical_map never gets stuck permanently in the inconsistent state where build
+    advanced but recompute didn't follow.
     """
-    # 不用内存脏标记：recompute 在本量级（几千边、全量 union-find）是毫秒级，每 tick
-    # 无条件重算最简单也最稳，一次性覆盖所有"标记没设/丢失"的坑——
-    #   启动即跑（sleep 放末尾），不必等 5 分钟；
-    #   进程崩溃重启后无条件对齐 canonical_map 与现有边；
-    #   admin /rebuild|/denylist 自身 recompute 失败时，下个 tick 必重算兜底，不依赖
-    #   "恰好有新事件"或任何跨协程标记。
-    # 代价仅是无变更时也跑一次重算，毫秒级，可忽略。
+    # No in-memory dirty flag: at a few thousand edges, full union-find recomputation takes milliseconds. Unconditional
+    # recomputation each tick is simplest and robust against missing/lost flags:
+    #   Run at startup, sleeping afterward rather than waiting 5 minutes.
+    #   Realign canonical_map with existing edges after crashes/restarts.
+    #   If admin /rebuild or /denylist recomputation fails, the next tick retries unconditionally, without relying
+    #   on coincidental new events or cross-coroutine flags.
+    # The only cost is millisecond-scale recomputation without changes, which is negligible.
     while True:
         try:
-            async with _canonical_lock:  # 与手动 /rebuild、/denylist 互斥，串行化重算
+            async with _canonical_lock:  # Serialize recomputation against manual /rebuild and /denylist.
                 await asyncio.to_thread(storage.build_all_pending_edges)
                 await asyncio.to_thread(storage.recompute_canonical)
         except Exception:
@@ -354,12 +389,12 @@ async def _periodic_canonical_rebuild():
 @app.on_event("startup")
 async def on_startup():
     rate_limiter.cleanup_stale()
-    # 启动先同步对齐一次 canonical_map（只跑 recompute，毫秒级、只对现有边做
-    # union-find，不扫事件）——重启后首个 /canonical/metrics 即读到与现有边一致的
-    # 结果。故意**不**在这里同步跑 build_all_pending_edges：那是全量事件 drain，
-    # 首次部署/长停机后可能耗时数分钟，会阻塞启动、拖垮 healthcheck 与 ingest。
-    # 昂贵的事件建边留给下面的后台任务；建边完成前 metrics 由 COALESCE 回退到
-    # device 口径（合理降级，非错误数据）。
+    # Synchronize canonical_map at startup using only millisecond-scale recomputation/union-find over existing edges,
+    # without scanning events, so the first post-restart /canonical/metrics matches current edges.
+    # Deliberately avoid synchronous build_all_pending_edges here: full event draining
+    # may take minutes after initial deployment/long downtime, blocking startup, health checks, and ingest.
+    # Leave expensive edge building to background work below; until complete, metrics COALESCE falls back to
+    # device-based counts, a reasonable fallback rather than erroneous data.
     try:
         await asyncio.to_thread(storage.recompute_canonical)
     except Exception:
@@ -372,7 +407,7 @@ async def on_startup():
 
 
 # ---------------------------------------------------------------------------
-# 入口
+# Entry point.
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":

@@ -1,3 +1,17 @@
+# Copyright 2025-2026 Project N.E.K.O. Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -7,7 +21,7 @@ import unicodedata
 
 PROFILE_NAME_MAX_UNITS = 60
 
-# 与 Windows 文件名规则保持兼容，避免角色名写入 memory_dir/{name}/ 时踩坑。
+# Follow Windows filename rules to avoid problems storing character names under memory_dir/{name}/.
 WINDOWS_FORBIDDEN_NAME_CHARS = frozenset('<>:"/\\|?*')
 SAFE_CHARACTER_NAME_EXTRA_CHARS = frozenset({
     " ",
@@ -26,10 +40,10 @@ SAFE_CHARACTER_NAME_EXTRA_CHARS = frozenset({
 WINDOWS_RESERVED_DEVICE_NAMES = frozenset({"CON", "PRN", "AUX", "NUL", "CLOCK$"})
 WINDOWS_RESERVED_DEVICE_NAME_PATTERN = re.compile(r"^(COM[1-9]|LPT[1-9])$", re.IGNORECASE)
 
-# 一级路由保留名称：如果角色名与这些路由冲突，会导致 /{lanlan_name} 无法正确匹配。
-# 包含 pages_router 中的页面路由、静态资源挂载路径和其他顶层路径。
+# Reserved top-level route names: conflicting character names prevent /{lanlan_name} from matching correctly.
+# Includes pages_router page routes, static-resource mount paths, and other top-level paths.
 RESERVED_ROUTE_NAMES = frozenset({
-    # pages_router 页面路由
+    # pages_router page routes
     "l2d",
     "model_manager",
     "live2d_parameter_editor",
@@ -37,6 +51,7 @@ RESERVED_ROUTE_NAMES = frozenset({
     "vrm_emotion_manager",
     "mmd_emotion_manager",
     "voice_clone",
+    "voice_identity",
     "api_key",
     "character_card_manager",
     "cloudsave_manager",
@@ -48,8 +63,12 @@ RESERVED_ROUTE_NAMES = frozenset({
     "toast",
     "card_maker",
     "soccer_demo",
+    "badminton_demo",
+    "air_basketball",
+    "drawing_guess_demo",
+    "watch_together",
     "jukebox",
-    # 静态资源 / 挂载路径
+    # Static resources / mount paths
     "static",
     "user_live2d",
     "user_live2d_local",
@@ -57,7 +76,7 @@ RESERVED_ROUTE_NAMES = frozenset({
     "user_mmd",
     "user_mods",
     "workshop",
-    # API / WebSocket / 系统
+    # API / WebSocket / system
     "api",
     "ws",
     "health",
@@ -145,10 +164,24 @@ def validate_character_name(
         return CharacterNameValidationResult(normalized=normalized, code="contains_path_separator")
     if ".." in normalized:
         return CharacterNameValidationResult(normalized=normalized, code="path_traversal")
-    # "." 作为目录名等同于当前目录，会破坏角色数据隔离；
-    # Windows 会静默去掉尾部点号，导致路径歧义（如 "foo." → "foo"）。
+    # Directory name "." means the current directory and breaks character-data isolation;
+    # Windows silently strips trailing periods, creating ambiguous paths (such as "foo." → "foo").
     if normalized == "." or normalized.endswith("."):
         return CharacterNameValidationResult(normalized=normalized, code="unsafe_dot")
+    # NO leading-dot rule here, deliberately, and it was tried.
+    #
+    # The migration reserves dot-prefixed names inside memory_dir for its
+    # workspaces, so it wants no character to hold one -- and CREATION
+    # already sees to that: every path that makes a character validates with
+    # ``allow_dots=False``, which refuses any dot at all. Adding the rule
+    # here as well changed nothing there and broke the other direction: this
+    # function is also the REQUEST and SNAPSHOT check, applied with
+    # ``allow_dots=True`` to names that already exist, so an install
+    # upgrading with a legacy ".Carol" would have started failing every
+    # memory call with a 400 and reporting its own cloud snapshot invalid.
+    #
+    # Forbidding a name and breaking the data already carrying it are not the
+    # same change. The first is done; the second is not wanted.
     if not allow_dots and "." in normalized:
         return CharacterNameValidationResult(normalized=normalized, code="contains_dot")
     if is_reserved_device_name(normalized):

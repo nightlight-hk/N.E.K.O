@@ -1,4 +1,18 @@
 # -*- coding: utf-8 -*-
+# Copyright 2025-2026 Project N.E.K.O. Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 GalGame Router
 
@@ -28,11 +42,12 @@ from config.prompts.prompts_galgame import (
     get_galgame_dialogue_footer,
     get_galgame_dialogue_header,
     get_galgame_option_generation_prompt,
+    normalize_galgame_locale,
 )
 from config.prompts.prompts_sys import _loc
 from utils.file_utils import robust_json_loads
-from utils.language_utils import detect_language, normalize_language_code
-from utils.llm_client import HumanMessage, SystemMessage, create_chat_llm
+from utils.language_utils import detect_prompt_language
+from utils.llm_client import HumanMessage, SystemMessage, create_chat_llm_async
 from utils.logger_config import get_module_logger
 from utils.token_tracker import set_call_type
 
@@ -50,16 +65,30 @@ GALGAME_OPTION_LABELS = ("A", "B", "C")
 
 
 def _resolve_language(text_sample: str, request_lang: str | None) -> str:
-    """Pick the best 'short' language code for the prompt."""
+    """Pick the prompt-dict key for the prompt: a short code, or 'zh-TW'.
+
+    Every dict in ``prompts_galgame`` is keyed by the eight core locales with a
+    ``zh-TW`` row of its own, so the request language is resolved at FULL width
+    (issue #2500 step 2). ``format='short'`` used to collapse Traditional into
+    Simplified here, which left those rows unreachable.
+
+    The detection branch cannot just be normalized the same way: ``detect_language``
+    reports script families, so Traditional and Simplified both come back as 'zh'
+    no matter what the user typed. ``detect_prompt_language`` is the pair that
+    refines a Chinese detection with the caller's own locale, which is the only
+    signal that separates the two.
+    """
     if request_lang:
         try:
-            return normalize_language_code(request_lang, format='short') or 'en'
+            return normalize_galgame_locale(request_lang)
         except Exception:
             # Bad language tag from the client — fall through to text-based detection.
             pass
     try:
         if text_sample.strip():
-            return normalize_language_code(detect_language(text_sample), format='short') or 'en'
+            # request_lang is unusable by the time we get here, so detect_prompt_language
+            # falls back to the process-wide full locale for the Chinese refinement.
+            return detect_prompt_language(text_sample, default='en', ui_language=request_lang)
     except Exception:
         # detect_language can choke on emoji-only / very short strings — default to en.
         pass
@@ -228,13 +257,13 @@ async def generate_galgame_options(request: Request):
     if not isinstance(data, dict):
         return JSONResponse({"success": False, "error": "invalid_payload"}, status_code=400)
 
-    # Telemetry：galgame 是 feature 之一，counter 用于"哪些功能被实际触发 +
-    # 多频繁"。**不**带 lanlan_name（用户自定义角色名，PII + 高基数）。
+    # Telemetry: galgame is a feature; counters track which features actually trigger and
+    # how often. **Exclude** lanlan_name (user-defined character name: PII + high cardinality).
     try:
         from utils.instrument import counter as _instr_counter
         _instr_counter("feature_invoked", feature="galgame_options")
     except Exception:
-        # 埋点失败不能挡 galgame endpoint —— 静默继续，不打日志防刷屏。
+        # Telemetry failure must not block galgame endpoints; continue silently without log spam.
         pass
 
     messages = _coerce_messages(data.get('messages'))
@@ -257,11 +286,11 @@ async def generate_galgame_options(request: Request):
     master_name = (data.get('master_name') or master_name_current or '').strip() \
         or _loc(GALGAME_DEFAULT_MASTER_PLACEHOLDER, lang)
 
-    # 纵深防御：game route 接管会话期间（语音输入被改路由进游戏逻辑），
-    # React composer 的 galgame 面板并非当前活动界面，此时生成选项只会白白
-    # 烧掉 summary 档 token。前端已在聊天窗口隐藏（voice-only / proactive
-    # 路径）时跳过该请求；这里与 core.py 里 voice-proactive 的 _takeover_active
-    # 守卫对称，确保异常 / 老版本客户端也无法绕过空耗 token。
+    # Defense in depth: while the game route owns the session (voice input redirected to game logic),
+    # the React composer's galgame panel is not active, so generating options merely
+    # wastes summary-tier tokens. The frontend skips this request when the chat window is hidden (voice-only / proactive
+    # paths); mirror core.py's voice-proactive _takeover_active guard here,
+    # preventing broken / older clients from bypassing protection against wasted tokens.
     try:
         mgr = get_session_manager().get(lanlan_name)
     except Exception:
@@ -275,7 +304,7 @@ async def generate_galgame_options(request: Request):
             "reason": "session_takeover",
         })
 
-    summary_config = config_manager.get_model_api_config('summary') or {}
+    summary_config = await config_manager.aget_model_api_config('summary') or {}
     api_key = (summary_config.get('api_key') or '').strip()
     model = (summary_config.get('model') or '').strip()
     base_url = (summary_config.get('base_url') or '').strip()
@@ -299,14 +328,15 @@ async def generate_galgame_options(request: Request):
     ))
 
     set_call_type("galgame_options")
-    llm = create_chat_llm(
-        model,
-        base_url,
-        api_key,
-        max_completion_tokens=GALGAME_OPTION_MAX_TOKENS,
-        timeout=GALGAME_OPTION_TIMEOUT_SECONDS,
-    )
     try:
+        llm = await create_chat_llm_async(
+            model,
+            base_url,
+            api_key,
+            max_completion_tokens=GALGAME_OPTION_MAX_TOKENS,
+            timeout=GALGAME_OPTION_TIMEOUT_SECONDS,
+            provider_type=summary_config.get('provider_type'),
+        )
         async with llm:
             result = await asyncio.wait_for(
                 llm.ainvoke([

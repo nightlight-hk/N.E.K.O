@@ -177,10 +177,8 @@ function resolveActionIcon(action: ResolvedPluginListAction) {
     case 'open_guide':
       return Document
     case 'start':
-    case 'enable_extension':
       return VideoPlay
     case 'stop':
-    case 'disable_extension':
       return VideoPause
     case 'reload':
       return RefreshRight
@@ -506,9 +504,28 @@ onBeforeUnmount(() => {
   font-weight: 800;
 }
 
+/* Dark overlays use the same neutral elevation as native poppers. The light
+ * theme's white sheen would otherwise turn into grey glare on this surface. */
+:global(html.dark .context-menu) {
+  background: var(--el-bg-color-overlay);
+  border-color: var(--el-border-color);
+  box-shadow: var(--shadow-lg);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+:global(html.dark .context-menu__item) {
+  background: transparent;
+}
+
+:global(html.dark .context-menu__item:is(:hover, :focus-visible, .context-menu__item--active)) {
+  background: var(--el-color-primary-light-9);
+  box-shadow: none;
+}
+
 .context-menu-fade-enter-active,
 .context-menu-fade-leave-active {
-  transition: opacity 0.12s ease;
+  transition: opacity var(--motion-duration-fast) var(--motion-ease-standard);
 }
 
 .context-menu-fade-enter-from,
@@ -519,16 +536,14 @@ onBeforeUnmount(() => {
 .context-menu-pop-enter-active,
 .context-menu-pop-leave-active {
   transition:
-    opacity 0.16s ease,
-    transform 0.18s cubic-bezier(0.22, 1, 0.36, 1),
-    filter 0.18s ease;
+    opacity var(--motion-duration-fast) var(--motion-ease-standard),
+    transform var(--motion-duration-fast) var(--motion-ease-standard);
 }
 
 .context-menu-pop-enter-from,
 .context-menu-pop-leave-to {
   opacity: 0;
   transform: translateY(4px) scale(0.96);
-  filter: blur(4px);
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -543,7 +558,6 @@ onBeforeUnmount(() => {
   .context-menu-pop-enter-from,
   .context-menu-pop-leave-to {
     transform: none;
-    filter: none;
   }
 }
 </style>

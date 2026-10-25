@@ -1,29 +1,42 @@
-"""Legacy ``settings.json`` accessor.
+# Copyright 2025-2026 Project N.E.K.O. Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
-历史背景
+"""Legacy ``settings.json`` accessor (read-only).
+
+History
 --------
-原本这里同时承载两件事：
+This module originally carried two responsibilities:
 
-1. 维护 ``memory/{name}/settings.json`` 的读写。这部分仍然在用——
-   ``memory_server.py`` 和 testbench/dump 工具都会调用 ``get_settings`` /
-   ``load_settings`` / ``save_settings`` 来把磁盘上的旧字段合进 prompt。
-2. 用 LLM 从对话里抽取新设定 + 用 LLM 跑矛盾消解。这套已经被 evidence /
-   reflection 流水线全面取代——见 ``memory_server.py::process_history``
-   里 "旧模块已禁用（性能不足）" 的注释；``extract_and_update_settings`` 与
-   ``detect_and_resolve_contradictions`` 已经没有任何调用方。
+1. Reading ``memory/{name}/settings.json``. Still in use —
+   ``app/memory_server/routes.py`` and the testbench/dump tools call ``get_settings`` /
+   ``load_settings`` to merge the legacy on-disk fields into the prompt.
+2. Using an LLM to extract new settings from conversations + run LLM
+   contradiction resolution. Fully superseded by the evidence / reflection
+   pipeline; ``extract_and_update_settings`` and
+   ``detect_and_resolve_contradictions`` had no callers left.
 
-为了避免这两个死方法继续把 ``SETTING_PROPOSER_MODEL`` /
-``SETTING_VERIFIER_MODEL`` 这种已退役的硬编码常量留在身上（也避免
-项目级 "no temperature" 守门时还得给死代码开口子），本次清理直接把
-LLM 路径删掉，只保留磁盘读写。如果未来真的需要重启这套，请走
-evidence/reflection 范式，不要复活旧代码。
+To keep these two dead methods from dragging along retired hard-coded
+constants like ``SETTING_PROPOSER_MODEL`` / ``SETTING_VERIFIER_MODEL`` (and to
+avoid carving out dead-code exceptions in the project-wide "no temperature"
+gate), this cleanup removes the LLM paths and the write-side disk IO outright
+and keeps only the disk read. ``settings.json`` is now a frozen legacy import
+source — cloudsave may sync it but the app no longer writes back.
 """
 import json
 
 from config import CHARACTER_RESERVED_FIELDS
-from utils.cloudsave_runtime import assert_cloudsave_writable
 from utils.config_manager import get_config_manager
-from utils.file_utils import atomic_write_json
 
 
 class ImportantSettingsManager:
@@ -43,26 +56,13 @@ class ImportantSettingsManager:
 
         for i in self.settings_file:
             try:
-                # 角色档案保留字段不参与记忆提取
+                # Reserved character-profile fields are excluded from memory extraction
                 for reserved_field in self._excluded_profile_fields:
                     self.lanlan_basic_config[i].pop(reserved_field, None)
                 with open(self.settings_file[i], 'r', encoding='utf-8') as f:
                     self.settings[i] = json.load(f)
             except (FileNotFoundError, json.JSONDecodeError):
                 self.settings[i] = {i: {}, self.name_mapping['human']: {}}
-
-    def save_settings(self, lanlan_name):
-        assert_cloudsave_writable(
-            self._config_manager,
-            operation="save",
-            target=f"memory/{lanlan_name}/settings.json",
-        )
-        atomic_write_json(
-            self.settings_file[lanlan_name],
-            self.settings[lanlan_name],
-            indent=2,
-            ensure_ascii=False,
-        )
 
     def get_settings(self, lanlan_name):
         self.load_settings()

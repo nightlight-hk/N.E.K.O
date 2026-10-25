@@ -9,7 +9,6 @@ import { computed, toValue, type MaybeRefOrGetter } from 'vue'
 import {
   useGridWorkbench,
   normalizeSearchPart,
-  safePinyin,
   type QualifierMatcher,
 } from '@/composables/useGridWorkbench'
 import { compareVersion } from '@/utils/version'
@@ -41,18 +40,16 @@ function buildMarketSearchIndex(plugin: MarketWorkbenchItem): string {
     ...(plugin.tags || []),
   ]
 
-  const pinyinParts = [plugin.name, plugin.description, plugin.short_description]
-    .flatMap((value) => {
-      const source = value || ''
-      const full = safePinyin(source, 'pinyin').replace(/\s+/g, ' ').trim()
-      const initials = safePinyin(source, 'first').replace(/\s+/g, '').trim()
-      return [full, full.replace(/\s+/g, ''), initials]
-    })
+  return textParts.map(normalizeSearchPart).filter(Boolean).join('\n')
+}
 
-  return [...textParts, ...pinyinParts]
-    .map(normalizeSearchPart)
-    .filter(Boolean)
-    .join('\n')
+function buildMarketPinyinIndex(plugin: MarketWorkbenchItem, search: (value: string, pattern: 'pinyin' | 'first') => string): string {
+  return [plugin.name, plugin.description, plugin.short_description].flatMap((value) => {
+    const source = value || ''
+    const full = search(source, 'pinyin').replace(/\s+/g, ' ').trim()
+    const initials = search(source, 'first').replace(/\s+/g, '').trim()
+    return [full, full.replace(/\s+/g, ''), initials]
+  }).map(normalizeSearchPart).filter(Boolean).join('\n')
 }
 
 function buildMarketQualifiers(
@@ -162,6 +159,7 @@ export function useMarketWorkbench(
     groupSelection: 'single',
     defaultSelectedGroupIds: ['all'],
     buildSearchIndex: buildMarketSearchIndex,
+    buildPinyinSearchIndex: buildMarketPinyinIndex,
     qualifierMatchers: buildMarketQualifiers(options),
     defaults: {
       layoutMode: 'compact',
@@ -180,14 +178,11 @@ export function useMarketWorkbench(
   return {
     items: workbench.items,
     filterText: workbench.filterText,
-    useRegex: workbench.useRegex,
-    filterMode: workbench.filterMode,
     selectedGroupIds: workbench.selectedGroupIds,
     layoutMode: workbench.layoutMode,
     multiSelectEnabled: workbench.multiSelectEnabled,
     selectedIds: workbench.selectedIds,
     selectedCount: workbench.selectedCount,
-    regexError: workbench.regexError,
     groupCounts: workbench.groupCounts,
     filteredItems: workbench.filteredItems,
     filteredByGroup: workbench.filteredByGroup,

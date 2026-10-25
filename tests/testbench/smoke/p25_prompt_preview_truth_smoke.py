@@ -47,7 +47,7 @@ Environment isolation: mirrors p25_external_events_smoke.py.
 Usage::
 
     .venv\\Scripts\\python.exe tests/testbench/smoke/p25_prompt_preview_truth_smoke.py
-"""
+"""  # noqa: DOCSTRING_CJK
 from __future__ import annotations
 
 import io
@@ -305,6 +305,7 @@ def check_pp2_avatar_event(client, mock_ext) -> list[str]:
             "tool_id": "fist",
             "action_id": "poke",
             "intensity": "normal",
+            "touch_zone": "head",
             "target": "avatar",
             "text_context": "(tester draft in composer)",
             "reward_drop": True,
@@ -328,28 +329,20 @@ def check_pp2_avatar_event(client, mock_ext) -> list[str]:
         )
         tail_content = str(tail.get("content") or "")
 
-        # The full instruction (built via
-        # _build_avatar_interaction_instruction) is multi-line and
-        # clearly longer than any single-line memory_note. Assert > 40
-        # chars as a proxy for "not the short note"; AND check that
-        # at least one of the avatar-specific keywords from the helper's
-        # template shows up, proving we captured the rendered
-        # instruction rather than a placeholder string.
+        # The avatar instruction is the direct event fact, not the short
+        # memory_note. It has no reply sentence, wrapper, or verbose field-list
+        # bullets. text_context remains a compatibility payload field but is
+        # excluded from the model instruction so composer drafts do not leak.
         _check(
-            len(tail_content) > 40,
-            "PP2.tail_not_note",
-            f"tail content too short ({len(tail_content)} chars): "
-            f"{tail_content[:80]!r} — looks like the memory_note, not "
-            "the full instruction",
+            "奖励" in tail_content,
+            "PP2.reward_fact",
+            "tail missing reward event fact: "
+            f"{tail_content[:200]!r}",
         )
-
-        # Reward + text_context presence — these fields are ONLY in the
-        # instruction, NEVER in the memory_note. If they show up here,
-        # we've confirmed preview = ground truth.
         _check(
-            "tester draft" in tail_content,
-            "PP2.text_context",
-            "tail missing text_context marker (confirms bug): "
+            "tester draft" not in tail_content,
+            "PP2.no_text_context",
+            "tail leaked compatibility text_context: "
             f"{tail_content[:200]!r}",
         )
         _check(
@@ -379,9 +372,8 @@ def check_pp2_avatar_event(client, mock_ext) -> list[str]:
         )
         if user_msg is not None:
             user_content = str(user_msg.get("content") or "")
-            # Memory note is short + single line. Instruction is long +
-            # multi-line with context/reward bullets. If the two are
-            # **equal**, the bug is still there.
+            # Memory note and instruction have different jobs. The instruction
+            # is compact now, but it must still differ from the persisted note.
             _check(
                 user_content != tail_content,
                 "PP2.preview_diverges_from_memory",
@@ -479,6 +471,7 @@ def check_pp5_source_flips_back(client, mock_ext) -> list[str]:
             "tool_id": "fist",
             "action_id": "poke",
             "intensity": "normal",
+            "touch_zone": "head",
             "target": "avatar",
         })
 

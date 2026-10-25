@@ -7,22 +7,27 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title data-i18n="live2d.manager">模型管理器 - Project N.E.K.O.</title>
     <!-- VRM 光照默认值：从后端注入，保证在所有 JS 之前同步可用 -->
+    <!-- 模型预览/编辑页豁免 avatar 空闲节流：用户在此手动播放任意动画（含无参
+         playAnimation 的舞蹈 VMD），期望满帧预览，不应被空闲地板压到 30fps -->
+    <script>window.__NEKO_DISABLE_AVATAR_IDLE_THROTTLE__ = true;</script>
     <script id="vrm-default-lighting-data" type="application/json">{{ (vrm_defaults | default({}, true)) | tojson | safe }}</script>
     <script>
         const vrmDefaultLightingData = document.getElementById('vrm-default-lighting-data');
         window.VRM_DEFAULT_LIGHTING = Object.freeze(JSON.parse(vrmDefaultLightingData?.textContent || '{}'));
     </script>
     <!-- i18next 加载器（统一处理 CDN 加载和初始化） -->
-    <script src="/static/i18n-i18next.js"></script>
+    <script src="/static/i18n-i18next.js?v={{ static_asset_version | default('0') }}"></script>
     <script src="/static/common_dialogs.js"></script>
+    <script src="/static/js/model_manager/named-window-registration.js?v={{ static_asset_version | default('0') }}"></script>
     <link rel="stylesheet" href="/static/css/model_manager.css?v={{ static_asset_version | default('0') }}">
     <link rel="stylesheet" href="/static/css/dark-mode.css">
-    <link rel="stylesheet" href="/static/css/tutorial-styles.css">
+    <link rel="stylesheet" href="/static/libs/driver.min.css?v={{ static_asset_version | default('0') }}">
+    <link rel="stylesheet" href="/static/css/tutorial-styles.css?v={{ static_asset_version | default('0') }}">
     <link rel="stylesheet" href="/static/css/model-profiler.css">
     <script src="/static/theme-manager.js"></script>
 </head>
 
-<body>
+<body class="model-manager-page">
 
 
     <div id="sidebar">
@@ -37,6 +42,8 @@
 
         <div class="control-group">
             <input type="file" id="model-upload" webkitdirectory directory multiple style="display: none;">
+            <input type="file" id="pngtuber-model-upload" webkitdirectory directory multiple style="display: none;">
+            <input type="file" id="pngtuber-package-upload" accept=".pngRemix,.pngremix,.save" style="display: none;">
             <input type="file" id="vrm-file-upload" accept=".vrm,.zip" style="display: none;">
             <input type="file" id="mmd-file-upload" accept=".pmx,.pmd,.zip" style="display: none;">
             <input type="file" id="mmd-animation-file-upload" accept=".vmd" style="display: none;">
@@ -63,11 +70,13 @@
                 </button>
                 <select id="model-type-select" class="control-select" style="display: none;">
                     <option value="live2d">Live2D</option>
-                    <option value="live3d">Live3D</option>
+                    <option value="live3d" data-i18n="live2d.modelType3d">3D Model</option>
+                    <option value="pngtuber">PNGTuber</option>
                 </select>
                 <div id="model-type-dropdown" class="model-type-dropdown" style="display: none;">
                     <div class="dropdown-item" data-value="live2d"><span class="dropdown-item-text" data-text="Live2D">Live2D</span></div>
-                    <div class="dropdown-item" data-value="live3d"><span class="dropdown-item-text" data-text="Live3D">Live3D</span></div>
+                    <div class="dropdown-item" data-value="live3d"><span class="dropdown-item-text" data-text="3D Model">3D Model</span></div>
+                    <div class="dropdown-item" data-value="pngtuber"><span class="dropdown-item-text" data-text="PNGTuber">PNGTuber</span></div>
                 </div>
             </div>
         </div>
@@ -163,10 +172,10 @@
                 <div id="vrm-animation-select-wrapper" style="position: relative; display: flex; flex: 1;">
                     <button id="vrm-animation-select-btn" class="btn btn-primary" type="button" disabled data-i18n-title="live2d.vrmAnimation.selectAnimation">
                         <img src="/static/icons/motion_select_icon.png?v=1" data-i18n-alt="live2d.vrmAnimation.selectAnimation" class="vrm-animation-select-icon" style="height: 40px; width: auto; max-width: 80px; image-rendering: crisp-edges; margin-right: 10px; flex-shrink: 0; object-fit: contain; display: inline-block;">
-                        <span class="round-stroke-text" id="vrm-animation-select-text" data-i18n="live2d.vrmAnimation.selectAnimation" data-text="Select Animation">选择动作</span>
+                        <span class="round-stroke-text" id="vrm-animation-select-text" data-i18n="live2d.noMotion" data-text="No Motion">无动作</span>
                     </button>
                     <select id="vrm-animation-select" class="control-select" style="display: none;" disabled>
-                        <option value="" data-i18n="live2d.vrmAnimation.selectAnimation">选择动作</option>
+                        <option value="_no_motion_" data-i18n="live2d.noMotion">无动作</option>
                     </select>
                     <div id="vrm-animation-dropdown" class="vrm-animation-dropdown" style="display: none;">
                         <!-- 下拉菜单项将动态生成 -->
@@ -182,10 +191,10 @@
                 <div id="vrm-expression-select-wrapper" style="position: relative; display: flex; flex: 1;">
                     <button id="vrm-expression-select-btn" class="btn btn-primary" type="button" disabled data-i18n-title="live2d.vrmExpression.selectExpression">
                         <img src="/static/icons/expression_chosen.png?v=1" data-i18n-alt="live2d.vrmExpression.selectExpression" class="vrm-expression-select-icon" style="height: 40px; width: auto; max-width: 80px; image-rendering: crisp-edges; margin-right: 10px; flex-shrink: 0; object-fit: contain; display: inline-block;">
-                        <span class="round-stroke-text" id="vrm-expression-select-text" data-i18n="live2d.vrmExpression.selectExpression" data-text="Select Expression">选择表情</span>
+                        <span class="round-stroke-text" id="vrm-expression-select-text" data-i18n="live2d.noExpression" data-text="No Expression">无表情</span>
                     </button>
                     <select id="vrm-expression-select" class="control-select" style="display: none;" disabled>
-                        <option value="" data-i18n="live2d.vrmExpression.selectExpression">选择表情</option>
+                        <option value="_no_expression_" data-i18n="live2d.noExpression">无表情</option>
                     </select>
                     <div id="vrm-expression-dropdown" class="vrm-expression-dropdown" style="display: none;">
                         <!-- 下拉菜单项将动态生成 -->
@@ -206,7 +215,7 @@
                         <span class="round-stroke-text" id="motion-select-text" data-i18n="live2d.selectMotion" data-text="Select Motion">选择动作</span>
                     </button>
                     <select id="motion-select" class="control-select" style="display: none;" disabled>
-                        <option value="" data-i18n="live2d.pleaseLoadModel">请先加载模型</option>
+                        <option value="" data-placeholder="true" data-i18n="live2d.pleaseLoadModel">请先加载模型</option>
                     </select>
                     <div id="motion-dropdown" class="motion-dropdown" style="display: none;">
                         <!-- 下拉菜单项将动态生成 -->
@@ -226,7 +235,7 @@
                         <span class="round-stroke-text" id="expression-select-text" data-i18n="live2d.selectExpression" data-text="Select Expression">选择表情</span>
                     </button>
                     <select id="expression-select" class="control-select" style="display: none;" disabled>
-                        <option value="" data-i18n="live2d.pleaseLoadModel">请先加载模型</option>
+                        <option value="" data-placeholder="true" data-i18n="live2d.pleaseLoadModel">请先加载模型</option>
                     </select>
                     <div id="expression-dropdown" class="expression-dropdown" style="display: none;">
                         <!-- 下拉菜单项将动态生成 -->
@@ -235,6 +244,25 @@
                 <button id="play-expression-btn" class="btn btn-primary" type="button" disabled data-i18n-title="common.play" data-i18n-aria="common.play">
                     <img src="/static/icons/motion_play_icon.png?v=1" data-i18n-alt="common.play" class="expression-play-icon">
                 </button>
+            </div>
+        </div>
+
+        <div class="control-group" id="pngtuber-preview-group" style="display: none; flex-direction: column; align-items: stretch; gap: 10px;">
+            <div id="pngtuber-basic-preview-section" style="display: flex; flex-direction: column; gap: 6px;">
+                <button id="pngtuber-talk-preview-btn" class="btn btn-primary" type="button" aria-label="测试说话" data-i18n-title="live2d.pngtuberTalkPreview" data-i18n-aria="live2d.pngtuberTalkPreview">
+                    <span class="round-stroke-text round-stroke-text-center" data-i18n="live2d.pngtuberTalkPreview" data-text="测试说话">测试说话</span>
+                </button>
+            </div>
+            <div id="pngtuber-state-preview-section" style="display: none; flex-direction: column; gap: 6px;">
+                <div id="pngtuber-state-preview-list" style="position: relative;">
+                    <button id="pngtuber-state-preview-select-btn" class="btn btn-primary" type="button" aria-label="状态预览" data-i18n-title="live2d.pngtuberStatePreview" data-i18n-aria="live2d.pngtuberStatePreview">
+                        <span class="round-stroke-text" id="pngtuber-state-preview-select-text" data-i18n="live2d.pngtuberStatePreview" data-text="状态预览">状态预览</span>
+                    </button>
+                    <select id="pngtuber-state-preview-select" class="control-select" style="display: none;">
+                        <option value="" data-i18n="live2d.pngtuberStatePreview">状态预览</option>
+                    </select>
+                    <div id="pngtuber-state-preview-dropdown" class="pngtuber-state-preview-dropdown" style="display: none;"></div>
+                </div>
             </div>
         </div>
 
@@ -537,6 +565,7 @@
     <div id="mmd-container" class="hidden">
         <canvas id="mmd-canvas"></canvas>
     </div>
+    <div id="pngtuber-container" class="hidden"></div>
 
     <div id="delete-model-modal">
         <div class="modal-content">
@@ -600,17 +629,29 @@
     <script src="/static/libs/live2d.min.js"></script>
     <script src="/static/libs/pixi.min.js"></script>
     <script src="/static/libs/index.min.js"></script>
-    <script src="/static/live2d-core.js"></script>
-    <script src="/static/live2d-emotion.js"></script>
-    <script src="/static/live2d-model.js"></script>
-    <script src="/static/live2d-interaction.js"></script>
-    <script src="/static/avatar-popup-common.js"></script>
-    <script src="/static/avatar-ui-popup.js"></script>
-    <script src="/static/avatar-ui-popup-config.js"></script>
-    <script src="/static/avatar-ui-buttons.js"></script>
-    <script src="/static/live2d-ui-buttons.js"></script>
-    <script src="/static/avatar-ui-drag.js"></script>
-    <script src="/static/live2d-init.js"></script>
+    <script src="/static/live2d/live2d-core.js"></script>
+    <script src="/static/live2d/live2d-emotion.js"></script>
+    <script src="/static/live2d/live2d-model.js"></script>
+    <script src="/static/avatar/avatar-touch-gestures.js"></script>
+    <script src="/static/live2d/live2d-interaction.js"></script>
+    <script src="/static/avatar/avatar-popup-common.js"></script>
+    <script src="/static/avatar/avatar-ui-popup.js"></script>
+    <script src="/static/avatar/avatar-ui-popup-config.js"></script>
+    <script src="/static/avatar/avatar-ui-buttons/cat-resource-registry.js?v={{ static_asset_version | default('0') }}"></script>
+    <script src="/static/avatar/avatar-ui-buttons/core.js"></script>
+    <script src="/static/avatar/avatar-ui-buttons/idle-assets-and-question.js"></script>
+    <script src="/static/avatar/avatar-ui-buttons/idle-playground.js"></script>
+    <script src="/static/avatar/avatar-ui-buttons/idle-actions-and-audio.js"></script>
+    <script src="/static/avatar/avatar-ui-buttons/idle-drag-and-subactions.js"></script>
+    <script src="/static/avatar/avatar-ui-buttons/idle-journey-and-presentation.js"></script>
+    <script src="/static/avatar/avatar-ui-buttons/idle-cat-mind-observations.js"></script>
+    <script src="/static/avatar/avatar-ui-buttons/methods-setup.js"></script>
+    <script src="/static/avatar/avatar-ui-buttons/methods-buttons.js"></script>
+    <script src="/static/avatar/avatar-ui-buttons/methods-return.js"></script>
+    <script src="/static/avatar/avatar-ui-buttons/methods-state-and-cleanup.js"></script>
+    <script src="/static/live2d/live2d-ui-buttons.js"></script>
+    <script src="/static/avatar/avatar-ui-drag.js"></script>
+    <script src="/static/live2d/live2d-init.js"></script>
 
     <!-- Three.js 核心库和importmap（用于ES6模块导入）-->
     <!-- 
@@ -638,9 +679,19 @@
         window.dispatchEvent(new CustomEvent('three-ready'));
     </script>
     <!-- VRM模块（按顺序加载，失败不影响Live2D）-->
-    <script src="/static/avatar-portrait.js"></script>
+    <script src="/static/avatar/avatar-portrait.js"></script>
+    <script src="/static/pngtuber-core.js?v={{ static_asset_version | default('0') }}"></script>
 
-    <script src="/static/js/model_manager.js?v={{ static_asset_version | default('0') }}"></script>
+    <script src="/static/js/model_manager/runtime-loaders.js?v={{ static_asset_version | default('0') }}"></script>
+    <script src="/static/vrm/motion/player.js?v={{ static_asset_version | default('0') }}"></script>
+    <script src="/static/js/model_manager/dropdown-manager.js?v={{ static_asset_version | default('0') }}"></script>
+    <script src="/static/js/model_manager/page-bridge.js?v={{ static_asset_version | default('0') }}"></script>
+    <script src="/static/js/model_manager/card-face.js?v={{ static_asset_version | default('0') }}"></script>
+    <script src="/static/js/model_manager/path-request-fullscreen.js?v={{ static_asset_version | default('0') }}"></script>
+    <script src="/static/js/model_manager/vrm-emotion-source.js?v={{ static_asset_version | default('0') }}"></script>
+    <script src="/static/js/model_manager/page-controller.js?v={{ static_asset_version | default('0') }}"></script>
+    <script src="/static/js/model_manager/background-model-drag.js?v={{ static_asset_version | default('0') }}"></script>
+    <script src="/static/js/model_manager/window-lifecycle.js?v={{ static_asset_version | default('0') }}"></script>
 
     <!-- 性能分析器 -->
     <script src="/static/model-profiler.js"></script>
@@ -698,21 +749,20 @@
         });
     </script>
 
-    <!-- Driver.js 库 -->
-    <script src="/static/libs/driver.min.js"></script>
-    <link rel="stylesheet" href="/static/libs/driver.min.css">
 
-    <script src="/static/tutorial-skip-controller.js?v=13"></script>
-    <script src="/static/tutorial-avatar-reload-controller.js?v=13"></script>
+    <script src="/static/libs/driver.min.js?v={{ static_asset_version | default('0') }}"></script>
+    <script src="/static/tutorial/core/skip-controller.js?v={{ static_asset_version | default('0') }}"></script>
+    <script src="/static/tutorial/avatar/reload-controller.js?v={{ static_asset_version | default('0') }}"></script>
     <!-- 通用教程管理器 -->
-    <script src="/static/universal-tutorial-manager.js?v=13"></script>
+    <script src="/static/tutorial/core/lifecycle-state-store.js?v={{ static_asset_version | default('0') }}"></script>
+    <script src="/static/tutorial/core/page-tutorial-manager.js?v={{ static_asset_version | default('0') }}"></script>
     <link rel="stylesheet" href="/static/css/touch-config.css">
     <script src="/static/touch-config.js"></script>
     <!-- 初始化 -->
     <script>
         document.addEventListener('DOMContentLoaded', function() {
-            if (typeof initUniversalTutorialManager === 'function') {
-                initUniversalTutorialManager();
+            if (typeof initPageTutorialManager === 'function') {
+                initPageTutorialManager();
             }
         });
     </script>

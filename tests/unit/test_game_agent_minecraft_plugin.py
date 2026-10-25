@@ -641,6 +641,155 @@ async def test_system_prompt_bundles_only_latest_frame_with_mime():
 
 
 @pytest.mark.asyncio
+async def test_state_burst_body_matches_who_is_actually_acting():
+    """The state burst must not tell her she is finishing her own previous
+    action when the only thing moving is mc-agent's autonomous play.
+
+    Regression: the burst had two bodies (IDLE / BUSY) and mc-agent's own
+    activity borrowed the BUSY one, whose text is ``You're still doing the
+    previous action``. With no dispatched task that is simply false, and it
+    held for the whole busy-latch TTL — she kept narrating instead of
+    dispatching while the user asked her to move.
+    """
+    from plugin.plugins.game_agent_minecraft import prompts
+
+    def _body_of(push):
+        return [p for p in push["parts"] if p["type"] == "text"][-1]["text"]
+
+    idle = prompts.t("SYSTEM_PROMPT_IDLE_BODY", lang="en")
+    busy = prompts.t("SYSTEM_PROMPT_BUSY_BODY", lang="en")
+    autonomous = prompts.t("SYSTEM_PROMPT_AUTONOMOUS_BODY", lang="en")
+    # A set, not a chain: ``idle != busy != autonomous`` is
+    # ``idle != busy and busy != autonomous``, which never compares idle with
+    # autonomous -- the one pair whose collapse would make the assertions below
+    # pass while the autonomous branch silently served the idle body.
+    assert len({idle, busy, autonomous}) == 3
+
+    # 1. Nothing running anywhere → invite her to dispatch.
+    service, push_calls = _make_service()
+    service.configure({})
+    service._lang = "en"
+    await service._fire_system_prompt()
+    assert idle in _body_of(push_calls[-1])
+
+    # 2. A task WE dispatched is in flight → "you're still doing it" is true.
+    claimed = await service.try_claim_pending("chop wood", overwrite=False)
+    assert claimed is not None
+    await service._fire_system_prompt()
+    assert busy in _body_of(push_calls[-1])
+
+    # 3. mc-agent is off doing its own thing, nothing pending on our side →
+    #    say that, not "your previous action".
+    service._pending = None
+    service._task_finished = True
+    await service._on_bot_status({"text": "🤖[自主] wandering around", "skill": "explore"})
+    assert service._mc_agent_busy() is True
+    await service._fire_system_prompt()
+    body = _body_of(push_calls[-1])
+    assert autonomous in body
+    assert busy not in body
+
+    # The burst is a snapshot: it must coalesce so bursts can't stack up in
+    # the delivery queue ahead of the user's own turn.
+    assert push_calls[-1]["coalesce_key"] == "mc_state"
+
+
+@pytest.mark.asyncio
+async def test_state_burst_resends_log_lines_for_the_delivery_ttl():
+    """A coalesced burst must not take the game's recent events with it.
+
+    These bursts collapse on ``mc_state`` (latest wins) and a collapsed burst is
+    dropped whole, so lines drained into it would never reach the model. They are
+    not snapshot data like the inventory; they are incremental events.
+
+    The window is the host's cue TTL rather than a generation count: the playback
+    gate routinely stays shut across several bursts (the queue has been seen at
+    depth 25), so three collapsing in a row is normal and a one-generation carry
+    would still lose the older two. Past the TTL the host would have dropped the
+    cue anyway, so the line stops riding along.
+    """
+    from plugin.plugins.game_agent_minecraft import service as service_mod
+
+    service, push_calls = _make_service()
+    service.configure({})
+    service._lang = "en"
+
+    def _body_of(push):
+        return [p for p in push["parts"] if p["type"] == "text"][-1]["text"]
+
+    await service._on_log("chopped an oak log")
+    await service._fire_system_prompt()
+    assert "chopped an oak log" in _body_of(push_calls[-1])
+
+    # Three bursts in a row: whichever one survives coalescing carries them all.
+    await service._on_log("picked up a sapling")
+    await service._fire_system_prompt()
+    await service._on_log("crafted planks")
+    await service._fire_system_prompt()
+    body = _body_of(push_calls[-1])
+    assert "chopped an oak log" in body
+    assert "picked up a sapling" in body
+    assert "crafted planks" in body
+
+    # Past the TTL they stop riding along -- the host drops a cue that old too,
+    # so they were never going to arrive as news. Age the entries directly rather
+    # than leaning on the clock: these bursts all land inside one tick of
+    # ``time.time()`` on Windows, so a zero TTL would not expire anything.
+    assert service_mod._LOG_CARRY_TTL_SECONDS > 0
+    aged = [(ts - service_mod._LOG_CARRY_TTL_SECONDS - 1.0, line) for ts, line in service._log_carry]
+    service._log_carry.clear()
+    service._log_carry.extend(aged)
+
+    await service._on_log("mined iron ore")
+    await service._fire_system_prompt()
+    body = _body_of(push_calls[-1])
+    assert "chopped an oak log" not in body
+    assert "crafted planks" not in body
+    assert "mined iron ore" in body
+
+
+@pytest.mark.asyncio
+async def test_alert_without_text_falls_back_to_the_cause():
+    """A text-less alert still has to reach her; only a truly empty one is dropped.
+
+    ``text`` is best-effort on mc-agent's side, and the handler used to return on
+    an empty one -- throwing away a ``cause`` that had already been rendered into
+    a usable phrase, for the single most important event that can happen to her
+    (death). This is the highest-severity channel in the plugin; a silent return
+    on it is never acceptable, so the drop that remains is logged.
+    """
+    service, push_calls = _make_service()
+    service.configure({})
+    service._lang = "en"
+
+    # No prose, but a cause we can render.
+    await service._on_alert({
+        "severity": "critical",
+        "cause": {"attacker": {"kind": "mob", "name": "zombie", "distance": 1.4}},
+    })
+    assert len(push_calls) == 1
+    pushed = push_calls[0]
+    assert pushed["priority"] == 9
+    assert pushed["coalesce_key"] == "mc_alert"
+    body = [p for p in pushed["parts"] if p["type"] == "text"][0]["text"]
+    assert "nearby" in body and "1.4" in body
+    # The cause became the headline, so it must not also appear as a duplicate
+    # "Cause hint:" line -- she would just say the same thing twice.
+    assert body.count("1.4") == 1
+
+    # Nothing usable at all: dropped, but the warning says so.
+    warnings: list[str] = []
+    service._log_warning = lambda msg, *a: warnings.append(msg)  # type: ignore[assignment]
+    await service._on_alert({"severity": "warn"})
+    assert len(push_calls) == 1
+    assert warnings and "alert dropped" in warnings[0]
+
+    # A normal alert is unaffected.
+    await service._on_alert({"severity": "warn", "text": "took 3 damage"})
+    assert len(push_calls) == 2
+
+
+@pytest.mark.asyncio
 async def test_log_cache_is_bounded():
     """Without a cap, an idle ``skip_system_prompt_if_busy=True`` plus a
     chatty agent would balloon the log cache without bound. The cap
@@ -784,10 +933,32 @@ async def test_log_callback_tracks_task_state_from_strings():
     service, _ = _make_service()
     service.configure({})
 
+    # A task WE dispatched is in flight — "action selection" just confirms it,
+    # so it may clear the finished flag.
+    claimed = await service.try_claim_pending("chop wood", overwrite=False)
+    assert claimed is not None
+    service._task_finished = True  # stale True; the log must clear it
     await service._on_log("action selection: chop wood")
     assert service._task_finished is False
+
+    # Drop the slot the way a terminal path would.
+    service._pending = None
+    service._task_finished = True
+
+    # Autonomous action selection (nothing pending) must NOT touch
+    # ``_task_finished``: nothing would ever reset it (``task run ended`` needs
+    # a real task run, the terminal paths need a pending slot), so the
+    # keep-going branch — gated on that flag — would be dead for the rest of
+    # the session and the state burst would keep telling her she is mid-action.
+    # It arms the TTL-bounded busy latch instead.
+    await service._on_log("action selection: wander off on its own")
+    assert service._task_finished is True
+    assert service._mc_agent_busy() is True
+
     await service._on_log("task run ended")
     assert service._task_finished is True
+    # A local terminal drops the stale busy latch too.
+    assert service._mc_agent_busy() is False
     await service._on_log("Connection lost and re-established.")
     assert service._task_finished is True
 
@@ -1286,17 +1457,64 @@ async def test_reload_config_live_no_restart_for_pure_data_keys():
 # ---------------------------------------------------------------------------
 
 
-def test_prompts_have_all_seven_locales():
+def test_task_tool_description_preserves_master_words_and_coordinates():
+    """The tool preserves master words without disabling autonomous idle play."""
+    from plugin.plugins.game_agent_minecraft import (
+        MINECRAFT_TASK_DESCRIPTION,
+        MINECRAFT_TASK_SCHEMA,
+    )
+
+    description = MINECRAFT_TASK_DESCRIPTION
+    task_schema_description = (
+        MINECRAFT_TASK_SCHEMA["properties"]["task"]["description"]
+    )
+
+    assert "relay the exact original wording" in description
+    assert "Do not translate, paraphrase" in description
+    assert "NEVER invent, infer, choose, or include in-game coordinates" in description
+    assert "unless master explicitly asked" in description
+    assert "master's most recent message" in description
+    assert "must not come from an earlier master message" in description
+    assert "NEVER call back, recover, retry, or re-dispatch" in description
+    assert "genuinely new autonomous action from the current game state" in description
+    assert "has not already been dispatched" in task_schema_description
+    assert "exact original wording" in task_schema_description
+    assert "genuinely new autonomous action" in task_schema_description
+    assert "current game state" in task_schema_description
+    assert "unless master explicitly asked for coordinates" in task_schema_description
+    assert "English with specific targets" not in description
+    assert "exact coordinates, specific block" not in description
+
+    from plugin.plugins.game_agent_minecraft import prompts
+
+    assert "dispatch a fresh task" not in prompts.t(
+        "COMPLETION_FOLLOWUP_BLOCKED", lang="en"
+    )
+    assert "different coordinates" not in prompts.t(
+        "COMPLETION_FOLLOWUP_BLOCKED", lang="en"
+    )
+    for key in (
+        "COMPLETION_FOLLOWUP_BLOCKED",
+        "COMPLETION_FOLLOWUP_SUCCESS",
+        "COMPLETION_FOLLOWUP_FAILED",
+        "RETROACTIVE_FOLLOWUP",
+    ):
+        cue = prompts.t(key, lang="en")
+        assert "unfinished explicit instruction" not in cue
+        assert "next step" not in cue
+
+
+def test_prompts_have_all_eight_locales():
     """Every entry in PROMPTS must carry a non-empty translation for
-    each supported language (zh, en, ja, ko, ru, es, pt). Missing keys
-    would otherwise silently fall back to EN and hide translation gaps
+    each supported language (zh, zh-TW, en, ja, ko, ru, es, pt). Missing
+    keys would otherwise silently fall back to EN and hide translation gaps
     from non-EN users."""
     from plugin.plugins.game_agent_minecraft import prompts
 
-    # Pin the expected locale set so the "seven locales" promise can't
-    # be silently regressed by editing SUPPORTED_LANGS down to six.
+    # Pin the expected locale set so the "eight locales" promise can't
+    # be silently regressed by editing SUPPORTED_LANGS down to seven.
     assert set(prompts.SUPPORTED_LANGS) == {
-        "zh", "en", "ja", "ko", "ru", "es", "pt",
+        "zh", "zh-TW", "en", "ja", "ko", "ru", "es", "pt",
     }
     missing: list[str] = []
     for key, bundle in prompts.PROMPTS.items():
@@ -1329,3 +1547,701 @@ def test_prompts_t_falls_back_to_english_on_missing_locale():
     en = prompts.t('TASK_NOT_CONNECTED', lang='en')
     assert out == en
 
+
+# ---------------------------------------------------------------------------
+# Status vocab tolerance — mc-agent now emits ``failed`` / ``superseded``
+# alongside ``ok`` / ``interrupted``. The plugin must tolerate every value
+# (no crash — status is an opaque string everywhere) AND frame the new ones
+# correctly: ``superseded`` is a non-completion, NOT a failure, and a late
+# non-completion frame must not be narrated as "actually finished".
+# ---------------------------------------------------------------------------
+
+
+def _make_facade(lang: str = "en"):
+    """Build just enough of the plugin facade to exercise
+    ``_format_completion_cue`` without the SDK ctx / WebSocket. That method
+    only reads ``self._lang`` + module-level prompts, so bypass __init__
+    (same object.__new__ trick used elsewhere in the suite for handler-only
+    methods)."""
+    from plugin.plugins.game_agent_minecraft import GameAgentMinecraftPlugin
+
+    facade = object.__new__(GameAgentMinecraftPlugin)
+    facade._lang = lang
+    return facade
+
+
+# " superseded " padded exercises the .strip() normalization; SUPERSEDED the
+# .lower(). Both must classify into the interrupted bucket, which [NO-SWITCH-CUE]
+# suppresses entirely (see _format_completion_cue's ``if is_interrupted``).
+@pytest.mark.parametrize(
+    "status", ["superseded", "interrupted", "SUPERSEDED", " superseded "]
+)
+def test_completion_cue_interrupted_is_suppressed(status):
+    """``interrupted`` / ``superseded`` is a task the LLM (or user) already
+    replaced on purpose — [NO-SWITCH-CUE] emits no completion cue at all so it
+    can't nudge another dispatch (the observed task-switch retry storm). The
+    case/whitespace variants must still land in that suppressed bucket."""
+    facade = _make_facade("en")
+    cue = facade._format_completion_cue({"status": status, "query": "mine 10 logs"})
+
+    assert cue == ""
+
+
+@pytest.mark.parametrize("status", ["failed", "FAILED"])
+def test_completion_cue_failed_still_reads_as_failure(status):
+    """Regression guard: ``failed`` must stay in the genuine-failure bucket
+    (it's not swept into the neutral interrupted carve-out); case-insensitive."""
+    from plugin.plugins.game_agent_minecraft import prompts
+
+    facade = _make_facade("en")
+    cue = facade._format_completion_cue(
+        {"status": status, "query": "reach the village"}
+    )
+
+    assert prompts.t("HEAD_VERB_FAILED", lang="en") in cue
+    assert prompts.t("COMPLETION_FOLLOWUP_FAILED", lang="en") in cue
+
+
+# "OK"/"ok " pin the .strip().lower() normalization for the success branch —
+# a case- or whitespace-sensitive regression would mislabel a success as failure.
+@pytest.mark.parametrize("status", ["ok", "OK", "ok "])
+def test_completion_cue_ok_still_reads_as_success(status):
+    """Regression guard: the new interrupted branch must not disturb the
+    success path (no detail → no blocked-marker rewrite)."""
+    from plugin.plugins.game_agent_minecraft import prompts
+
+    facade = _make_facade("en")
+    cue = facade._format_completion_cue({"status": status, "query": "place a torch"})
+
+    assert prompts.t("HEAD_VERB_SUCCESS", lang="en") in cue
+    assert prompts.t("COMPLETION_FOLLOWUP_SUCCESS", lang="en") in cue
+
+
+def test_completion_cue_ok_but_blocked_text_reads_as_blocked():
+    """status='ok' whose feedback text signals a blocked action (mc-agent's
+    'ok but really stuck' quirk) must be re-labeled blocked, not success —
+    guards the shared ``text_signals_blocked`` marker detection."""
+    from plugin.plugins.game_agent_minecraft import prompts
+
+    facade = _make_facade("en")
+    cue = facade._format_completion_cue(
+        {"status": "ok", "query": "walk to 博士", "text": "could not find path to 博士"}
+    )
+
+    assert prompts.t("HEAD_VERB_BLOCKED", lang="en") in cue
+    assert prompts.t("COMPLETION_FOLLOWUP_BLOCKED", lang="en") in cue
+    assert prompts.t("COMPLETION_FOLLOWUP_SUCCESS", lang="en") not in cue
+
+
+# ``failed`` / ``timeout`` are genuine non-completions the plugin still narrates
+# (honestly, via the 'ended without completing' header). ``interrupted`` /
+# ``superseded`` are handled separately below — [NO-SWITCH-CUE] drops them.
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["failed", "timeout"])
+async def test_retroactive_cue_non_completion_does_not_claim_finished(status):
+    """A late ``task_finished`` for an overwritten/abandoned task whose
+    status is a non-completion must use the honest 'ended without completing'
+    header — never RETROACTIVE_HEADER's 'actually finished', which would
+    fabricate a success the character would then narrate."""
+    from plugin.plugins.game_agent_minecraft import prompts
+
+    service, push_calls = _make_service()
+    service.set_lang("en")
+    # A task the plugin already moved on from, still tracked in history.
+    service._remember_dispatched("hist-1", "build a cobblestone wall")
+    service._seen_task_id_echo = True  # modern agent that echoes task_id
+
+    await service._on_task_finished(
+        {"status": status, "task_id": "hist-1", "text": "stopped partway"}
+    )
+
+    blob = "\n".join(
+        p.get("text") or ""
+        for call in push_calls
+        for p in (call.get("parts") or [])
+    )
+    # Cue fired (task_text is interpolated raw, stable across locales).
+    assert "build a cobblestone wall" in blob
+    ended = prompts.t(
+        "RETROACTIVE_HEADER_ENDED", lang="en",
+        task_text="build a cobblestone wall", status=status,
+    )
+    finished = prompts.t(
+        "RETROACTIVE_HEADER", lang="en",
+        task_text="build a cobblestone wall", status=status,
+    )
+    assert ended in blob
+    assert finished not in blob
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["superseded", "interrupted"])
+async def test_retroactive_cue_interrupted_superseded_is_suppressed(status):
+    """[NO-SWITCH-CUE]: a late ``interrupted`` / ``superseded`` frame is a task
+    the LLM already replaced on purpose. Re-surfacing it retroactively only
+    nudges another dispatch (the retry storm), so no cue fires at all — the
+    task text is never surfaced."""
+    service, push_calls = _make_service()
+    service.set_lang("en")
+    service._remember_dispatched("hist-1", "build a cobblestone wall")
+    service._seen_task_id_echo = True
+
+    await service._on_task_finished(
+        {"status": status, "task_id": "hist-1", "text": "stopped partway"}
+    )
+
+    blob = "\n".join(
+        p.get("text") or ""
+        for call in push_calls
+        for p in (call.get("parts") or [])
+    )
+    assert "build a cobblestone wall" not in blob
+
+
+@pytest.mark.asyncio
+async def test_retroactive_cue_ok_still_claims_finished():
+    """Regression guard: a genuine late completion (``ok``) keeps the
+    'actually finished' header — the whole reason the retroactive cue
+    exists is to tell the character the action she gave up on really did complete."""
+    from plugin.plugins.game_agent_minecraft import prompts
+
+    service, push_calls = _make_service()
+    service.set_lang("en")
+    service._remember_dispatched("hist-2", "smelt 8 iron")
+    service._seen_task_id_echo = True
+
+    await service._on_task_finished(
+        {"status": "ok", "task_id": "hist-2", "text": "done late"}
+    )
+
+    blob = "\n".join(
+        p.get("text") or ""
+        for call in push_calls
+        for p in (call.get("parts") or [])
+    )
+    finished = prompts.t(
+        "RETROACTIVE_HEADER", lang="en",
+        task_text="smelt 8 iron", status="ok",
+    )
+    ended = prompts.t(
+        "RETROACTIVE_HEADER_ENDED", lang="en",
+        task_text="smelt 8 iron", status="ok",
+    )
+    assert finished in blob
+    assert ended not in blob
+
+
+@pytest.mark.asyncio
+async def test_retroactive_cue_ok_but_blocked_text_does_not_claim_finished():
+    """A late status='ok' frame whose text signals a blocked action must NOT
+    assert 'actually finished' — the same 'ok but really stuck' quirk the live
+    completion cue guards. Otherwise the cue says 'it actually finished' while its
+    own feedback line shows 'could not find path'."""
+    from plugin.plugins.game_agent_minecraft import prompts
+
+    service, push_calls = _make_service()
+    service.set_lang("en")
+    service._remember_dispatched("hist-3", "walk to 博士")
+    service._seen_task_id_echo = True
+
+    await service._on_task_finished(
+        {"status": "ok", "task_id": "hist-3", "text": "could not find path to 博士"}
+    )
+
+    blob = "\n".join(
+        p.get("text") or ""
+        for call in push_calls
+        for p in (call.get("parts") or [])
+    )
+    ended = prompts.t(
+        "RETROACTIVE_HEADER_ENDED", lang="en",
+        task_text="walk to 博士", status="ok",
+    )
+    finished = prompts.t(
+        "RETROACTIVE_HEADER", lang="en",
+        task_text="walk to 博士", status="ok",
+    )
+    assert ended in blob
+    assert finished not in blob
+
+
+@pytest.mark.asyncio
+async def test_busy_flag_cleared_on_dispatched_task_completion():
+    """[BUSY] A dispatched task's terminal ``task_finished`` must clear the
+    ``_agent_busy`` flag set by an earlier bot_status_nl. Without this the
+    keep-going nudge stays suppressed for the full ``_agent_busy_ttl`` while
+    the agent sits idle after completing, leaving a silent avatar for ~1min."""
+    import time
+    from plugin.plugins.game_agent_minecraft.service import PendingTask
+
+    service, _ = _make_service()
+    service._seen_task_id_echo = True
+    service._pending = PendingTask(
+        task_text="mine 10 logs", event=asyncio.Event(),
+        start_time=0.0, task_id="t1",
+    )
+    # An in-flight bot_status_nl reported the agent busy; no later frame arrives.
+    service._agent_busy = True
+    service._agent_busy_at = time.time()
+
+    await service._on_task_finished({"status": "ok", "task_id": "t1"})
+
+    assert service._pending is None
+    assert service._agent_busy is False
+    assert service._mc_agent_busy() is False
+
+
+@pytest.mark.asyncio
+async def test_connection_bounce_wakes_pending_even_when_deduped():
+    """[CONTROL-LOG] A repeated 'Connection lost and re-established.' inside the
+    dedup window must still wake a pending task with the interrupted verdict.
+    The control-log state handling runs before the dedup early-return, so a
+    second reconnect during a pending task isn't dropped — otherwise the handler
+    would sit until ``task_timeout_seconds``."""
+    import time
+    from plugin.plugins.game_agent_minecraft.service import PendingTask
+
+    service, _ = _make_service()
+    pending = PendingTask(
+        task_text="dig straight down", event=asyncio.Event(),
+        start_time=0.0, task_id="t2",
+    )
+    service._pending = pending
+    # Same control log already seen moments ago → the dedup gate would drop it
+    # if state handling ran after the dedup return.
+    service._recent_log_times["Connection lost and re-established."] = time.time()
+
+    await service._on_log("Connection lost and re-established.")
+
+    assert service._pending is None
+    assert pending.result.get("status") == "interrupted"
+    assert pending.event.is_set()
+
+
+@pytest.mark.asyncio
+async def test_busy_flag_cleared_on_task_timeout():
+    """[BUSY] A dispatched task that ends via the local timeout path (no
+    task_finished ever arrives) must also clear _agent_busy — otherwise the
+    keep-going nudge stays suppressed for the full TTL after the timeout."""
+    import time
+
+    service, _ = _make_service()
+    service.configure({"task_timeout_seconds": 30.0})
+    service._client = _FakeClient()
+    service._task_timeout = 0.05  # force the timeout path fast
+    service._agent_busy = True
+    service._agent_busy_at = time.time()
+
+    out = await service.execute_minecraft_task(task="mine forever")
+
+    assert out["status"] == "timeout"
+    assert service._agent_busy is False
+    assert service._mc_agent_busy() is False
+
+
+@pytest.mark.asyncio
+async def test_busy_flag_cleared_on_connection_bounce():
+    """[BUSY] A connection bounce ends the pending task via _on_log and anchors
+    the recovery keep-going nudge — it must also clear _agent_busy, or that
+    nudge stays suppressed for the full TTL after the bounce."""
+    import time
+    from plugin.plugins.game_agent_minecraft.service import PendingTask
+
+    service, _ = _make_service()
+    service._pending = PendingTask(
+        task_text="build a wall", event=asyncio.Event(),
+        start_time=0.0, task_id="t3",
+    )
+    service._agent_busy = True
+    service._agent_busy_at = time.time()
+
+    await service._on_log("Connection lost and re-established.")
+
+    assert service._pending is None
+    assert service._agent_busy is False
+    assert service._mc_agent_busy() is False
+
+
+@pytest.mark.asyncio
+async def test_completion_text_with_command_syntax_is_filtered():
+    """[ANTI-PARROT] A task_finished whose free-text carries mc-agent command
+    syntax (goToCoordinates(...) etc.) must not reach _log_cache /
+    RECENT_EVENTS_BLOCK or the completion payload — the _on_log anti-parrot
+    filter only covers log frames, so completion text is sanitized at its
+    derivation point too, else the dialog LLM re-dispatches the raw command."""
+    from plugin.plugins.game_agent_minecraft.service import PendingTask
+
+    service, _ = _make_service()
+    service._seen_task_id_echo = True
+    pending = PendingTask(
+        task_text="go mine", event=asyncio.Event(), start_time=0.0, task_id="t4",
+    )
+    service._pending = pending
+
+    await service._on_task_finished(
+        {"status": "ok", "task_id": "t4",
+         "text": "Finished goToCoordinates(118,64,-115,1)"}
+    )
+
+    # Task still resolved as a success...
+    assert pending.result.get("status") == "ok"
+    assert pending.event.is_set()
+    # ...but the command-syntax text never reaches model-visible sinks.
+    assert all("goToCoordinates" not in ln for ln in service._log_cache)
+    assert "goToCoordinates" not in (pending.result.get("text") or "")
+
+
+@pytest.mark.asyncio
+async def test_completion_ok_with_command_syntax_keeps_block_signal():
+    """[ANTI-PARROT] Scrubbing command syntax must NOT strip a co-located block
+    signal: a status='ok' completion whose text is
+    'Failed goToCoordinates(...): could not find path' must keep 'could not find
+    path' so text_signals_blocked still fires (else the blocked action reads as a
+    success), while the command syntax is still removed."""
+    from plugin.plugins.game_agent_minecraft.service import (
+        PendingTask,
+        text_signals_blocked,
+    )
+
+    service, _ = _make_service()
+    service._seen_task_id_echo = True
+    pending = PendingTask(
+        task_text="walk to base", event=asyncio.Event(), start_time=0.0, task_id="t5",
+    )
+    service._pending = pending
+
+    await service._on_task_finished(
+        {"status": "ok", "task_id": "t5",
+         "text": "Failed goToCoordinates(1,2,3): could not find path"}
+    )
+
+    out_text = pending.result.get("text") or ""
+    assert "goToCoordinates" not in out_text        # command syntax scrubbed
+    assert "could not find path" in out_text          # block signal preserved
+    assert text_signals_blocked(out_text)             # → blocked, not success
+
+
+@pytest.mark.asyncio
+async def test_busy_flag_cleared_on_task_run_ended_log_when_idle():
+    """[BUSY] The 'task run ended' terminal log (no pending) marks the service
+    finished — it must also clear _agent_busy, matching the other terminal
+    paths, or the keep-going nudge stays suppressed for the full TTL."""
+    import time
+
+    service, _ = _make_service()
+    service._agent_busy = True
+    service._agent_busy_at = time.time()
+    assert service._pending is None
+
+    await service._on_log("task run ended")
+
+    assert service._task_finished is True
+    assert service._agent_busy is False
+    assert service._mc_agent_busy() is False
+
+
+@pytest.mark.asyncio
+async def test_busy_flag_cleared_on_stray_task_finished_when_idle():
+    """[BUSY] An autonomous/stray task_finished (no pending, no known id) marks
+    the service idle — it must also clear _agent_busy, or the recovery keep-going
+    nudge is suppressed for the full TTL after an autonomous completion."""
+    import time
+
+    service, _ = _make_service()
+    service._agent_busy = True
+    service._agent_busy_at = time.time()
+    assert service._pending is None
+
+    await service._on_task_finished(
+        {"status": "ok", "text": "did an autonomous thing"}
+    )
+
+    assert service._task_finished is True
+    assert service._agent_busy is False
+    assert service._mc_agent_busy() is False
+
+
+@pytest.mark.asyncio
+async def test_stale_bot_status_does_not_rearm_busy_after_terminal():
+    """[BUSY-RACE] A busy bot_status_nl that lags a completion (arrives within the
+    re-arm grace after a terminal marked idle) must NOT re-arm _agent_busy — else
+    recovery stalls for the full TTL while the agent is already idle."""
+    service, _ = _make_service()
+    service._seen_task_id_echo = True
+    service._pending = None
+
+    await service._on_task_finished({"status": "ok", "text": "done"})
+    assert service._agent_busy is False
+
+    # Untagged busy status lagging the completion — no tag, no pending → the
+    # conservative policy does not re-arm it.
+    await service._on_bot_status({"text": "mining", "skill": "mine", "kind": "cmd"})
+
+    assert service._agent_busy is False
+    assert service._mc_agent_busy() is False
+
+
+@pytest.mark.asyncio
+async def test_untagged_busy_rearms_while_task_pending():
+    """A busy bot_status_nl re-arms _agent_busy while a dispatched task is pending
+    — the pending task is the correlation, even for an untagged frame."""
+    from plugin.plugins.game_agent_minecraft.service import PendingTask
+
+    service, _ = _make_service()
+    service._pending = PendingTask(
+        task_text="mine ore", event=asyncio.Event(), start_time=0.0, task_id="tp",
+    )
+
+    await service._on_bot_status({"text": "working", "skill": "mine", "kind": "cmd"})
+
+    assert service._agent_busy is True
+    assert service._mc_agent_busy() is True
+
+
+@pytest.mark.asyncio
+async def test_stale_dispatched_status_does_not_rearm_when_idle():
+    """A dispatched-command status frame with no pending task is a stale trailing
+    report of the just-finished dispatch — it must not re-arm busy, regardless of
+    arrival time (a content correlation, not a timing guess)."""
+    service, _ = _make_service()
+    service._pending = None
+    service._agent_busy = False
+
+    await service._on_bot_status(
+        {"text": "🎯[按指令] goToCoordinates", "skill": "goto", "kind": "cmd"}
+    )
+
+    assert service._agent_busy is False
+    assert service._mc_agent_busy() is False
+
+
+@pytest.mark.asyncio
+async def test_untagged_busy_does_not_rearm_when_idle():
+    """[BUSY-RACE] An untagged busy bot_status_nl with no pending task can't be
+    correlated to real work (stale or unattributable) — the conservative policy
+    does not re-arm busy at any delay, so recovery isn't stranded for the TTL."""
+    service, _ = _make_service()
+    service._pending = None
+    service._agent_busy = False
+
+    await service._on_bot_status({"text": "still going", "skill": "mine", "kind": "cmd"})
+
+    assert service._agent_busy is False
+    assert service._mc_agent_busy() is False
+
+
+@pytest.mark.asyncio
+async def test_autonomous_status_rearms_busy_without_pending():
+    """An autonomous status frame reflects genuine ongoing activity — it re-arms
+    busy even with no pending task (autonomy is its own correlation)."""
+    service, _ = _make_service()
+    service._pending = None
+    service._agent_busy = False
+
+    await service._on_bot_status(
+        {"text": "🤖[自主] exploring", "skill": "explore", "kind": "auto"}
+    )
+
+    assert service._agent_busy is True
+
+
+# ---------------------------------------------------------------------------
+# duplicate frames — "same instruction already running" is not a completion
+# ---------------------------------------------------------------------------
+
+
+async def _dispatch_and_get_id(service, task: str) -> tuple[asyncio.Task, str]:
+    runner = asyncio.create_task(service.execute_minecraft_task(task=task))
+    for _ in range(50):
+        if service._pending is not None and service._pending.task_text == task:
+            break
+        await asyncio.sleep(0.01)
+    else:
+        pytest.fail("_pending was never set")
+    return runner, service._pending.task_id
+
+
+@pytest.mark.asyncio
+async def test_duplicate_frame_keeps_pending_and_resolves_via_original_id():
+    """Regression for the 2026-09-07 resend loop: a re-dispatch of text that
+    mc-agent is still running gets ``status=duplicate``. That frame must NOT
+    clear the slot nor wake the handler as a failure; the eventual
+    ``task_finished`` for the ORIGINAL dispatch id resolves the new slot."""
+    service, _ = _make_service()
+    service.configure({"task_timeout_seconds": 5.0})
+    service._client = _FakeClient()
+
+    runner1, first_id = await _dispatch_and_get_id(service, "mine 10 logs")
+    # First dispatch drops out of the slot (e.g. plugin-side timeout) while
+    # mc-agent keeps running it. Simulate by timing the wait out directly.
+    service._pending.result = {"status": "timeout", "query": "mine 10 logs"}
+    service._pending.event.set()
+    service._pending = None
+    await asyncio.wait_for(runner1, timeout=2.0)
+
+    runner2, second_id = await _dispatch_and_get_id(service, "mine 10 logs")
+    assert second_id != first_id
+
+    await service._on_task_finished({
+        "status": "duplicate",
+        "task_id": second_id,
+        "message": "收到。相同指令已在执行中（已运行20秒），请勿重发。",
+    })
+    await asyncio.sleep(0.05)
+
+    assert not runner2.done(), "duplicate frame must not resolve the handler"
+    assert service._pending is not None
+    assert service._pending.task_id == second_id
+    assert service._pending.alias_task_id == first_id
+    assert any("相同指令已在执行中" in line for line in service._log_cache)
+
+    await service._on_task_finished(
+        {"status": "ok", "task_id": first_id, "text": "done"}
+    )
+    out = await asyncio.wait_for(runner2, timeout=2.0)
+    assert out["status"] == "ok"
+    assert service._pending is None
+
+
+@pytest.mark.asyncio
+async def test_duplicate_chain_aliases_root_not_sibling_duplicate():
+    """Three dispatches of one long task: the first really runs, the second
+    and third both get ``duplicate``. The third must alias the FIRST id (the
+    running one), not the second (which never ran and whose id no completion
+    frame will ever carry) — otherwise the root's completion routes to the
+    retroactive bucket and the third slot waits until timeout."""
+    service, _ = _make_service()
+    service.configure({"task_timeout_seconds": 5.0})
+    service._client = _FakeClient()
+
+    async def _drop_slot_as_timeout(runner):
+        service._pending.result = {"status": "timeout", "query": "mine 10 logs"}
+        service._pending.event.set()
+        service._pending = None
+        await asyncio.wait_for(runner, timeout=2.0)
+
+    runner1, first_id = await _dispatch_and_get_id(service, "mine 10 logs")
+    await _drop_slot_as_timeout(runner1)
+
+    runner2, second_id = await _dispatch_and_get_id(service, "mine 10 logs")
+    await service._on_task_finished({"status": "duplicate", "task_id": second_id})
+    await asyncio.sleep(0.02)
+    assert service._pending.alias_task_id == first_id
+    await _drop_slot_as_timeout(runner2)
+
+    runner3, third_id = await _dispatch_and_get_id(service, "mine 10 logs")
+    await service._on_task_finished({"status": "duplicate", "task_id": third_id})
+    await asyncio.sleep(0.02)
+    assert service._pending.alias_task_id == first_id, (
+        "third slot aliased a sibling duplicate instead of the running root"
+    )
+
+    await service._on_task_finished({"status": "ok", "task_id": first_id})
+    out = await asyncio.wait_for(runner3, timeout=2.0)
+    assert out["status"] == "ok"
+    assert service._pending is None
+
+
+@pytest.mark.asyncio
+async def test_duplicate_frame_without_prior_dispatch_keeps_pending():
+    """No earlier dispatch of the same text in history (mc-agent is running
+    its own task, or the history rolled over): still hold the slot; the
+    slot's own id resolves it later."""
+    service, _ = _make_service()
+    service.configure({"task_timeout_seconds": 5.0})
+    service._client = _FakeClient()
+
+    runner, task_id = await _dispatch_and_get_id(service, "go to the village")
+    await service._on_task_finished({"status": "duplicate", "task_id": task_id})
+    await asyncio.sleep(0.05)
+
+    assert not runner.done()
+    assert service._pending is not None
+    assert service._pending.alias_task_id == ""
+
+    await service._on_task_finished({"status": "ok", "task_id": task_id})
+    out = await asyncio.wait_for(runner, timeout=2.0)
+    assert out["status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_duplicate_frame_for_historical_id_stays_retroactive():
+    """A duplicate echoing an id that is no longer pending is not our slot's
+    business — it must not disturb the current pending task."""
+    service, push_calls = _make_service()
+    service.configure({"task_timeout_seconds": 5.0})
+    service._client = _FakeClient()
+
+    runner, task_id = await _dispatch_and_get_id(service, "mine 10 logs")
+    await service._on_task_finished({"status": "duplicate", "task_id": "ghost-id"})
+    await asyncio.sleep(0.05)
+
+    assert not runner.done()
+    assert service._pending is not None and service._pending.task_id == task_id
+
+    await service._on_task_finished({"status": "ok", "task_id": task_id})
+    out = await asyncio.wait_for(runner, timeout=2.0)
+    assert out["status"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# identifier-shaped task text is refused at the entry
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "mine_block",
+        "query_inventory",
+        "GET_DIAMOND",
+        "mineDiamonds",
+        "goToCoordinates(118,64,-115,1)",
+        "  mine_block  ",
+    ],
+)
+def test_task_looks_like_identifier_true(text):
+    from plugin.plugins.game_agent_minecraft.service import task_looks_like_identifier
+
+    assert task_looks_like_identifier(text) is True
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "mine 4 oak logs nearby",
+        "挖钻石",
+        "stop",
+        "mine",
+        "Mine diamonds",
+        "walk to 120 64 -50",
+        "come here",
+        "",
+    ],
+)
+def test_task_looks_like_identifier_false(text):
+    from plugin.plugins.game_agent_minecraft.service import task_looks_like_identifier
+
+    assert task_looks_like_identifier(text) is False
+
+
+@pytest.mark.asyncio
+async def test_execute_rejects_identifier_task_before_claiming():
+    service, _ = _make_service()
+    service._client = _FakeClient()
+
+    out = await service.execute_minecraft_task(task="mine_block")
+
+    assert out["is_error"] is True
+    assert out["error"] == "INVALID_TASK"
+    assert service._pending is None
+    assert service._client.sent == []
+
+
+def test_task_tool_description_does_not_name_other_entries():
+    """The description must not contain identifier-shaped entry names the
+    model could copy into ``task`` (observed: ``query_inventory``)."""
+    from plugin.plugins.game_agent_minecraft import MINECRAFT_TASK_DESCRIPTION
+
+    assert "query_inventory" not in MINECRAFT_TASK_DESCRIPTION
+    assert "inventory" in MINECRAFT_TASK_DESCRIPTION

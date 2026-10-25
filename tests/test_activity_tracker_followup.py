@@ -14,12 +14,15 @@ to avoid touching the real user_preferences.json, and feeds a fabricated
 from __future__ import annotations
 
 import asyncio
+import inspect
 import time
 
 import pytest
 
 from main_logic.activity.snapshot import (
     ActivitySnapshot,
+    UnfinishedThread,
+    derive_propensity,
     derive_skip_probability,
     derive_tone,
     format_activity_state_section,
@@ -357,8 +360,8 @@ def test_count_thresholds_reject_non_integer_floats():
     """``window_switch_transition_threshold`` and
     ``unfinished_thread_max_followups`` are count-shaped — floats like
     ``0.9`` or ``1.7`` must NOT silently truncate to 0 / 1 (which would
-    break transitioning detection or cap unfinished_thread at 1 instead
-    of the user's intended 2). Loader-side validation only checks
+    break transitioning detection or turn a typo into an unintended
+    unfinished_thread override). Loader-side validation only checks
     "positive number"; the integer guard lives in ActivityStateMachine.
 
     Verify by direct ActivityPreferences construction (bypasses the
@@ -375,8 +378,8 @@ def test_count_thresholds_reject_non_integer_floats():
         f'non-integer float must fall back to default 5; '
         f'got {sm._window_switch_transition_threshold}'
     )
-    assert sm._unfinished_thread_max_followups == 2, (
-        f'non-integer float must fall back to default 2; '
+    assert sm._unfinished_thread_max_followups == 1, (
+        f'non-integer float must fall back to default 1; '
         f'got {sm._unfinished_thread_max_followups}'
     )
 
@@ -420,7 +423,7 @@ def test_loader_drops_invalid_threshold_values():
     ('chatting',        None,           None,     'warm'),
     ('stale_returning', None,           None,     'warm'),
     ('focused_work',    None,           None,     'concise'),
-    # ``idle`` while desk-pet is up reads as 摸鱼 territory — pair with
+    # ``idle`` while the desk pet is up reads as a goofing-off state — pair it with
     # ``playful`` (light banter) instead of the businesslike ``concise``.
     # ``transitioning`` and ``away`` keep ``concise``: the former is
     # mid-context-switch, the latter doesn't render.
@@ -454,15 +457,15 @@ def _witty_snapshot() -> ActivitySnapshot:
 
 
 @pytest.mark.unit
-# zh/ja/ko/ru/en 是 _normalize_lang 能区分出的全部语言；es/pt 经 _normalize_lang
-# 回退 en，这里一并断言它们至少拿到 en 质量闸（而非什么都没有）。
+# zh/ja/ko/ru/en are all languages that _normalize_lang can distinguish; es/pt fall back to en through _normalize_lang
+# so assert here that they at least receive the en quality bar (rather than none).
 @pytest.mark.parametrize('lang', ['zh', 'en', 'ja', 'ko', 'ru', 'es', 'pt'])
 def test_witty_quality_bar_renders(lang):
-    """``witty`` 渲染时必须带上「没梗就 [PASS]」质量闸（区别于其它语气）。
+    """``witty`` output must include the \"if there's no joke, use [PASS]\" quality bar (unlike other tones).
 
-    回归保护：质量闸是 witty 专属的额外一行，靠 ACTIVITY_TONE_QUALITY_BARS +
-    formatter 的 .get(tone) 渲染。若任一环节回归（漏渲染 / 表里缺 lang），
-    entertainment 就退回「有啥说啥」，丢掉「没梗宁可不说」的产品意图。
+    Regression guard: the quality bar is an extra line exclusive to witty, rendered through ACTIVITY_TONE_QUALITY_BARS +
+    formatter's .get(tone). If either stage regresses (line omitted / language missing from the table),
+    entertainment falls back to \"say whatever comes to mind\", losing the product intent of \"if there's no joke, say nothing\".
     """
     out = format_activity_state_section(_witty_snapshot(), lang=lang)
     assert '[PASS]' in out, f'{lang}: witty 质量闸（[PASS] 指令）未渲染'
@@ -470,7 +473,7 @@ def test_witty_quality_bar_renders(lang):
 
 @pytest.mark.unit
 def test_non_witty_tone_has_no_quality_bar():
-    """非 witty 语气不应渲染质量闸——它是 witty 专属，别误伤其它语气。"""
+    """Non-witty tones must not render the quality bar — it is exclusive to witty; do not affect other tones."""
     snap = ActivitySnapshot(
         state='idle', state_age_seconds=10.0, previous_state=None,
         transitioned_recently=False, stale_returning=False,
@@ -478,6 +481,77 @@ def test_non_witty_tone_has_no_quality_bar():
     )
     out = format_activity_state_section(snap, lang='zh')
     assert '[PASS]' not in out
+
+
+@pytest.mark.unit
+def test_activity_state_renders_open_threads_in_state_section():
+    snap = ActivitySnapshot(
+        state='idle', state_age_seconds=10.0, previous_state=None,
+        transitioned_recently=False, stale_returning=False,
+        propensity='open', tone='playful',
+        open_threads=['AI 答应等会帮看测试还没看'],
+    )
+
+    out = format_activity_state_section(snap, lang='zh')
+
+    assert '开放话题:' in out
+    assert '- AI 答应等会帮看测试还没看' in out
+
+
+@pytest.mark.unit
+def test_activity_state_unfinished_thread_hides_followup_count():
+    snap = ActivitySnapshot(
+        state='focused_work', state_age_seconds=10.0, previous_state=None,
+        transitioned_recently=False, stale_returning=False,
+        propensity='restricted_screen_only', tone='concise',
+        unfinished_thread=UnfinishedThread(
+            text='主人，你今天准备几点出发?',
+            age_seconds=60.0,
+            follow_up_count=0,
+            max_follow_ups=1,
+        ),
+    )
+
+    out = format_activity_state_section(snap, lang='zh')
+
+    assert '未收尾话题：「…主人，你今天准备几点出发?」(60s前)' in out
+    assert '已跟进' not in out
+    assert '/1' not in out
+
+
+@pytest.mark.unit
+def test_activity_state_line_uses_localized_label_not_english_enum():
+    """Regression: the state line renders only the localized label, never
+    the bare English enum (snap.state / snap.propensity). Weak models echo
+    a leaked enum as the reply's first line, so a zh user ends up hearing
+    'focused_work' / 'restricted_screen_only'."""
+    snap = ActivitySnapshot(
+        state='focused_work', state_age_seconds=10.0, previous_state=None,
+        transitioned_recently=False, stale_returning=False,
+        propensity='restricted_screen_only', tone='concise',
+    )
+    out = format_activity_state_section(snap, lang='zh')
+    assert '专注工作中' in out
+    assert 'focused_work' not in out
+    assert 'restricted_screen_only' not in out
+
+
+@pytest.mark.unit
+def test_activity_scores_line_maps_english_state_keys_to_localized_labels():
+    """Regression: the scores line maps English state keys to localized
+    labels instead of emitting 'focused_work' raw. The keys come from the
+    emotion-tier LLM under an English contract — the subtlest leak source."""
+    snap = ActivitySnapshot(
+        state='focused_work', state_age_seconds=10.0, previous_state=None,
+        transitioned_recently=False, stale_returning=False,
+        propensity='open', tone='concise',
+        activity_scores={'focused_work': 0.7, 'chatting': 0.2, 'idle': 0.1},
+    )
+    out = format_activity_state_section(snap, lang='zh')
+    assert '专注工作中 0.7' in out
+    assert '聊天中 0.2' in out
+    assert 'focused_work' not in out
+    assert 'chatting' not in out
 
 
 # ── #1 / skip_probability ───────────────────────────────────────────
@@ -491,8 +565,8 @@ def test_skip_probability_defaults():
     assert derive_skip_probability('idle') == 0.0
 
     # Gaming defaults — competitive intentionally dropped to 0 (was 0.3).
-    # 屏幕专注态的安静感现在由 /proactive_chat 的 base-interval×1.25 + 后端
-    # 抖动机制承担，skip_probability 只留 immersive_horror 这一例外。
+    # The quiet feel during focused screen activity is now handled by /proactive_chat's base-interval×1.25 plus the backend
+    # jitter mechanism; skip_probability remains only for the immersive_horror exception.
     assert derive_skip_probability('gaming', game_intensity='competitive') == 0.0
     assert derive_skip_probability(
         'gaming', game_intensity='immersive', game_genre='horror',
@@ -681,6 +755,421 @@ def test_loader_returns_defaults_when_no_activity_section(tmp_path):
     assert p.user_app_overrides == {}
 
 
+def test_conversation_turn_dispatcher_sends_messages_to_background_topic_pool():
+    from main_logic.conversation_turns import ConversationTurnDispatcher, TopicHookTurnSink
+
+    calls = []
+
+    class FakeTopicPool:
+        def note_user_message(self, lanlan_name, text, *, lang='zh'):
+            calls.append(('user', lanlan_name, text, lang))
+
+        def note_ai_message(self, lanlan_name, text, *, lang='zh'):
+            calls.append(('ai', lanlan_name, text, lang))
+
+    dispatcher = ConversationTurnDispatcher(
+        'test_lanlan',
+        language='zh-CN',
+        privacy_check=lambda: False,
+    )
+    dispatcher.add_sink(TopicHookTurnSink(pool_factory=lambda: FakeTopicPool()))
+
+    dispatcher.note_user_message(text='我想买凯迪拉克，但预算有点顶不住', now=1.0)
+    dispatcher.note_ai_message(text='别急着破釜沉舟，先看看预算。', now=2.0)
+
+    assert calls == [
+        ('user', 'test_lanlan', '我想买凯迪拉克，但预算有点顶不住', 'zh-CN'),
+        ('ai', 'test_lanlan', '别急着破釜沉舟，先看看预算。', 'zh-CN'),
+    ]
+
+
+def test_conversation_turn_dispatcher_uses_global_language_for_background_topic_pool(monkeypatch):
+    from main_logic.conversation_turns import ConversationTurnDispatcher, TopicHookTurnSink
+    from utils import language_utils
+
+    calls = []
+
+    class FakeTopicPool:
+        def note_user_message(self, lanlan_name, text, *, lang='zh'):
+            calls.append(('user', lanlan_name, text, lang))
+
+        def note_ai_message(self, lanlan_name, text, *, lang='zh'):
+            calls.append(('ai', lanlan_name, text, lang))
+
+    monkeypatch.setattr(language_utils, 'get_global_language', lambda: 'en-US')
+
+    dispatcher = ConversationTurnDispatcher('test_lanlan', privacy_check=lambda: False)
+    dispatcher.add_sink(TopicHookTurnSink(pool_factory=lambda: FakeTopicPool()))
+    dispatcher.note_user_message(text='I want a new phone but I am not sure about the price.', now=1.0)
+    dispatcher.note_ai_message(text='Fair, let us slow down before your wallet files a complaint.', now=2.0)
+
+    assert calls == [
+        ('user', 'test_lanlan', 'I want a new phone but I am not sure about the price.', 'en'),
+        ('ai', 'test_lanlan', 'Fair, let us slow down before your wallet files a complaint.', 'en'),
+    ]
+
+
+def test_conversation_turn_dispatcher_uses_session_language_for_background_topic_pool(monkeypatch):
+    from main_logic.conversation_turns import ConversationTurnDispatcher, TopicHookTurnSink
+    from utils import language_utils
+
+    calls = []
+
+    class FakeTopicPool:
+        def note_user_message(self, lanlan_name, text, *, lang='zh'):
+            calls.append(('user', lanlan_name, text, lang))
+
+        def note_ai_message(self, lanlan_name, text, *, lang='zh'):
+            calls.append(('ai', lanlan_name, text, lang))
+
+    monkeypatch.setattr(language_utils, 'get_global_language', lambda: 'en-US')
+
+    dispatcher = ConversationTurnDispatcher('test_lanlan', privacy_check=lambda: False)
+    dispatcher.add_sink(TopicHookTurnSink(pool_factory=lambda: FakeTopicPool()))
+    dispatcher.set_language('ja-JP')
+    dispatcher.note_user_message(text='転職について少し迷っています。', now=1.0)
+    dispatcher.note_ai_message(text='焦らず、次の条件を一緒に整理しよう。', now=2.0)
+
+    assert calls == [
+        ('user', 'test_lanlan', '転職について少し迷っています。', 'ja'),
+        ('ai', 'test_lanlan', '焦らず、次の条件を一緒に整理しよう。', 'ja'),
+    ]
+
+
+def test_conversation_turn_dispatcher_preserves_traditional_chinese_topic_locale():
+    from main_logic.conversation_turns import ConversationTurnDispatcher, TopicHookTurnSink
+
+    calls = []
+
+    class FakeTopicPool:
+        def note_user_message(self, lanlan_name, text, *, lang='zh'):
+            calls.append((lanlan_name, text, lang))
+
+    dispatcher = ConversationTurnDispatcher('test_lanlan', privacy_check=lambda: False)
+    dispatcher.add_sink(TopicHookTurnSink(pool_factory=lambda: FakeTopicPool()))
+    dispatcher.set_language('zh-TW')
+    dispatcher.note_user_message(text='我想用繁體中文聊最近的生活選擇', now=1.0)
+
+    assert calls == [('test_lanlan', '我想用繁體中文聊最近的生活選擇', 'zh-TW')]
+
+
+def test_conversation_turn_dispatcher_keeps_topic_text_in_privacy_mode():
+    from main_logic.conversation_turns import (
+        ActivityTrackerTurnSink,
+        ConversationTurnDispatcher,
+        TopicHookTurnSink,
+    )
+
+    activity_calls = []
+    topic_calls = []
+
+    class FakeActivityTracker:
+        def on_user_message(self, *, text=None, now=None):
+            activity_calls.append(('user', text, now))
+
+        def on_ai_message(self, *, text=None, now=None):
+            activity_calls.append(('ai', text, now))
+
+    class FakeTopicPool:
+        def note_user_message(self, lanlan_name, text, *, lang='zh'):
+            topic_calls.append(('user', lanlan_name, text, lang))
+
+        def note_ai_message(self, lanlan_name, text, *, lang='zh'):
+            topic_calls.append(('ai', lanlan_name, text, lang))
+
+    dispatcher = ConversationTurnDispatcher(
+        'test_lanlan',
+        language='zh-CN',
+        privacy_check=lambda: True,
+    )
+    dispatcher.add_sink(ActivityTrackerTurnSink(FakeActivityTracker()))
+    dispatcher.add_sink(TopicHookTurnSink(pool_factory=lambda: FakeTopicPool()))
+
+    dispatcher.note_user_message(text='secret user turn', now=1.0)
+    dispatcher.note_ai_message(text='secret ai turn?', now=2.0)
+
+    assert activity_calls == [
+        ('user', None, 1.0),
+        ('ai', None, 2.0),
+    ]
+    assert topic_calls == [
+        ('user', 'test_lanlan', 'secret user turn', 'zh-CN'),
+        ('ai', 'test_lanlan', 'secret ai turn?', 'zh-CN'),
+    ]
+
+
+def test_conversation_turn_dispatcher_redacts_when_privacy_check_fails():
+    from main_logic.conversation_turns import (
+        ActivityTrackerTurnSink,
+        ConversationTurnDispatcher,
+        TopicHookTurnSink,
+    )
+
+    activity_calls = []
+    topic_calls = []
+
+    class FakeActivityTracker:
+        def on_user_message(self, *, text=None, now=None):
+            activity_calls.append(('user', text, now))
+
+        def on_ai_message(self, *, text=None, now=None):
+            activity_calls.append(('ai', text, now))
+
+    class FakeTopicPool:
+        def note_user_message(self, lanlan_name, text, *, lang='zh'):
+            topic_calls.append(('user', lanlan_name, text, lang))
+
+        def note_ai_message(self, lanlan_name, text, *, lang='zh'):
+            topic_calls.append(('ai', lanlan_name, text, lang))
+
+    def broken_privacy_check():
+        raise RuntimeError("preference store unavailable")
+
+    dispatcher = ConversationTurnDispatcher(
+        'test_lanlan',
+        language='zh-CN',
+        privacy_check=broken_privacy_check,
+    )
+    dispatcher.add_sink(ActivityTrackerTurnSink(FakeActivityTracker()))
+    dispatcher.add_sink(TopicHookTurnSink(pool_factory=lambda: FakeTopicPool()))
+
+    dispatcher.note_user_message(text='secret user turn', now=1.0)
+
+    assert activity_calls == [('user', None, 1.0)]
+    assert topic_calls == [('user', 'test_lanlan', 'secret user turn', 'zh-CN')]
+
+
+def test_conversation_turn_dispatcher_sends_redacted_turns_to_topic_store():
+    from main_logic.conversation_turns import ConversationTurnDispatcher, TopicHookTurnSink
+
+    notes = []
+
+    class FakeTopicPool:
+        def note_user_message(self, lanlan_name, text, *, lang='zh'):
+            notes.append(('user', lanlan_name, text, lang))
+
+    dispatcher = ConversationTurnDispatcher(
+        'test_lanlan',
+        language='zh-CN',
+        privacy_check=lambda: True,
+    )
+    dispatcher.add_sink(TopicHookTurnSink(pool_factory=lambda: FakeTopicPool()))
+
+    dispatcher.note_user_message(text='secret user turn', now=1.0)
+
+    assert notes == [('user', 'test_lanlan', 'secret user turn', 'zh-CN')]
+
+
+def test_topic_turn_sink_ignores_activity_private_for_signal_store():
+    from main_logic.conversation_turns import ConversationTurnDispatcher, TopicHookTurnSink
+
+    notes = []
+
+    class FakeTopicPool:
+        def note_user_message(self, lanlan_name, text, *, lang='zh'):
+            notes.append(('user', lanlan_name, text, lang))
+
+    dispatcher = ConversationTurnDispatcher(
+        'test_lanlan',
+        language='zh-CN',
+        privacy_check=lambda: False,
+    )
+    dispatcher.add_sink(
+        TopicHookTurnSink(
+            pool_factory=lambda: FakeTopicPool(),
+            activity_private_check=lambda: True,
+        )
+    )
+
+    dispatcher.note_user_message(text='private foreground turn', now=1.0)
+
+    assert notes == [('user', 'test_lanlan', 'private foreground turn', 'zh-CN')]
+
+
+def test_activity_guess_loop_kicks_topic_candidates_before_private_bail():
+    from main_logic.activity.tracker import UserActivityTracker
+
+    source = inspect.getsource(UserActivityTracker._activity_guess_loop)
+    assert "self._process_topic_candidates_if_ready(lang=topic_lang, now=ts)" in source
+    assert "await self._purge_topic_candidates_for_privacy()" not in source
+    assert source.index("self._process_topic_candidates_if_ready(lang=topic_lang, now=ts)") < source.index("if rule_snap.state == 'private':")
+    assert source.index("if rule_snap.state == 'private':") < source.index("if not _proactive_chat_enabled():")
+
+
+def test_activity_guess_gate_wired_with_production_backoff_knobs():
+    """config → tracker → gate wiring carries the user-tuned faster-decay
+    schedule: 4x growth per re-narration, capped at 900s (aligned with the
+    15-min away threshold)."""
+    from main_logic.activity.tracker import UserActivityTracker
+    from config import (
+        ACTIVITY_GUESS_BACKOFF_BASE_SECONDS,
+        ACTIVITY_GUESS_BACKOFF_MULTIPLIER,
+        ACTIVITY_GUESS_BACKOFF_CAP_SECONDS,
+    )
+
+    tracker = UserActivityTracker('test_lanlan')
+    gate = tracker._activity_guess_gate
+    assert gate._base == ACTIVITY_GUESS_BACKOFF_BASE_SECONDS
+    assert gate._mult == ACTIVITY_GUESS_BACKOFF_MULTIPLIER
+    assert gate._cap == max(
+        ACTIVITY_GUESS_BACKOFF_CAP_SECONDS, ACTIVITY_GUESS_BACKOFF_BASE_SECONDS,
+    )
+    # Pin the user's headline ask so a silent revert to the old 2x/600s is caught.
+    assert ACTIVITY_GUESS_BACKOFF_MULTIPLIER == 4.0
+    assert ACTIVITY_GUESS_BACKOFF_CAP_SECONDS == 900.0
+
+
+def test_narration_suppressed_check_defaults_and_injection():
+    from main_logic.activity.tracker import UserActivityTracker
+
+    tracker = UserActivityTracker('test_lanlan')
+
+    # No predicate injected → never suppressed (old behavior preserved).
+    assert tracker._is_narration_suppressed() is False
+
+    # Predicate returning True → suppressed.
+    tracker.set_narration_suppressed_check(lambda: True)
+    assert tracker._is_narration_suppressed() is True
+
+    # Predicate returning False → not suppressed.
+    tracker.set_narration_suppressed_check(lambda: False)
+    assert tracker._is_narration_suppressed() is False
+
+    # Raising predicate → fail-open (don't suppress, don't crash the heartbeat).
+    def _boom():
+        raise RuntimeError('boom')
+
+    tracker.set_narration_suppressed_check(_boom)
+    assert tracker._is_narration_suppressed() is False
+
+    # Cleared → back to never suppressed.
+    tracker.set_narration_suppressed_check(None)
+    assert tracker._is_narration_suppressed() is False
+
+
+def test_activity_guess_loop_skips_llm_when_narration_suppressed():
+    """The narration-suppressed gate sits with the other no-consumer skips:
+    after the proactive-disabled gate, before the away bail, and uses the
+    fail-open helper rather than calling the predicate inline."""
+    from main_logic.activity.tracker import UserActivityTracker
+
+    source = inspect.getsource(UserActivityTracker._activity_guess_loop)
+    assert "if self._is_narration_suppressed():" in source
+    assert (
+        source.index("if not _proactive_chat_enabled():")
+        < source.index("if self._is_narration_suppressed():")
+    )
+    assert (
+        source.index("if self._is_narration_suppressed():")
+        < source.index("if rule_snap.state == 'away':")
+    )
+
+
+def test_activity_guess_signature_excludes_idle_bucket():
+    """The activity_guess gate must not key on monotonically-growing idle time.
+
+    While AFK, system_idle_seconds keeps climbing; an earlier version folded
+    idle//30 into the dedup signature, flipping it every ~30s and burning one
+    emotion-tier LLM call every ~40s during pure idle. The gate now keys on a
+    coarse ``(state, window-category)`` signature handed to ActivityGuessGate
+    (per-signature backoff + novelty bypass); idle seconds never enter it. The
+    active->idle->away transition is still caught by state (away bails anyway).
+    """
+    from main_logic.activity.tracker import UserActivityTracker
+
+    from types import SimpleNamespace
+
+    loop_source = inspect.getsource(UserActivityTracker._activity_guess_loop)
+    sig_source = inspect.getsource(UserActivityTracker._coarse_activity_sig)
+    # idle_bucket is the variable name from the old signature that bucketed idle seconds (the cause of wasted work); asserting it
+    # does not regress precisely protects that behavior. Do not assert "system_idle_seconds" not in source: that is broader
+    # than the target constraint and would wrongly reject other harmless future uses of idle seconds in the loop (LLM input
+    # signals still use it in the separate _snapshot_signals_for_llm method).
+    assert "idle_bucket" not in loop_source
+    assert "idle_bucket" not in sig_source
+    assert "self._activity_guess_gate.should_fire(" in loop_source
+    # Behaviour (not just the comment): the coarse key is (state, category) —
+    # different category → different key; same category but different
+    # canonical/subcategory → SAME key (coarsening), so window flicker within a
+    # category does not re-narrate.
+    work = SimpleNamespace(
+        state='focused_work',
+        active_window=SimpleNamespace(category='work', canonical='IDE', subcategory='code'),
+    )
+    chat = SimpleNamespace(
+        state='focused_work',
+        active_window=SimpleNamespace(category='chat', canonical='IM', subcategory='dm'),
+    )
+    same_bucket = SimpleNamespace(
+        state='focused_work',
+        active_window=SimpleNamespace(category='work', canonical='Browser', subcategory='docs'),
+    )
+    assert (UserActivityTracker._coarse_activity_sig(work)
+            != UserActivityTracker._coarse_activity_sig(chat))
+    assert (UserActivityTracker._coarse_activity_sig(work)
+            == UserActivityTracker._coarse_activity_sig(same_bucket))
+
+
+def test_conversation_turn_dispatcher_does_not_purge_topic_signals_for_redacted_turns():
+    from main_logic.conversation_turns import ConversationTurnDispatcher, TopicHookTurnSink
+
+    purges = []
+    notes = []
+
+    class FakeTopicPool:
+        def purge_all_accumulated_signals(self):
+            purges.append("*")
+
+        def purge_accumulated_signals(self, lanlan_name):
+            purges.append(lanlan_name)
+
+        def note_user_message(self, lanlan_name, text, *, lang='zh'):
+            notes.append(('user', lanlan_name, text, lang))
+
+    dispatcher = ConversationTurnDispatcher(
+        'test_lanlan',
+        language='zh-CN',
+        privacy_check=lambda: True,
+    )
+    dispatcher.add_sink(TopicHookTurnSink(pool_factory=lambda: FakeTopicPool()))
+
+    dispatcher.note_user_message(text='secret user turn', now=1.0)
+
+    assert purges == []
+    assert notes == [('user', 'test_lanlan', 'secret user turn', 'zh-CN')]
+
+
+def test_topic_turn_sink_keeps_current_character_when_activity_is_private():
+    from main_logic.conversation_turns import ConversationTurnDispatcher, TopicHookTurnSink
+
+    purges = []
+    notes = []
+
+    class FakeTopicPool:
+        def purge_accumulated_signals(self, lanlan_name):
+            purges.append(lanlan_name)
+
+        def note_user_message(self, lanlan_name, text, *, lang='zh'):
+            notes.append(('user', lanlan_name, text, lang))
+
+    dispatcher = ConversationTurnDispatcher(
+        'test_lanlan',
+        language='zh-CN',
+        privacy_check=lambda: False,
+    )
+    dispatcher.add_sink(
+        TopicHookTurnSink(
+            pool_factory=lambda: FakeTopicPool(),
+            activity_private_check=lambda: True,
+        )
+    )
+
+    dispatcher.note_user_message(text='private foreground turn', now=1.0)
+
+    assert purges == []
+    assert notes == [('user', 'test_lanlan', 'private foreground turn', 'zh-CN')]
+
+
 # ── Hot-reload (Codex P2) ───────────────────────────────────────────
 
 
@@ -807,7 +1296,7 @@ def test_update_window_collapses_on_canonical_but_invalidates_on_intensity_chang
 
 def test_mark_unfinished_thread_used_honors_threshold_override():
     """When prefs set max_followups=3, the cap retires the thread on the
-    third call (not the second — the module constant default)."""
+    third call, proving explicit integer overrides still win over the default."""
     prefs = ActivityPreferences(
         thresholds={'unfinished_thread_max_followups': 3.0},
     )
@@ -1038,25 +1527,25 @@ def _tick_for_seconds(tracker, *, state: str, seconds: float, step: float = 20.0
 
 @pytest.mark.unit
 def test_context_prompt_reemits_after_session_baseline_reset():
-    """跨 session 仍在同一状态时，reset 基线后应重新算作「进入」再置 pending。
+    """When the same state continues across sessions, resetting the baseline should count it as a new entry and set pending again.
 
-    回归保护 Codex P2：tracker 跨 session 长存，若不在 session 开始清情境弹窗基线，
-    「上个 session 在游戏、新 session 仍在游戏」就检测不到进入、漏弹。也确认这只动情境
-    弹窗专属基线、状态保持期间不会重复触发。
+    Regression guard for Codex P2: the tracker persists across sessions. If the contextual-popup baseline is not cleared at session start,
+    \"gaming in the previous session and still gaming in the new session\" will not register entry, so the popup is missed. Also confirms only the baseline
+    specific to contextual popups changes and that it does not trigger repeatedly while the state persists.
     """
     tracker = _make_tracker_for_break_tests()
 
-    # session A：进入 gaming → 置 play pending
+    # Session A: enter gaming → set play pending
     tracker._tick_break_reminders(_snap_for_state('gaming', app='Game'), now=1000.0)
     assert tracker._context_prompt_pending is not None
     assert tracker._context_prompt_pending['context'] == 'play'
 
-    # 模拟 drain 消费掉；仍在 gaming → 状态保持，下一 tick 不重复触发
+    # Simulate drain consuming it; still gaming → state persists, and the next tick does not trigger again
     tracker._context_prompt_pending = None
     tracker._tick_break_reminders(_snap_for_state('gaming', app='Game'), now=1020.0)
     assert tracker._context_prompt_pending is None
 
-    # 新 session：清基线 → 仍在 gaming 也重新算「进入」→ 再置 play pending
+    # New session: clear baseline → still gaming counts as entering again → set play pending again
     tracker.reset_context_prompt_baseline()
     tracker._tick_break_reminders(_snap_for_state('gaming', app='Game'), now=1040.0)
     assert tracker._context_prompt_pending is not None
@@ -1065,20 +1554,48 @@ def test_context_prompt_reemits_after_session_baseline_reset():
 
 @pytest.mark.unit
 def test_context_prompt_pending_cleared_on_leaving_target_state():
-    """进游戏置 pending 后、还没 drain 就切到非目标态(idle) → 过期 pending 应被清掉。
+    """After entering a game and setting pending, switching to a non-target state (idle) before drain → the expired pending item must be cleared.
 
-    回归保护 Codex P2：pending 可能由 get_snapshot 路径（实验组 kick）置、还没等 loop
-    drain，用户就离开了游戏/工作；不清就会把已离开的场景推成过期弹窗。
+    Regression guard for Codex P2: pending may be set through the get_snapshot path (experimental-group kick) before the loop
+    drains it, and the user may leave the game/work before then; without clearing it, an expired popup would be pushed for a scene the user left.
     """
     tracker = _make_tracker_for_break_tests()
 
-    # 进 gaming → 置 play pending（模拟 get_snapshot 置、未 drain）
+    # Enter gaming → set play pending (simulate get_snapshot setting it, not yet drained)
     tracker._tick_break_reminders(_snap_for_state('gaming', app='Game'), now=1000.0)
     assert tracker._context_prompt_pending is not None
 
-    # 切到 idle（非目标态）→ 过期 pending 被清
+    # Switch to idle (not a target state) → clear the expired pending item
     tracker._tick_break_reminders(_snap_for_state('idle', app=None), now=1020.0)
     assert tracker._context_prompt_pending is None
+
+
+@pytest.mark.unit
+def test_context_prompt_is_consumed_without_push_during_internal_game(monkeypatch):
+    """Do not prompt for screen sharing while an internal game route is active."""
+    tracker = _make_tracker_for_break_tests()
+    tracker._context_prompt_pending = {'context': 'play', 'set_at': 1000.0}
+    pushed = []
+    route_active = {'value': True}
+
+    async def _push(context):
+        pushed.append(context)
+
+    tracker.set_context_prompt_callback(_push)
+    monkeypatch.setattr(
+        'main_logic.activity.tracker.is_external_route_active',
+        lambda lanlan_name: lanlan_name == 'test_lanlan' and route_active['value'],
+    )
+
+    asyncio.run(tracker._drain_context_prompt())
+
+    assert tracker._context_prompt_pending is None
+    assert pushed == []
+
+    route_active['value'] = False
+    tracker._context_prompt_pending = {'context': 'work', 'set_at': 1020.0}
+    asyncio.run(tracker._drain_context_prompt())
+    assert pushed == ['work']
 
 
 def test_break_acc_advances_during_focused_work():
@@ -1470,3 +1987,158 @@ def test_loader_wires_work_break_game_invite_probability(tmp_path):
     prefs = _load_from_file(str(pref_file))
     assert prefs is not None
     assert prefs.work_break_game_invite_probability is None
+
+
+# ── focused_video (immersive video watching) ────────────────────────
+#
+# Placed at the end of the file deliberately: the docstring-cjk ratchet
+# (scripts/check_docstring_no_cjk.py) flags CJK docstrings whose line span
+# overlaps diff-added lines. ``test_witty_quality_bar_renders`` above carries
+# an intentional CJK docstring; appending here keeps it out of this change's
+# diff range so it isn't re-flagged.
+
+
+def _video_prefs(*, focused=100, casual=10) -> ActivityPreferences:
+    """ActivityPreferences classifying player.exe as entertainment/video.
+
+    Uses a small focused_video / casual_browsing dwell threshold so tests
+    can cross them with modest fabricated time deltas.
+    """
+    return ActivityPreferences(
+        user_app_overrides={
+            'player.exe': _AppOverride(
+                category='entertainment', subcategory='video', canonical='Player',
+            ),
+            'editor.exe': _AppOverride(
+                category='work', subcategory='ide', canonical='Editor',
+            ),
+        },
+        thresholds={
+            'focused_video_min_dwell_seconds': focused,
+            'casual_browsing_min_dwell_seconds': casual,
+        },
+    )
+
+
+def test_focused_video_propensity_and_tone():
+    """focused_video reuses restricted_screen_only propensity + witty tone.
+
+    Both are deliberate reuse (no new propensity / tone added): the
+    propensity cuts music/meme/web while keeping screen snark, and witty
+    carries the same "[PASS] if you have nothing funny" quality bar as
+    casual_browsing.
+    """
+    assert derive_propensity('focused_video') == 'restricted_screen_only'
+    assert derive_tone('focused_video') == 'witty'
+
+
+def test_focused_video_fires_after_sustained_dwell():
+    """Video window below the dwell bar stays casual_browsing; past it flips.
+
+    The high threshold is the "don't trip on a freshly opened clip" gate.
+    """
+    prefs = _video_prefs(focused=100, casual=10)
+    sm = ActivityStateMachine(prefs=prefs)
+    video = _sys_snap(title='Long Movie', process='player.exe')
+    t0 = 1000.0
+    sm.update_system(video)
+    sm.update_window(observation_from_system(video, prefs), now=t0)
+
+    # Below focused_video threshold → casual_browsing (open) — just a clip.
+    early = sm.get_snapshot(now=t0 + 50)
+    assert early.state == 'casual_browsing'
+    assert early.propensity == 'open'
+
+    # Past threshold → focused_video (restricted + witty).
+    late = sm.get_snapshot(now=t0 + 120)
+    assert late.state == 'focused_video'
+    assert late.propensity == 'restricted_screen_only'
+    assert late.tone == 'witty'
+    codes = [code for code, _ in late.propensity_reasons]
+    assert 'state_focused_video' in codes
+
+
+def test_focused_video_dwell_resets_on_window_switch():
+    """Continuity: switching to a non-video window resets the dwell clock.
+
+    Watching a video, flicking to a work window, then back to the video
+    restarts the dwell timer — so the user doesn't slide into focused_video
+    on accumulated-but-interrupted watch time. This is what keeps
+    "work while a video plays in the corner" on the open (casual) side.
+    """
+    prefs = _video_prefs(focused=100, casual=10)
+    sm = ActivityStateMachine(prefs=prefs)
+    video = _sys_snap(title='Ep 1', process='player.exe')
+    work = _sys_snap(title='main.py', process='editor.exe')
+    t0 = 1000.0
+
+    # Watch video, approaching the focused_video threshold but not crossing.
+    sm.update_system(video)
+    sm.update_window(observation_from_system(video, prefs), now=t0)
+    assert sm.get_snapshot(now=t0 + 80).state == 'casual_browsing'
+
+    # Flick to a work window (dwell resets), then back to the video.
+    sm.update_window(observation_from_system(work, prefs), now=t0 + 90)
+    sm.update_system(video)
+    sm.update_window(observation_from_system(video, prefs), now=t0 + 100)
+
+    # Only 50s on the video since switching back → still casual_browsing,
+    # even though absolute time since t0 (150s) is well past the threshold.
+    snap = sm.get_snapshot(now=t0 + 150)
+    assert snap.state == 'casual_browsing'
+    assert snap.propensity == 'open'
+
+
+def test_non_video_entertainment_never_upgrades_to_focused_video():
+    """Non-video entertainment (social/etc) stays casual_browsing forever.
+
+    Only subcategory video/live can reach focused_video; other
+    entertainment dwell, however long, stays on the open side.
+    """
+    prefs = ActivityPreferences(
+        user_app_overrides={
+            'social.exe': _AppOverride(
+                category='entertainment', subcategory='social', canonical='SocialApp',
+            ),
+        },
+        thresholds={
+            'focused_video_min_dwell_seconds': 100,
+            'casual_browsing_min_dwell_seconds': 10,
+        },
+    )
+    sm = ActivityStateMachine(prefs=prefs)
+    sn = _sys_snap(title='Feed', process='social.exe')
+    t0 = 1000.0
+    sm.update_system(sn)
+    sm.update_window(observation_from_system(sn, prefs), now=t0)
+
+    snap = sm.get_snapshot(now=t0 + 500)  # way past focused_video threshold
+    assert snap.state == 'casual_browsing'
+    assert snap.propensity == 'open'
+
+
+def test_focused_video_default_dwell_threshold_is_120():
+    """Default FOCUSED_VIDEO_MIN_DWELL_SECONDS is 120s (2 min)."""
+    from main_logic.activity.state_machine import FOCUSED_VIDEO_MIN_DWELL_SECONDS
+
+    assert FOCUSED_VIDEO_MIN_DWELL_SECONDS == 120.0
+
+    # No threshold override → the instance picks up the code default.
+    prefs = ActivityPreferences(
+        user_app_overrides={
+            'player.exe': _AppOverride(
+                category='entertainment', subcategory='video', canonical='Player',
+            ),
+        },
+    )
+    sm = ActivityStateMachine(prefs=prefs)
+    assert sm._focused_video_min_dwell_seconds == 120.0
+
+    video = _sys_snap(title='Cool Video', process='player.exe')
+    t0 = 1000.0
+    sm.update_system(video)
+    sm.update_window(observation_from_system(video, prefs), now=t0)
+    # Just under the 120s default → casual_browsing (30s default already cleared).
+    assert sm.get_snapshot(now=t0 + 119).state == 'casual_browsing'
+    # Just past it → focused_video.
+    assert sm.get_snapshot(now=t0 + 121).state == 'focused_video'

@@ -915,6 +915,14 @@
         }
     }
 
+    function refreshCompactInteractionGeometry() {
+        try {
+            window.dispatchEvent(new CustomEvent('neko:compact-interaction-geometry-refresh'));
+        } catch (_) {
+            // 非紧凑窗口不提供几何桥，普通网页弹窗无需额外处理。
+        }
+    }
+
     function temporarilyHideReactChatOverlayForModal(modalConfig) {
         if (!modalConfig || modalConfig.skin !== 'autostart-retention') {
             return function noop() {};
@@ -950,6 +958,7 @@
         return new Promise((resolve) => {
             const modalConfig = config || {};
             const isAutostartRetentionSkin = modalConfig.skin === 'autostart-retention';
+            const isTheaterSkin = modalConfig.skin === 'theater';
             const isDecisionPrompt = modalConfig.type === 'decision';
             const restoreObscuredUi = temporarilyHideReactChatOverlayForModal(modalConfig);
             let settled = false;
@@ -964,6 +973,8 @@
             overlay.className = 'modal-overlay';
             if (isAutostartRetentionSkin) {
                 overlay.classList.add('modal-overlay-autostart-retention');
+            } else if (isTheaterSkin) {
+                overlay.classList.add('modal-overlay-theater');
             }
 
             // 创建对话框
@@ -971,6 +982,13 @@
             dialog.className = 'modal-dialog';
             if (isAutostartRetentionSkin) {
                 dialog.classList.add('modal-dialog-autostart-retention');
+            } else if (isTheaterSkin) {
+                dialog.classList.add('modal-dialog-theater');
+                // 公共弹窗位于 React 根节点之外，必须单独登记为透明桌面窗口的原生命中岛。
+                dialog.setAttribute('data-compact-geometry-owner', 'surface');
+                dialog.setAttribute('data-compact-geometry-item', 'theaterModal');
+                // 弹窗打开时先聚焦容器，避免程序焦点让第一个按钮误显示成已选择状态。
+                dialog.tabIndex = -1;
             }
             dialog.setAttribute('role', 'dialog');
             dialog.setAttribute('aria-modal', 'true');
@@ -1144,11 +1162,13 @@
                     }
                 }
                 document.removeEventListener('keydown', escHandler);
-                overlay.style.animation = 'fadeOut 0.2s ease-out';
+                // 动画与 DOM 清理均为 200ms；保持末帧，避免两者调度错开时闪回可见状态。
+                overlay.style.animation = 'fadeOut 0.2s ease-out forwards';
                 setTimeout(() => {
                     if (overlay.parentNode) {
                         overlay.parentNode.removeChild(overlay);
                     }
+                    if (isTheaterSkin) refreshCompactInteractionGeometry();
                     if (isDecisionPrompt) {
                         emitDecisionPromptLifecycleEvent('neko:decision-prompt-closed', {
                             skin: modalConfig.skin || '',
@@ -1314,6 +1334,12 @@
 
             // 添加到页面
             document.body.appendChild(overlay);
+            if (isTheaterSkin) {
+                refreshCompactInteractionGeometry();
+                // 弹入动画使用 transform；动画结束后再上报一次最终命中区域，避免透明窗口沿用起始位置。
+                dialog.addEventListener('animationend', refreshCompactInteractionGeometry, { once: true });
+                window.setTimeout(refreshCompactInteractionGeometry, 320);
+            }
             if (isDecisionPrompt) {
                 emitDecisionPromptLifecycleEvent('neko:decision-prompt-opened', {
                     skin: modalConfig.skin || '',
@@ -1328,6 +1354,7 @@
                             return modalConfig.onShown({
                                 overlay: overlay,
                                 dialog: dialog,
+                                close: finish,
                             });
                         })
                         .catch(function (error) {
@@ -1346,6 +1373,8 @@
                 if (input) {
                     input.focus();
                     input.select();
+                } else if (isTheaterSkin) {
+                    dialog.focus();
                 } else {
                     const primaryBtn = footer.querySelector('.modal-btn-primary');
                     const firstBtn = footer.querySelector('.modal-btn');
@@ -1396,6 +1425,8 @@
             okText: options.okText,
             cancelText: options.cancelText,
             danger: options.danger || false,
+            skin: options.skin,
+            onResolve: options.onResolve,
         });
         console.log('[showConfirm] 返回 Promise:', promise);
         return promise;
@@ -1473,6 +1504,9 @@
  */
 (function() {
     'use strict';
+
+    // Pages can reuse dialogs while retaining their existing keyboard and zoom behavior.
+    if (document.currentScript?.dataset.dialogsOnly === 'true') return;
     
     // 禁用 Ctrl+/-、Ctrl+0 和 Ctrl/Cmd+W 键盘快捷键
     document.addEventListener('keydown', function(event) {
@@ -1533,6 +1567,7 @@
     const SHARED_NAMED_WINDOW_PREFIX = 'neko:named-window:';
     const SHARED_NAMED_WINDOW_FOCUS_PREFIX = 'neko:named-window-focus:';
     const SHARED_NAMED_WINDOW_TTL_MS = 5000;
+    const MODEL_MANAGER_SINGLETON_WINDOW_NAME = 'neko_model_manager_singleton';
     
     /**
      * 打开或聚焦窗口
@@ -1542,7 +1577,11 @@
      * @param {string} url - 要打开的 URL
      * @param {string} windowName - 窗口名称（用于标识和重用）
      * @param {string} [features] - 窗口特性（可选，默认为标准设置窗口）
-     * @param {{navigateOnReuse?: boolean}} [options] - 复用同名窗口时是否强制导航
+     * @param {{navigateOnReuse?: boolean, onReuse?: Function, shouldNavigateOnReuse?: Function, preserveGeometryOnReuse?: boolean, delegateNavigationToSharedWindow?: boolean}} [options] - 复用同名窗口时的行为
+     *   - preserveGeometryOnReuse: 复用已有窗口时不按 features 重设尺寸/位置（保留用户拖动后的窗口）
+     *   - delegateNavigationToSharedWindow: navigateOnReuse 时若没有本地 handle 但同名窗口已在共享登记中活跃，
+     *     不再用 window.open(name) 直接导航（会丢掉目标页未保存内容），而是把目标 URL 以
+     *     { type: 'neko:navigate-on-reuse', url } 消息发给该窗口，由它自行确认后跳转
      * @returns {Window|null} - 返回窗口对象
      */
     window.openOrFocusWindow = function(url, windowName, features, options) {
@@ -1551,34 +1590,69 @@
         features = features || defaultFeatures;
         const targetUrl = resolveOpenedWindowUrl(url);
         const normalizedOptions = options && typeof options === 'object' ? options : {};
+        const isModelManager = isModelManagerWindowUrl(targetUrl);
+        const effectiveWindowName = isModelManager
+            ? MODEL_MANAGER_SINGLETON_WINDOW_NAME
+            : windowName;
 
         // 检查窗口是否已打开且未关闭
-        const existingWindow = window._openedWindows[windowName];
+        const existingWindow = window._openedWindows[effectiveWindowName];
         if (existingWindow && !existingWindow.closed) {
-            if (normalizedOptions.navigateOnReuse) {
+            if (isModelManager) {
+                if (typeof normalizedOptions.onReuse === 'function') {
+                    normalizedOptions.onReuse();
+                }
+                requestOpenedWindowRestoreIfMinimized(existingWindow);
+                return existingWindow;
+            }
+            if (normalizedOptions.navigateOnReuse
+                && (typeof normalizedOptions.shouldNavigateOnReuse !== 'function'
+                    || normalizedOptions.shouldNavigateOnReuse(existingWindow, targetUrl) !== false)) {
                 navigateOpenedWindow(existingWindow, targetUrl, !!normalizedOptions.navigateOnReuse);
             }
-            applyOpenedWindowFeatures(existingWindow, features);
+            if (!normalizedOptions.preserveGeometryOnReuse) {
+                applyOpenedWindowFeatures(existingWindow, features);
+            }
             requestOpenedWindowRestore(existingWindow);
             existingWindow.focus();
             return existingWindow;
         }
 
-        if (!normalizedOptions.navigateOnReuse && isSharedNamedWindowActive(windowName)) {
-            requestSharedNamedWindowFocus(windowName);
-            return createSharedNamedWindowProxy(windowName);
+        const delegateNavigation = !!(normalizedOptions.navigateOnReuse
+            && normalizedOptions.delegateNavigationToSharedWindow);
+        if ((!normalizedOptions.navigateOnReuse || delegateNavigation)
+            && isSharedNamedWindowActive(effectiveWindowName)) {
+            if (typeof normalizedOptions.onReuse === 'function') {
+                normalizedOptions.onReuse();
+            }
+            requestSharedNamedWindowFocus(
+                effectiveWindowName,
+                delegateNavigation ? { type: 'neko:navigate-on-reuse', url: targetUrl } : undefined
+            );
+            return createSharedNamedWindowProxy(effectiveWindowName);
         }
 
         // 没有本地 handle 且目标页未登记为活跃时，直接按 URL 打开。
         // 避免先打开 about:blank；部分 Electron/window.open handler 会因此卡住。
-        const newWindow = window.open(targetUrl, windowName, features);
+        const newWindow = window.open(targetUrl, effectiveWindowName, features);
         if (newWindow) {
-            cacheOpenedWindow(windowName, newWindow);
+            cacheOpenedWindow(effectiveWindowName, newWindow);
             applyOpenedWindowFeatures(newWindow, features);
-            requestOpenedWindowRestore(newWindow);
+            if (!isModelManager) requestOpenedWindowRestore(newWindow);
         }
         return newWindow;
     };
+
+    function isModelManagerWindowUrl(url) {
+        try {
+            const pathname = new URL(url, window.location.href).pathname;
+            return pathname === '/model_manager' || pathname === '/l2d';
+        } catch (_) {
+            return false;
+        }
+    }
+
+    window.isModelManagerWindowUrl = isModelManagerWindowUrl;
 
     function isReusableNamedWindowName(windowName) {
         if (!windowName) return false;
@@ -1725,6 +1799,30 @@
 
     window.requestOpenedWindowRestore = requestOpenedWindowRestore;
 
+    function requestOpenedWindowRestoreIfMinimized(targetWindow) {
+        if (!targetWindow || targetWindow.closed) return;
+        var hasNativeRestoreBridge = false;
+        try {
+            var targetWindowControl = targetWindow.nekoWindowControl;
+            hasNativeRestoreBridge = !!(
+                targetWindowControl &&
+                typeof targetWindowControl.restoreIfMinimized === 'function'
+            );
+        } catch (_) {}
+        try {
+            targetWindow.postMessage({ type: 'neko:restore-window-if-minimized' }, window.location.origin);
+        } catch (_) {}
+        if (!hasNativeRestoreBridge) {
+            try {
+                if (targetWindow.document && targetWindow.document.hidden === true) {
+                    targetWindow.focus();
+                }
+            } catch (_) {}
+        }
+    }
+
+    window.requestOpenedWindowRestoreIfMinimized = requestOpenedWindowRestoreIfMinimized;
+
     /**
      * 计算「在当前所在显示器可用区域内居中」的 window.open features 字符串。
      * 多显示器下 window.open 的 left/top 是相对整个虚拟桌面原点的坐标，必须叠加当前屏幕
@@ -1767,12 +1865,19 @@
 
     window.addEventListener('message', function(event) {
         if (event.origin !== window.location.origin) return;
-        if (!event.data || event.data.type !== 'neko:restore-window') return;
+        if (!event.data) return;
         const api = window.nekoWindowControl;
-        if (!api || typeof api.restore !== 'function') return;
-        Promise.resolve(api.restore()).catch(function() {
-            // 非 Electron 环境下忽略
-        });
+        if (!api) return;
+        if (event.data.type === 'neko:restore-window-if-minimized') {
+            if (typeof api.restoreIfMinimized !== 'function') return;
+            Promise.resolve(api.restoreIfMinimized()).catch(function() {});
+            return;
+        }
+        if (event.data.type === 'neko:restore-window' && typeof api.restore === 'function') {
+            Promise.resolve(api.restore()).catch(function() {
+                // 非 Electron 环境下忽略
+            });
+        }
     });
     
     /**

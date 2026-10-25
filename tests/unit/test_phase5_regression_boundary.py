@@ -1,47 +1,55 @@
 """
-Phase 5 — 回归与边界验证：静态契约测试
+Phase 5 — Regression and boundary validation: static contract tests
 
-验证核心约束：本功能只做"加自动触发条件 + 换表现"，不改写老链路。
-依据：implementation-flow.md Phase 5 重点验证 1-6 + design.md 6.2 不应改坏 1-6。
+Verify core constraints: this feature adds automatic triggers and changes presentation without rewriting existing paths.
+Sources: implementation-flow.md Phase 5 checks 1–6 + design.md 6.2 regression protections 1–6.
 """
 
 from pathlib import Path
-import subprocess
+from tests.static_app_parts import read_path_or_parts
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-APP_AUTO_GOODBYE_PATH = PROJECT_ROOT / "static" / "app-auto-goodbye.js"
-APP_UI_PATH = PROJECT_ROOT / "static" / "app-ui.js"
-APP_BUTTONS_PATH = PROJECT_ROOT / "static" / "app-buttons.js"
-AVATAR_UI_BUTTONS_PATH = PROJECT_ROOT / "static" / "avatar-ui-buttons.js"
-APP_REACT_CHAT_PATH = PROJECT_ROOT / "static" / "app-react-chat-window.js"
-APP_INTERPAGE_PATH = PROJECT_ROOT / "static" / "app-interpage.js"
+APP_AUTO_GOODBYE_PATH = PROJECT_ROOT / "static" / "app" / "app-auto-goodbye.js"
+APP_UI_PATH = PROJECT_ROOT / "static" / "app" / "app-ui"
+APP_BUTTONS_PATH = PROJECT_ROOT / "static" / "app" / "app-buttons.js"
+AVATAR_UI_BUTTONS_PATH = PROJECT_ROOT / "static" / "avatar" / "avatar-ui-buttons"
+APP_REACT_CHAT_PATH = PROJECT_ROOT / "static" / "app" / "app-react-chat-window"
+APP_INTERPAGE_PATH = PROJECT_ROOT / "static" / "app" / "app-interpage"
 
 
 def _read(path: Path) -> str:
-    return path.read_text(encoding="utf-8")
+    return read_path_or_parts(path)
 
 
-# ── 5.1 手动 goodbye 链路未被改写 ──────────────────────────
+# ── 5.1 Manual goodbye path remains unchanged ──────────────────────────
 
 
-def test_app_buttons_not_modified_by_feature():
-    """app-buttons.js 不在本功能的改动范围内。"""
-    result = subprocess.run(
-        ["git", "diff", "HEAD", "--", "static/app-buttons.js"],
-        capture_output=True, text=True, cwd=str(PROJECT_ROOT),
-    )
-    assert result.stdout.strip() == "", (
-        "app-buttons.js has unexpected changes"
-    )
+def test_app_buttons_preserve_goodbye_backend_silence_contract():
+    """The ask-to-leave path must silently synchronize cat state to the backend."""
+    source = _read(APP_BUTTONS_PATH)
+
+    assert "window.isNekoGoodbyeModeActive()" in source
+    assert "action: 'end_session'" in source
+    assert "goodbye_active: !!isGoodbyeMode" in source
+    assert "action: 'goodbye_state'" in source
+    assert "reason: 'return-session'" in source
 
 
 def test_app_ui_changes_are_limited_to_return_ball_desktop_bridge_contract():
-    """app-ui.js 允许承载 return-ball 桌面桥接，但不能改写 return 主语义。"""
+    """Keep the return-ball desktop bridge without changing return semantics."""
     source = _read(APP_UI_PATH)
 
     assert "action: 'idle_return_ball_state'" in source
     assert "function canPostIdleReturnBallDesktopState()" in source
+    assert "function isIdleCat1PlaygroundActiveForReturnBallDesktopBridge()" in source
+    assert "__nekoIdleCat1PlaygroundDropState" in source
+    assert "__nekoIdleCat1PlaygroundPendingEntry" in source
+    bridge_start = source.index("function isIdleCat1PlaygroundActiveForReturnBallDesktopBridge()")
+    bridge_end = source.index("function canPostIdleReturnBallDesktopState()", bridge_start)
+    bridge_block = source[bridge_start:bridge_end]
+    assert "buttons[i].__nekoIdleCat1PlaygroundPendingEntry" in bridge_block
+    assert "if (isIdleCat1PlaygroundActiveForReturnBallDesktopBridge()) return;" in source
     assert "electron-chat-window" in source
     assert "function getReturnBallDragScreenRect(" in source
     assert "'return-ball-dragging'" in source
@@ -50,13 +58,16 @@ def test_app_ui_changes_are_limited_to_return_ball_desktop_bridge_contract():
     assert "start_session" not in source
 
 
-# ── 5.2 auto-goodbye 只派发 live2d-goodbye-click ──────────
+# ── 5.2 Auto-goodbye does not directly perform departure side effects ──────────
 
 
-def test_auto_goodbye_does_not_call_any_goodbye_side_effects_directly():
+def test_auto_goodbye_only_syncs_silence_without_running_goodbye_side_effects():
     source = _read(APP_AUTO_GOODBYE_PATH)
 
     assert "window.dispatchEvent(new CustomEvent('live2d-goodbye-click'" in source
+    assert "action: 'goodbye_state'" in source
+    assert "window.__nekoGoodbyeSilentState" in source
+    assert "pending: !!pending" in source
     assert "end_session" not in source
     assert "stopProactiveChatSchedule" not in source
     assert "syncVoiceChatComposerHidden" not in source
@@ -65,7 +76,7 @@ def test_auto_goodbye_does_not_call_any_goodbye_side_effects_directly():
     assert "resetSessionButton.addEventListener" not in source
 
 
-# ── 5.3 return-ball 回来仍走 handleReturnClick ─────────────
+# ── 5.3 Returning via return-ball still uses handleReturnClick ─────────────
 
 
 def test_avatar_return_button_dispatches_prefix_return_click_not_start_session():
@@ -77,7 +88,7 @@ def test_avatar_return_button_dispatches_prefix_return_click_not_start_session()
     assert "start_session" not in source
 
 
-# ── 5.4 start_session 不被误触发 ──────────────────────────
+# ── 5.4 start_session is not accidentally triggered ──────────────────────────
 
 
 def test_no_new_code_references_start_session_or_return_session_button():
@@ -94,7 +105,7 @@ def test_no_new_code_references_start_session_or_return_session_button():
         )
 
 
-# ── 5.5 queued/running 任务阻断 auto-goodbye ──────────────
+# ── 5.5 queued/running tasks block auto-goodbye ──────────────
 
 
 def test_has_blocking_active_work_treats_queued_and_running_as_blockers():
@@ -108,7 +119,7 @@ def test_has_blocking_active_work_treats_queued_and_running_as_blockers():
 
 
 def test_try_auto_goodbye_has_autoGoodbyeTriggered_guard():
-    """防止 goodbye manager 没设上 _goodbyeClicked 时重复派发事件。"""
+    """Prevent duplicate dispatch when goodbye manager has not set _goodbyeClicked."""
     source = _read(APP_AUTO_GOODBYE_PATH)
 
     assert "state.autoGoodbyeTriggered" in source
@@ -117,7 +128,7 @@ def test_try_auto_goodbye_has_autoGoodbyeTriggered_guard():
     )
 
 
-# ── 5.6 deferred reminder (保持 running) 被正确阻断 ──────
+# ── 5.6 Deferred reminders (remaining running) are correctly blocked ──────
 
 
 def test_deferred_reminder_running_state_is_blocked_without_exemption():
@@ -135,7 +146,7 @@ def test_deferred_reminder_running_state_is_blocked_without_exemption():
     assert 'case"reminder"' not in compact_source
 
 
-# ── design.md 6.2: 不应改坏 ───────────────────────────────
+# ── design.md 6.2: behavior that must not regress ───────────────────────────────
 
 
 def test_old_chat_container_not_referenced_in_new_code():

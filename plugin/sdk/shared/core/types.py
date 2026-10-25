@@ -4,7 +4,22 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping, MutableMapping, Protocol, TypeAlias
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Literal,
+    Mapping,
+    MutableMapping,
+    Protocol,
+    TypeAlias,
+    TypedDict,
+)
+
+from .cards import ChatCard, PluginView
+
+if TYPE_CHECKING:
+    from openai import AsyncOpenAI
 
 
 JsonScalar: TypeAlias = str | int | float | bool | None
@@ -13,6 +28,42 @@ JsonObject: TypeAlias = dict[str, JsonValue]
 Metadata: TypeAlias = Mapping[str, JsonValue]
 InputSchema: TypeAlias = Mapping[str, JsonValue]
 EntryHandler: TypeAlias = Callable[..., object]
+
+
+PushMessageFailureReason: TypeAlias = Literal[
+    "backpressure",
+    # The SDK measured the wire payload the way the host's ingest server does
+    # and it blew MESSAGE_PLANE_PAYLOAD_MAX_BYTES. Unlike "backpressure" this
+    # is not transient: the host would discard the WHOLE push (text parts
+    # included) and the author would only ever see it in the host log, so the
+    # SDK rejects it locally instead of reporting a submission that silently
+    # goes nowhere. Retrying an identical payload cannot help -- the push has
+    # to get smaller, which for images means ctx.images.upload().
+    "payload_too_large",
+    "transport_error",
+    "transport_unavailable",
+]
+
+
+class PushMessageSubmitted(TypedDict):
+    """The SDK accepted responsibility for a local message submission."""
+
+    submitted: Literal[True]
+
+
+class PushMessageRejected(TypedDict):
+    """The SDK synchronously rejected a local message submission."""
+
+    ok: Literal[False]
+    submitted: Literal[False]
+    reason: PushMessageFailureReason
+
+
+# Immediate local submission result. ``submitted=True`` only means that the
+# SDK's authoritative local submission path accepted responsibility for the
+# payload; it does not acknowledge host consumption, model generation, or
+# playback.
+PushMessageResult: TypeAlias = PushMessageSubmitted | PushMessageRejected
 
 
 class LoggerLike(Protocol):
@@ -69,6 +120,10 @@ class BusConversationsProtocol(Protocol):
     def get_by_id(self, conversation_id: str, max_count: int = 10, timeout: float | None = None) -> object: ...
 
 
+class BusFramesProtocol(Protocol):
+    def get(self, **kwargs: object) -> object: ...
+
+
 class BusMemoryProtocol(Protocol):
     def get(self, *, bucket_id: str, limit: int = 20, timeout: float = 5.0) -> object: ...
 
@@ -78,15 +133,63 @@ class BusProtocol(Protocol):
     events: BusEventsProtocol | None
     lifecycle: BusLifecycleProtocol | None
     conversations: BusConversationsProtocol | None
+    frames: BusFramesProtocol | None
     memory: BusMemoryProtocol | None
 
 
+class PluginImagesProtocol(Protocol):
+    async def upload(
+        self,
+        data: bytes | bytearray,
+        *,
+        mime: str | None = None,
+        timeout: float = 3.0,
+    ) -> dict[str, object]: ...
+
+
+class PluginModelsProtocol(Protocol):
+    async def get_client(self) -> AsyncOpenAI: ...
+
+
+class ReplyTailProtocol(Protocol):
+    version: int
+
+    async def register(self, context: dict, *, registration_id: str, parts: list,
+                       ai_behavior: str = "blind", timeout: float = 5.0) -> dict: ...
+
+    async def status(self, context: dict, *, registration_id: str, timeout: float = 5.0) -> dict: ...
+
+    async def cancel(self, context: dict, *, registration_id: str, timeout: float = 5.0) -> dict: ...
+
+
 class PluginContextProtocol(Protocol):
+    @property
+    def images(self) -> PluginImagesProtocol: ...
+
+    @property
+    def models(self) -> PluginModelsProtocol: ...
+
+    @property
+    def reply_tail(self) -> ReplyTailProtocol: ...
+
     plugin_id: str
     metadata: Metadata
     logger: LoggerLike | None
     config_path: str | Path | None
     bus: BusProtocol | None
+
+    async def create_card(self, *, html: str, summary: str, css: str = "",
+                          actions: dict[str, Any] | None = None,
+                          target_lanlan: str | None = None) -> "ChatCard": ...
+
+    def get_card(self, card_id: str, *, target_lanlan: str | None = None) -> "ChatCard": ...
+
+    async def create_view(self, *, title: str, html: str, css: str = "",
+                          actions: dict[str, Any] | None = None,
+                          summary: str | None = None,
+                          target_lanlan: str | None = None) -> "PluginView": ...
+
+    def get_view(self, view_id: str, *, target_lanlan: str | None = None) -> "PluginView": ...
 
     async def get_own_config(self, timeout: float = 5.0) -> object: ...
 
@@ -97,6 +200,10 @@ class PluginContextProtocol(Protocol):
     async def get_own_profile_config(self, profile_name: str, timeout: float = 5.0) -> object: ...
 
     async def get_own_effective_config(self, profile_name: str | None = None, timeout: float = 5.0) -> object: ...
+
+    async def update_own_config(self, updates: JsonObject, timeout: float = 10.0) -> object: ...
+
+    async def replace_own_config(self, config: JsonObject, timeout: float = 10.0) -> object: ...
 
     async def upsert_own_profile_config(
         self,
@@ -187,7 +294,7 @@ class PluginContextProtocol(Protocol):
         fast_mode: bool = False,
         delivery: str | bool | None = None,
         reply: bool | None = None,
-    ) -> object: ...
+    ) -> PushMessageResult: ...
 
     def update_status(self, status: dict[str, object]) -> None: ...
 
@@ -206,6 +313,7 @@ class RouterProtocol(Protocol):
 
 __all__ = [
     "BusConversationsProtocol",
+    "BusFramesProtocol",
     "BusEventsProtocol",
     "BusLifecycleProtocol",
     "BusMemoryProtocol",
@@ -223,5 +331,12 @@ __all__ = [
     "MutableStateProtocol",
     "PluginContextProtocol",
     "PluginRef",
+    "PushMessageFailureReason",
+    "PushMessageRejected",
+    "PushMessageResult",
+    "PluginImagesProtocol",
+    "PluginModelsProtocol",
+    "ReplyTailProtocol",
+    "PushMessageSubmitted",
     "RouterProtocol",
 ]

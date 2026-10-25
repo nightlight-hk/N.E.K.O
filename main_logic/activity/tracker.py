@@ -1,3 +1,17 @@
+# Copyright 2025-2026 Project N.E.K.O. Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Per-character user-activity tracker.
 
 Combines the process-wide ``SystemSignalCollector`` with session-scoped
@@ -51,8 +65,17 @@ from main_logic.activity.system_signals import (
     SystemSignalCollector, SystemSnapshot, get_system_signal_collector,
 )
 from utils.activity_config import get_activity_preferences
+from utils.external_route_registry import is_external_route_active
+from main_logic.activity.activity_guess_gate import ActivityGuessGate
+from config import (
+    ACTIVITY_GUESS_BACKOFF_BASE_SECONDS,
+    ACTIVITY_GUESS_BACKOFF_MULTIPLIER,
+    ACTIVITY_GUESS_BACKOFF_CAP_SECONDS,
+    ACTIVITY_GUESS_SIG_CACHE_SIZE,
+)
 
 logger = logging.getLogger(__name__)
+
 
 # Conversation buffers: small enough to keep prompt sizes tight, large
 # enough to give the emotion-tier LLM real recent context.
@@ -64,10 +87,16 @@ _CONV_BUFFER_MAXLEN = 12
 # up when activity is actually shifting.
 _ACTIVITY_GUESS_TICK_SECONDS = 20.0
 
-# After computing activity_guess, suppress recompute for at least this
-# long even if signature changes — protects against thrashing during
-# rapid window flicker (a 30s minimum interval between LLM calls).
-_ACTIVITY_GUESS_MIN_REFRESH_SECONDS = 30.0
+# The per-call minimum-interval floor + adaptive re-narrate backoff now live in
+# ActivityGuessGate (configured via ACTIVITY_GUESS_BACKOFF_* in config); see
+# main_logic/activity/activity_guess_gate.py. The old flat 30s floor is gone.
+
+# How many recent foreground windows (with dwell) to feed the activity_guess LLM
+# so its narration can describe the user's activity FLOW ("coded, then browsed,
+# now chatting"), not just the instantaneous window. Canonical app names only —
+# never window titles — see ActivityStateMachine.recent_window_trail.
+_ACTIVITY_GUESS_WINDOW_TRAIL_LIMIT = 3
+_ACTIVITY_GUESS_WINDOW_TRAIL_MAX_AGE_SECONDS = 600.0
 
 # Frontend-pushed external signals are considered fresh for this many
 # seconds. After that the tracker falls back to the local collector
@@ -146,18 +175,18 @@ _BREAK_REMINDER_TICK_MAX_DELTA_SECONDS = 30.0
 # thinking, not slacking — as are voice_engaged / chatting (they are
 # producing). transitioning is excluded because it's not an end state.
 _ANTI_SLACK_LEISURE_STATES: frozenset[str] = frozenset({
-    'casual_browsing', 'gaming',
+    'casual_browsing', 'focused_video', 'gaming',
 })
 
 
 def _privacy_mode_active() -> bool:
-    """用户是否开启了隐私模式。开启时整个 tracker 应当短路。
+    """Whether the user has enabled privacy mode. The whole tracker should short-circuit when on.
 
-    存储在前端 ``proactiveVisionEnabled`` 的反面（详见 utils.preferences）。
-    异常路径 fail-closed：任何读取异常一律按"隐私模式开启"处理，宁可
-    短期内 tracker 不可用，也不能让"读不出来"等价于"用户没开隐私"。
-    正常的"用户没开隐私"路径走 ``is_privacy_mode_enabled`` 返回 False，
-    不进 except 分支。
+    Stored as the inverse of the frontend ``proactiveVisionEnabled`` (see utils.preferences).
+    The exception path is fail-closed: any read error is treated as "privacy mode on" —
+    better to lose the tracker briefly than to let "can't read the setting" be equivalent
+    to "user didn't enable privacy". The normal "user didn't enable privacy" path goes
+    through ``is_privacy_mode_enabled`` returning False and never enters the except branch.
     """
     try:
         from utils.preferences import is_privacy_mode_enabled
@@ -170,18 +199,21 @@ def _privacy_mode_active() -> bool:
 
 
 def _proactive_chat_enabled() -> bool:
-    """主动搭话总开关是否打开。
+    """Whether the proactive-chat master switch is on.
 
-    ``activity_guess`` 的 emotion-tier LLM 叙述只喂 proactive Phase 2 的
-    state_section，没有别的消费方；主动搭话关时算它纯属浪费。loop 用它跳过
-    LLM 部分——这样「实验组为弹窗 kick 起 loop、但用户没开主动搭话」时只剩廉价
-    规则轮询 + 情境弹窗检测，零 LLM 开销。
+    The emotion-tier LLM narration from ``activity_guess`` only feeds the state_section of
+    proactive Phase 2 — there is no other consumer, so computing it while proactive chat is
+    off is pure waste. The loop uses this to skip the LLM part, so when "the experiment
+    group kicks the loop for context prompts but the user hasn't enabled proactive chat",
+    only the cheap rule polling + context prompt detection remain, with zero LLM cost.
 
-    fail-open：key 缺失 *或* 读取异常都返回 True。误判「关」会把 proactive-on 用户该有
-    的活动叙述吞掉（伤用户可见功能），误判「开」只是多算一次叙述（小成本），两害相权
-    取「宁可多算」。真正明确关掉主动搭话的用户 key=false（前端总会同步这个键），照样
-    走 skip 分支，成本修复对主流场景依旧生效；只有从没同步过设置的全新会话才落到缺失→
-    True 这条窄路径，可忽略。
+    Fail-open: a missing key *or* a read error both return True. Misjudging "off" would
+    swallow the activity narration a proactive-on user should get (hurts a user-visible
+    feature), while misjudging "on" merely computes one extra narration (small cost), so
+    we prefer "compute too much". Users who explicitly turned proactive chat off have
+    key=false (the frontend always syncs this key) and still take the skip branch, so the
+    cost fix keeps working for the mainstream case; only brand-new sessions that never
+    synced settings fall into the narrow missing→True path, which is negligible.
     """
     try:
         from utils.preferences import load_global_conversation_settings
@@ -242,15 +274,22 @@ class UserActivityTracker:
         self._open_threads_computed_at_seq: int = -1
         self._open_threads_task: asyncio.Task | None = None
 
-        # activity_guess cache. Stale check uses a state-signature tuple
-        # (state, active app, idle bucket) — when unchanged for a tick
-        # AND we recently computed, the loop short-circuits before
-        # paying the LLM cost.
-        self._activity_scores_cache: dict[str, float] = {}
-        self._activity_guess_cache: str = ''
-        self._activity_guess_state_sig: tuple | None = None
-        self._activity_guess_at: float = 0.0
+        # adaptive-backoff gate + per-signature narration cache. The gate
+        # decides when the heartbeat may pay for an emotion-tier narration call
+        # (coarse (state, window-category) signature, per-signature exponential
+        # backoff, novelty bypass — see ActivityGuessGate) AND stores the last
+        # narration per signature, so get_snapshot always serves the narration
+        # for the activity the user is in right now. Replaces the old flat 30s
+        # floor + exact-app signature + single global narration cache, which let
+        # window flicker burn one (silent) call every ~40s.
+        self._activity_guess_gate = ActivityGuessGate(
+            base_seconds=ACTIVITY_GUESS_BACKOFF_BASE_SECONDS,
+            cap_seconds=ACTIVITY_GUESS_BACKOFF_CAP_SECONDS,
+            cache_size=ACTIVITY_GUESS_SIG_CACHE_SIZE,
+            backoff_multiplier=ACTIVITY_GUESS_BACKOFF_MULTIPLIER,
+        )
         self._activity_guess_loop_task: asyncio.Task | None = None
+        self._topic_candidate_task: asyncio.Task | None = None
 
         # Frontend-pushed system signal (for remote deployments where the
         # backend's local OS APIs see only the server, not the user).
@@ -307,22 +346,28 @@ class UserActivityTracker:
         self._work_break_pending: dict | None = None
         self._anti_slack_pending: dict | None = None
 
-        # ── 情境弹窗（A/B 实验组前端用）──────────────────────────
-        # 当用户「进入」游戏/娱乐 或「进入」专注工作时，给前端推一次性信号，让前端
-        # （仅实验组、每会话每类一次）弹窗问要不要开/关屏幕分享来源。后端只负责检测
-        # 「进入」这一刻并推送，分组判定 + 去重都在前端。
-        #   * ``_context_prompt_pending``：一次性槽位，由 ``_tick_break_reminders``
-        #     在检测到进入目标状态时 set（同步安全，只置 dict），由异步
-        #     ``_activity_guess_loop`` 心跳 drain 后 await 推送回调。后写覆盖前写
-        #     （两次 drain 间多次切换只推最新那次，够用）。
-        #   * ``_on_context_prompt``：core.py 注入的 async 回调，签名 ``(context: str)``
-        #     —— context 取 'play'（游戏/娱乐）或 'work'（专注工作）。未注入则不推。
+        # ── Context dialogs (frontend A/B treatment group) ──────────────────────────
+        # On entering games/entertainment or focused work, send a one-shot frontend signal prompting
+        # whether to enable/disable screen-sharing sources (treatment only, once per type/session). Backend detects
+        # entry and pushes; frontend handles group assignment and deduplication.
+        #   * ``_context_prompt_pending``: one-shot slot set by ``_tick_break_reminders``
+        #     on entering target states (synchronously safe dict assignment), drained by async
+        #     ``_activity_guess_loop`` heartbeats before awaiting push callbacks. Later writes overwrite earlier ones
+        #     (only latest transition between drains is needed).
+        #   * ``_on_context_prompt``: async core.py callback, signature ``(context: str)``;
+        #     context is 'play' (games/entertainment) or 'work' (focused work). No injection means no push.
         self._context_prompt_pending: dict | None = None
         self._on_context_prompt: Callable[[str], Awaitable[None]] | None = None
-        # 情境弹窗专属的「上一状态」基线，独立于 break-reminder 的 _last_known_state
-        # ——这样可以在每个 session 开始时单独清掉（reset_context_prompt_baseline），让
-        # 「跨 session 仍在同一状态」也能重新算作一次「进入」并再弹（前端按 app 会话去
-        # 重），同时不扰动 break/anti-slack 的状态机。
+        # Predicate for whether activity_guess narration has a downstream consumer. The injector
+        # (core.py) provides a bool callback: True means nobody consumes current narration
+        # (session is goodbye_silent; proactive Phase 2 bails at entry), so skip this tick's
+        # expensive emotion-tier LLM call. Rule heartbeats (break reminders / context dialogs)
+        # still tick normally. Without injection, never suppress (preserve old behavior).
+        self._narration_suppressed_check: Callable[[], bool] | None = None
+        # Context-dialog previous-state baseline, independent of break reminders' _last_known_state,
+        # reset separately at each session start (reset_context_prompt_baseline), allowing
+        # unchanged states across sessions to count as entry and prompt again (frontend deduplicates by app session),
+        # without disturbing break/anti-slack state machines.
         self._context_prompt_last_state: ActivityState | None = None
 
     # ── hooks (called from core.py and friends) ─────────────────
@@ -339,11 +384,12 @@ class UserActivityTracker:
         ts = now if now is not None else time.time()
         self._sm.update_user_message(now=ts)
         self._conv_seq += 1
-        # 隐私模式：让用户消息文本直接不进 buffer，避免在切回非隐私模式时
-        # 旧数据被 enrichment LLM 二次曝光。state machine 的时间戳还要更新
-        # （下游 idle / focused_work 判定依赖），文本扔了即可。
+        # Privacy mode: omit user-message text from buffers, preventing enrichment LLM exposure
+        # of old data when privacy is disabled again. Still update state-machine timestamps
+        # for downstream idle / focused_work decisions; discard only text.
         if text and not _privacy_mode_active():
-            self._user_msg_buffer.append((ts, text.strip()[:1000]))
+            cleaned = text.strip()[:1000]
+            self._user_msg_buffer.append((ts, cleaned))
 
     def on_ai_message(self, *, text: str | None = None, now: float | None = None) -> None:
         """Stamp an "AI just spoke" event.
@@ -352,7 +398,7 @@ class UserActivityTracker:
         question heuristic over it: if the AI's reply trips the heuristic
         (ends with ``?`` / ``？`` / a CN sentence-final question particle),
         an unfinished-thread record opens — Phase 2 will be allowed up to
-        ``UNFINISHED_THREAD_MAX_FOLLOWUPS`` (default 2) follow-ups within
+        ``UNFINISHED_THREAD_MAX_FOLLOWUPS`` (default 1) follow-up within
         the 5-minute window even in restricted_screen_only states.
 
         Text is also appended to the AI conversation buffer so the
@@ -361,12 +407,20 @@ class UserActivityTracker:
         ts = now if now is not None else time.time()
         self._sm.update_ai_message(text=text, now=ts)
         if text and not _privacy_mode_active():
-            self._ai_msg_buffer.append((ts, text.strip()[:1000]))
+            cleaned = text.strip()[:1000]
+            self._ai_msg_buffer.append((ts, cleaned))
             # AI also opens threads (promises, abandoned mid-sentences) →
             # bump _conv_seq so kickoff_open_threads_compute will recompute.
             # Empty / no-text turns (errors / silenced) skip the bump,
             # since nothing in the buffer changed.
             self._conv_seq += 1
+
+    def is_private_activity_active(self) -> bool:
+        """Whether the latest activity state is private/redacted."""
+        try:
+            return self._sm._current_state == 'private'
+        except Exception:
+            return True
 
     def mark_unfinished_thread_used(self) -> None:
         """Record that a proactive emission just used the override slot.
@@ -505,10 +559,18 @@ class UserActivityTracker:
         # Patch in emotion-tier enrichment caches. ``snap`` is a frozen
         # dataclass; ``replace`` returns a new instance without mutating
         # the original. Callers always get a self-consistent snapshot.
+        # Serve the narration for the activity the user is in RIGHT NOW, not
+        # whichever signature fired last: with the per-signature backoff a
+        # re-narration can be suppressed, so a single global slot could hand the
+        # proactive prompt a narration for a different activity. cached() returns
+        # ('', {}) for a not-yet-narrated signature — honest, not stale-wrong.
+        cur_scores, cur_guess = self._activity_guess_gate.cached(
+            self._coarse_activity_sig(snap)
+        )
         return dc_replace(
             snap,
-            activity_scores=dict(self._activity_scores_cache),
-            activity_guess=self._activity_guess_cache,
+            activity_scores=dict(cur_scores),
+            activity_guess=cur_guess,
             open_threads=list(self._open_threads_cache),
             work_break_pending=self._build_work_break_pending(),
             anti_slack_pending=self._build_anti_slack_pending(),
@@ -546,10 +608,18 @@ class UserActivityTracker:
                 work_break_pending=None,
                 anti_slack_pending=None,
             )
+        # Serve the narration for the activity the user is in RIGHT NOW, not
+        # whichever signature fired last: with the per-signature backoff a
+        # re-narration can be suppressed, so a single global slot could hand the
+        # proactive prompt a narration for a different activity. cached() returns
+        # ('', {}) for a not-yet-narrated signature — honest, not stale-wrong.
+        cur_scores, cur_guess = self._activity_guess_gate.cached(
+            self._coarse_activity_sig(snap)
+        )
         return dc_replace(
             snap,
-            activity_scores=dict(self._activity_scores_cache),
-            activity_guess=self._activity_guess_cache,
+            activity_scores=dict(cur_scores),
+            activity_guess=cur_guess,
             open_threads=list(self._open_threads_cache),
             work_break_pending=self._build_work_break_pending(),
             anti_slack_pending=self._build_anti_slack_pending(),
@@ -736,16 +806,16 @@ class UserActivityTracker:
         ):
             self._anti_slack_pending = None
 
-        # ── 情境弹窗一次性检测（A/B 实验组前端用）────────────────
-        # 只在「进入」目标状态那一刻置 pending（state != 上一状态），状态保持期间不重复
-        # 触发，避免 20s 心跳刷屏。分组判定 + 每会话去重都在前端。
-        #   gaming / casual_browsing（=娱乐，进游戏/看番/视频）→ 'play'
-        #   focused_work（进专注工作）                       → 'work'
-        # 用 _context_prompt_last_state（情境弹窗专属基线）而非 _last_known_state：后者
-        # 跨 session 长存，会让「上个 session 结束时在游戏、新 session 仍在游戏」检测不到
-        # 进入、漏弹；专属基线在每个 session 开始时被 reset_context_prompt_baseline 清成
-        # None，于是当前状态重新算作一次「进入」。为 None（首启 / 不安全 delta 重置 /
-        # 新 session）都算「进入」，前端按 app 会话去重兜住重复。
+        # ── One-shot context-dialog detection (frontend A/B treatment group) ────────────────
+        # Set pending only on entering a target state (state differs from previous); do not repeat while unchanged,
+        # avoiding 20s heartbeat spam. Frontend handles assignment and per-session deduplication.
+        #   gaming / casual_browsing (entertainment: gaming/anime/video) -> 'play'
+        #   focused_work (entering focused work)                       -> 'work'
+        # Use context-specific _context_prompt_last_state rather than _last_known_state, which persists
+        # across sessions and misses entry when a user ends one session gaming and starts another still gaming.
+        # reset_context_prompt_baseline clears the dedicated baseline to None at each session start,
+        # so current state counts as fresh entry. None (first start / unsafe-delta reset /
+        # new session) always means entry; frontend app-session deduplication handles repeats.
         ctx_prev = self._context_prompt_last_state
         _CONTEXT_PROMPT_TARGET_STATES = ('gaming', 'casual_browsing', 'focused_work')
         if state != ctx_prev:
@@ -753,11 +823,11 @@ class UserActivityTracker:
                 self._context_prompt_pending = {'context': 'play', 'set_at': now}
             elif state == 'focused_work':
                 self._context_prompt_pending = {'context': 'work', 'set_at': now}
-        # 离开目标状态（进 idle/away/chatting/transitioning/private 等非目标态）时，清掉
-        # 还没 drain 的过期 pending：pending 可能是 get_snapshot 路径（实验组 kick）置的、
-        # 还没等到 loop drain，用户就离开了游戏/工作；若不清，loop 会把「已经离开的场景」
-        # 推成过期弹窗，甚至据此翻错设置。目标态之间切换（gaming↔casual_browsing↔
-        # focused_work）由上面的 overwrite 处理，不受影响。
+        # On leaving target states (idle/away/chatting/transitioning/private, etc.), clear stale undrained
+        # pending; get_snapshot (treatment kick) may set it, then users leave gaming/work before
+        # loop drain. Otherwise the loop pushes an obsolete dialog for an exited context,
+        # potentially changing the wrong setting. Target-to-target transitions (gaming<->casual_browsing<->
+        # focused_work) still use overwrite above, unaffected.
         if state not in _CONTEXT_PROMPT_TARGET_STATES:
             self._context_prompt_pending = None
         self._context_prompt_last_state = state
@@ -855,18 +925,21 @@ class UserActivityTracker:
         self._anti_slack_last_fired_at = ts
         self._anti_slack_pending = None
 
-    # ── 情境弹窗（A/B 实验组前端用）──────────────────────────────
+    # ── Context dialogs (frontend A/B treatment group) ──────────────────────────────
 
     def reset_context_prompt_baseline(self) -> None:
-        """清掉情境弹窗的「上一状态」基线，让下一 tick 把当前状态重新算作一次「进入」。
+        """Clear the context prompt's "previous state" baseline so the next tick counts the current state as a fresh "entry".
 
-        在每个 session 开始时调用（core.py 的实验组 kick 里）。tracker 跨 session 长存，
-        若不清，「上个 session 结束时在游戏、新 session 仍在游戏」就检测不到进入、漏弹。
-        只动情境弹窗专属基线，不碰 break/anti-slack 的 _last_known_state。
+        Called at the start of every session (in core.py's experiment-group kick). The
+        tracker outlives sessions; without clearing, "gaming when the last session ended,
+        still gaming in the new session" would never be detected as an entry and the
+        prompt would be missed. Only touches the context-prompt baseline, not the
+        break/anti-slack ``_last_known_state``.
 
-        同时清掉可能遗留的 pending：上个 session 置了 pending 但没来得及 drain（loop 没
-        tick 到就 end_session）时，残留会被新 session 的首个 tick 推成过期弹窗。清掉后
-        紧跟的 kick get_snapshot 会按新 session 的当前状态重新置 pending。
+        Also clears any leftover pending: if the previous session set a pending but never
+        drained it (session ended before the loop ticked), the leftover would be pushed
+        as a stale prompt by the new session's first tick. After clearing, the kick's
+        following get_snapshot re-sets pending based on the new session's current state.
         """
         self._context_prompt_last_state = None
         self._context_prompt_pending = None
@@ -874,19 +947,56 @@ class UserActivityTracker:
     def set_context_prompt_callback(
         self, callback: Callable[[str], Awaitable[None]] | None
     ) -> None:
-        """注入「进入游戏/娱乐 或 进入专注工作」时往前端推送的 async 回调。
+        """Inject the async callback that pushes "entered gaming/entertainment or focused work" signals to the frontend.
 
-        由 core.py 在建好 tracker 后调用，回调内部把信号经 WebSocket 发给前端。
-        ``callback(context)`` 的 context 取 'play'（游戏/娱乐）或 'work'（专注工作）。
-        传 None 解除注入（如会话结束）。
+        Called by core.py after the tracker is built; the callback forwards the signal to
+        the frontend over WebSocket. ``callback(context)`` receives 'play'
+        (gaming/entertainment) or 'work' (focused work). Pass None to remove the
+        callback (e.g. when the session ends).
         """
         self._on_context_prompt = callback
 
-    async def _drain_context_prompt(self) -> None:
-        """把 ``_tick_break_reminders`` 攒下的一次性情境信号推给前端。
+    def set_narration_suppressed_check(
+        self, predicate: Callable[[], bool] | None
+    ) -> None:
+        """Inject the predicate that decides whether activity_guess narration has a live consumer.
 
-        只在异步心跳里调用（async 上下文才能 await 回调）。一次消费一个槽位，
-        推送失败静默吞掉——埋点性质的提示，丢一次也不该把心跳搞崩。
+        ``predicate()`` returns True when narration currently has no consumer —
+        the sole reader (proactive Phase 2) won't act, so computing the
+        emotion-tier guess just burns an LLM call with nobody to read it. The
+        injector owns the exact conditions (today: the catgirl is in
+        goodbye-silence, OR no client is connected to deliver a proactive turn
+        to); the tracker treats the predicate as opaque. The 20s heartbeat keeps
+        ticking the rule-based break-reminder / context-prompt logic regardless;
+        only the LLM narration step is skipped. Pass None to clear (never suppress).
+        """
+        self._narration_suppressed_check = predicate
+
+    def _is_narration_suppressed(self) -> bool:
+        """Whether this tick should skip the activity_guess LLM (no consumer).
+
+        Fail-open: a missing predicate or a raising one both mean "don't
+        suppress" — losing the cost optimization is harmless, but wrongly
+        suppressing would silently starve a proactive-on user's narration.
+        """
+        check = self._narration_suppressed_check
+        if check is None:
+            return False
+        try:
+            return bool(check())
+        except Exception as e:
+            logger.debug(
+                '[%s] narration suppressed-check failed, not suppressing: %s',
+                self.lanlan_name, e,
+            )
+            return False
+
+    async def _drain_context_prompt(self) -> None:
+        """Push the one-shot context signals accumulated by ``_tick_break_reminders`` to the frontend.
+
+        Only called from the async heartbeat (awaiting the callback requires an async
+        context). Consumes one slot per call; push failures are swallowed silently —
+        these are telemetry-style prompts, and losing one must not crash the heartbeat.
         """
         pending = self._context_prompt_pending
         if pending is None:
@@ -895,9 +1005,16 @@ class UserActivityTracker:
         callback = self._on_context_prompt
         if callback is None:
             return
+        # When builtin mini-games own interaction, gaming describes N.E.K.O's own game window,
+        # not a newly opened external game. Pushing again creates a homepage screen-sharing
+        # prompt while Electron foregrounds the mini-game, leaving the prompt visible
+        # but unclickable. Pending was consumed above, preventing an obsolete prompt on game exit.
+        # Apply the same suppression during any external route takeover, not just mini-games.
+        if is_external_route_active(self.lanlan_name):
+            return
         try:
             await callback(pending['context'])
-        except Exception as e:  # noqa: BLE001 — 推送失败不能让心跳挂掉
+        except Exception as e:  # noqa: BLE001 - Push failure must not stop the heartbeat.
             logger.debug(
                 '[%s] context prompt push failed (%s): %s',
                 self.lanlan_name, pending.get('context'), e,
@@ -983,30 +1100,60 @@ class UserActivityTracker:
 
     # ── activity_guess background loop ──────────────────────────
 
-    async def _activity_guess_loop(self) -> None:
-        """20s tick. Recomputes activity_guess on state change.
+    @staticmethod
+    def _coarse_activity_sig(snap: ActivitySnapshot) -> tuple:
+        """Coarse ``(state, window-category)`` key for the activity_guess gate.
 
-        Skip rules (in order of cheapness):
-          1. State signature unchanged AND user hasn't said anything
-             new since last compute → skip.
-          2. ``state == 'away'`` → no point describing absence.
-          3. Last LLM call < ``_ACTIVITY_GUESS_MIN_REFRESH_SECONDS`` ago
-             → skip even if signature changed (anti-thrash).
+        Deliberately coarser than the exact app: flicking between two
+        same-category apps (two IM clients, two browsers) is the same activity
+        as far as the narration is concerned, so it must not re-narrate. Shared
+        by the heartbeat loop (deciding when to fire) and ``get_snapshot``
+        (reading the narration for the current activity), so both agree on the
+        key for the same snapshot."""
+        return (
+            snap.state,
+            snap.active_window.category if snap.active_window else None,
+        )
+
+    async def _activity_guess_loop(self) -> None:
+        """20s tick. Recomputes activity_guess when the activity is fresh.
+
+        Cheap bails first: privacy mode, ``state == 'away'`` (nothing to
+        narrate), proactive-chat disabled, narration suppressed. Whatever
+        survives is handed to ``ActivityGuessGate.should_fire`` — a coarse
+        ``(state, window-category)`` signature with a per-signature exponential
+        backoff (BASE → CAP) and a novelty / new-conversation bypass — so
+        flicking between the same apps stops re-narrating while a genuinely new
+        activity still refreshes at once.
 
         Failures are silent — the previous cache stays in place until
         the next tick succeeds.
         """
-        last_conv_seq = -1
         while True:
             try:
                 await asyncio.sleep(_ACTIVITY_GUESS_TICK_SECONDS)
             except asyncio.CancelledError:
                 return
 
-            # 隐私模式：本 tick 不读窗口/进程，也不调 LLM，直接进入下一轮。
-            # 缓存自然衰减（保留最后一次值，proactive_chat 那边 snapshot 已被
-            # gating 成 None，缓存不会被消费）。
+            # Privacy mode: no window/process reads or activity LLM calls this tick.
+            # Deep-topic candidate is intentionally independent from privacy
+            # mode now; it consumes the persisted conversation signal window
+            # and owns its own readiness/pending checks.
             if _privacy_mode_active():
+                try:
+                    from utils.language_utils import get_global_language, get_global_language_full
+                    topic_lang = get_global_language_full() or get_global_language() or 'en'
+                except Exception as exc:
+                    logger.debug(
+                        "[%s] topic language resolve failed in privacy mode: %s",
+                        self.lanlan_name,
+                        exc,
+                    )
+                    topic_lang = 'en'
+                self._process_topic_candidates_if_ready(
+                    lang=topic_lang,
+                    now=time.time(),
+                )
                 continue
 
             try:
@@ -1031,58 +1178,66 @@ class UserActivityTracker:
                 # for the break-reminder timers.
                 self._tick_break_reminders(rule_snap, now=ts)
 
-                # Drain 情境弹窗 pending 并推送（必须在下面 away/private 的 bail 之前，
-                # 否则进 away/private 那一 tick 设的 pending 会被 continue 跳过永不推；
-                # 实际进游戏/娱乐/工作都不会是 away/private，这里只是防御性早 drain）。
-                # 这是唯一的 drain 点：心跳每 tick 都跑、且是 async 上下文，能 await 回调。
-                # get_snapshot 路径也调 _tick_break_reminders 设 pending，但 _last_known_state
-                # 已被它更新，本 drain 把那次 pending 一并发出，不会漏也不会重。
+                # Drain and push context-dialog pending before away/private bails below,
+                # or pending set on entry to away/private could be skipped by continue forever.
+                # Games/entertainment/work are never away/private; this early drain is defensive.
+                # Sole drain point: heartbeat runs every tick in async context and can await callbacks.
+                # get_snapshot also calls _tick_break_reminders and updates _last_known_state;
+                # drain sends that pending too, neither missing nor duplicating it.
                 await self._drain_context_prompt()
 
-                # 主动搭话关时跳过 activity_guess 的 LLM 叙述：它只喂 proactive Phase 2，
-                # 没开主动搭话就没有消费方。上面的 _tick_break_reminders + 情境弹窗 drain
-                # 是纯规则、已经跑过，所以「进游戏/工作」检测照常工作。这样实验组为弹窗
-                # kick 起的 loop 在用户没开主动搭话时只有廉价规则轮询、零 LLM 开销。
+                # Both use full locale codes (#2500 step 2): activity_lang feeds only
+                # ``call_activity_guess``, whose ``_normalize_lang`` recognizes zh-TW and
+                # ``ACTIVITY_GUESS_PROMPTS`` has a zh-TW template. Short codes give Traditional users
+                # Simplified narration; Simplified 'zh-CN' still normalizes to
+                # 'zh', preserving behavior.
+                from utils.language_utils import get_global_language_full
+                activity_lang = get_global_language_full() or 'en'
+                topic_lang = activity_lang
+                self._process_topic_candidates_if_ready(lang=topic_lang, now=ts)
+
+                # Bail on private — explicitly do NOT send sensitive app
+                # context (or even surrounding conversation) to the
+                # emotion-tier LLM. Existing cached values stay frozen
+                # until the user leaves the private app; on resume the
+                # state-signature dedup will refresh naturally. Topic
+                # candidate processing has already been kicked above.
+                if rule_snap.state == 'private':
+                    continue
+
+                # With proactive chat disabled, skip activity_guess LLM narration: its sole consumer is proactive Phase 2.
+                # Rule-only _tick_break_reminders and context-dialog drain already ran,
+                # preserving game/work entry detection. Treatment-triggered loops for dialogs therefore use
+                # cheap rule polling without LLM costs when proactive chat is off.
                 if not _proactive_chat_enabled():
+                    continue
+
+                # Skip activity_guess LLM while goodbye_silent (idle silent catgirl):
+                # its sole consumer proactive Phase 2 bails at entry, leaving narration unread.
+                # Rule-based / rate-limited break reminders, context-dialog drain, and topic candidates
+                # already ran; this only saves an expensive pointless emotion-tier call.
+                # After user wake-up clears goodbye_silent, narration naturally resumes next tick.
+                if self._is_narration_suppressed():
                     continue
 
                 # Bail on away — nothing useful to narrate.
                 if rule_snap.state == 'away':
                     continue
 
-                # Bail on private — explicitly do NOT send sensitive app
-                # context (or even surrounding conversation) to the
-                # emotion-tier LLM. Existing cached values stay frozen
-                # until the user leaves the private app; on resume the
-                # state-signature dedup will refresh naturally.
-                if rule_snap.state == 'private':
-                    continue
-
-                # Anti-thrash: respect the minimum refresh interval.
-                if (
-                    self._activity_guess_at
-                    and ts - self._activity_guess_at < _ACTIVITY_GUESS_MIN_REFRESH_SECONDS
+                # Adaptive-backoff gate. Coarse (state, window-category)
+                # signature so flicking between two same-category apps is a
+                # no-op; per-signature exponential backoff (BASE → CAP) so
+                # oscillating between already-narrated activities decays toward
+                # CAP instead of burning one (silent) call every ~40s; a novel
+                # signature or a new conversation turn bypasses the backoff and
+                # fires now. The narration only describes *what* the user is
+                # doing, so a stale narration of an unchanged activity is still
+                # accurate — staleness never makes it wrong. See ActivityGuessGate.
+                coarse_sig = self._coarse_activity_sig(rule_snap)
+                if not self._activity_guess_gate.should_fire(
+                    coarse_sig, self._conv_seq, ts,
                 ):
                     continue
-
-                # State signature: which "kind of activity" the rule
-                # machine sees right now, plus whether the user has
-                # said something new. Quantize idle to coarse buckets
-                # so minor jitter doesn't trigger recompute.
-                idle_bucket = int((rule_snap.system_idle_seconds or 0) // 30)
-                sig = (
-                    rule_snap.state,
-                    (rule_snap.active_window.canonical
-                        if rule_snap.active_window else None),
-                    (rule_snap.active_window.subcategory
-                        if rule_snap.active_window else None),
-                    idle_bucket,
-                )
-                if sig == self._activity_guess_state_sig and self._conv_seq == last_conv_seq:
-                    continue
-
-                from utils.language_utils import get_global_language
-                lang = get_global_language() or 'en'
 
                 # In-flight guard — capture conv_seq + buffer snapshots
                 # before the LLM call. Same pattern as
@@ -1094,14 +1249,14 @@ class UserActivityTracker:
                 seen_conv_seq = self._conv_seq
                 user_msgs_snapshot = list(self._user_msg_buffer)
                 ai_msgs_snapshot = list(self._ai_msg_buffer)
-                signals = self._snapshot_signals_for_llm(rule_snap)
+                signals = self._snapshot_signals_for_llm(rule_snap, now=ts)
                 from main_logic.activity.llm_enrichment import call_activity_guess
                 result = await call_activity_guess(
                     snapshot_signals=signals,
                     rule_state=rule_snap.state,
                     user_msgs=user_msgs_snapshot,
                     ai_msgs=ai_msgs_snapshot,
-                    lang=lang,
+                    lang=activity_lang,
                 )
                 if result is None:
                     continue
@@ -1111,16 +1266,50 @@ class UserActivityTracker:
                         self.lanlan_name, seen_conv_seq, self._conv_seq,
                     )
                     continue
-                self._activity_scores_cache = result.get('scores', {}) or {}
-                self._activity_guess_cache = result.get('guess', '') or ''
-                self._activity_guess_state_sig = sig
-                self._activity_guess_at = ts
-                last_conv_seq = seen_conv_seq
+                self._activity_guess_gate.record_fired(
+                    coarse_sig, seen_conv_seq, ts,
+                    scores=result.get('scores', {}) or {},
+                    guess=result.get('guess', '') or '',
+                )
             except asyncio.CancelledError:
                 return
             except Exception as e:
                 # Stay alive — one bad tick shouldn't kill the loop.
                 logger.debug('[%s] activity_guess loop tick failed: %s', self.lanlan_name, e)
+
+    def _process_topic_candidates_if_ready(self, *, lang: str, now: float) -> None:
+        """Let the topic pool piggyback on the activity heartbeat.
+
+        Candidate analysis has its own dirty/ready/pending checks inside the
+        pool. This hook merely supplies the existing 20s cadence, then
+        returns immediately so a slow topic analyzer cannot stall the activity
+        heartbeat.
+        """
+        if self._topic_candidate_task is not None and not self._topic_candidate_task.done():
+            return
+        self._topic_candidate_task = asyncio.create_task(
+            self._run_topic_candidates_if_ready(lang=lang, now=now),
+            name=f"topic-candidates-{self.lanlan_name}",
+        )
+
+    async def _run_topic_candidates_if_ready(self, *, lang: str, now: float) -> None:
+        try:
+            from main_logic.topic.pipeline import get_topic_hook_pool
+            await get_topic_hook_pool().process_ready_topics(
+                lanlan_name=self.lanlan_name,
+                lang=lang,
+                now=now,
+            )
+        except Exception as exc:
+            logger.debug("[%s] topic candidate heartbeat failed: %s", self.lanlan_name, exc)
+
+    async def _purge_topic_candidates_for_privacy(self, *, all_characters: bool = False) -> None:
+        """Deprecated compatibility no-op.
+
+        Privacy mode no longer purges or gates the deep-topic signal store.
+        """
+        del all_characters
+        return
 
     def _refresh_prefs(self) -> None:
         """Pick up live edits to ``user_preferences.json::activity``.
@@ -1160,14 +1349,17 @@ class UserActivityTracker:
             return ext
         return self._collector.snapshot()
 
-    @staticmethod
-    def _snapshot_signals_for_llm(snap: ActivitySnapshot) -> dict:
+    def _snapshot_signals_for_llm(self, snap: ActivitySnapshot, *, now: float) -> dict:
         """Pick the structured fields worth feeding into the prompt.
 
         Trimmed deliberately — full snapshot has many cross-references
         and timing fields the LLM doesn't need. We pass what's
         observably "what is the user doing on screen + how recent is
         activity", and leave the rest as state-machine internals.
+
+        ``recent_windows`` adds a short trail of the last few foreground apps
+        (canonical names + dwell, no titles) so the narration can describe the
+        user's activity FLOW rather than only the instantaneous window.
         """
         win = snap.active_window
         return {
@@ -1177,12 +1369,33 @@ class UserActivityTracker:
                 if win and win.canonical else None
             ),
             'window_title': win.title if win else None,
+            'recent_windows': self._format_window_trail(now=now),
             'system_idle_seconds': int(snap.system_idle_seconds),
             'cpu_avg_30s': round(snap.cpu_avg_30s, 1),
             'window_switch_rate_5min': snap.window_switch_rate_5min,
             'voice_mode_active': snap.voice_mode_active,
             'time_period': snap.period,
         }
+
+    def _format_window_trail(self, *, now: float) -> str | None:
+        """One compact line of the recent foreground-app trail, or None.
+
+        Returns None for a single window (it adds nothing over ``active_window``),
+        so the line only appears when there's an actual flow to describe. App
+        names only — no titles. Example: ``VS Code 6min -> Chrome 2min -> Slack 40s``.
+        """
+        trail = self._sm.recent_window_trail(
+            now=now,
+            limit=_ACTIVITY_GUESS_WINDOW_TRAIL_LIMIT,
+            max_age_seconds=_ACTIVITY_GUESS_WINDOW_TRAIL_MAX_AGE_SECONDS,
+        )
+        if len(trail) < 2:
+            return None
+
+        def _dwell(seconds: float) -> str:
+            return f'{int(seconds)}s' if seconds < 90 else f'{int(seconds / 60)}min'
+
+        return ' -> '.join(f'{name} {_dwell(d)}' for name, d in trail)
 
     # ── internals ──────────────────────────────────────────────
 
@@ -1194,12 +1407,16 @@ class UserActivityTracker:
         # Spin up the activity_guess background loop on first snapshot
         # request. The loop self-throttles (state-signature dedup +
         # anti-thrash interval), so starting it eagerly is cheap.
-        if self._activity_guess_loop_task is None:
-            self._activity_guess_loop_task = asyncio.create_task(
-                self._activity_guess_loop(),
-                name=f'activity_guess_loop_{self.lanlan_name}',
-            )
+        self.ensure_activity_guess_loop_started()
         logger.info(
             '[%s] UserActivityTracker started (shared system collector + guess loop)',
             self.lanlan_name,
         )
+
+    def ensure_activity_guess_loop_started(self) -> None:
+        """Start the 20s heartbeat without starting OS signal collection."""
+        if self._activity_guess_loop_task is None or self._activity_guess_loop_task.done():
+            self._activity_guess_loop_task = asyncio.create_task(
+                self._activity_guess_loop(),
+                name=f'activity_guess_loop_{self.lanlan_name}',
+            )

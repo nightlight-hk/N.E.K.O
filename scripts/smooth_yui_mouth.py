@@ -1,4 +1,18 @@
-"""Smooth ParamMouthForm / ParamMouthOpenY in static/yui-origin motion files.
+# Copyright 2025-2026 Project N.E.K.O. Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Smooth ParamMouthForm / ParamMouthOpenY in Live2D motion files.
 
 The artist keyframes for the mouth params are too jittery for our use case
 (no lipsync, just background animation), causing visible flicker. This script
@@ -18,14 +32,16 @@ Meta.CurveCount / TotalSegmentCount / TotalPointCount are recomputed using the
 formula validated against the original files: per-curve points =
 4 + 3 * bezier_count + 1 * (linear|stepped|inverse_stepped)_count.
 
-Usage: `uv run python scripts/smooth_yui_mouth.py`
+Usage: `uv run python scripts/smooth_yui_mouth.py [--root static/yui-lolita]`
+(default root: static/yui-origin)
 """
 
+import argparse
 import json
 import math
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1] / "static" / "yui-origin"
+DEFAULT_ROOT = Path(__file__).resolve().parents[1] / "static" / "yui-origin"
 
 TARGET_IDS = ("ParamMouthForm", "ParamMouthOpenY")
 NEUTRAL = {"ParamMouthForm": 0.0, "ParamMouthOpenY": 0.0}
@@ -106,8 +122,8 @@ def smooth_curve(keys, neutral, sigma_s, out_hz, fade_s):
     t_end, _ = keys[-1]
     duration = t_end - t_start
     if duration <= 0:
-        # 退化时间轴（首尾时间相同）：直接钉回中性位，避免 dt=0 触发除零
-        # 让整批 motion 处理中断。
+        # For a degenerate timeline (identical start and end times), pin to neutral to avoid dt=0 causing division by zero
+        # and interrupting the entire batch of motions.
         return [(t_start, neutral), (t_end, neutral)]
     n_samples = max(2, int(round(duration * SAMPLE_HZ)) + 1)
     dt = duration / (n_samples - 1)
@@ -197,8 +213,19 @@ def process(path: Path):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
+    parser.add_argument(
+        "--root",
+        type=Path,
+        default=DEFAULT_ROOT,
+        help="Model directory containing *.motion3.json files (default: static/yui-origin)",
+    )
+    args = parser.parse_args()
+    files = sorted(args.root.glob("*.motion3.json"))
+    if not files:
+        parser.error(f"no *.motion3.json files under {args.root}")
     print(f"sigma={SIGMA_S}s  out={OUT_HZ}Hz  fade={FADE_S}s  sample={SAMPLE_HZ}Hz")
-    for f in sorted(ROOT.glob("*.motion3.json")):
+    for f in files:
         s = process(f)
         line = f"{f.name:<28}"
         for tid in TARGET_IDS:

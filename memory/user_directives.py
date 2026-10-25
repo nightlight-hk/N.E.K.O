@@ -1,43 +1,83 @@
 # -*- coding: utf-8 -*-
+# Copyright 2025-2026 Project N.E.K.O. Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 UserDirectivesManager — per-character store for explicit user ban-topic
 directives ("别再提 X / stop saying X / その話はもう / ...").
 
-设计动机
+Motivation
 --------
-本轮 LLM 看得到用户原话，不需要这里干预。但下一次 session 重启（archive
-触发 / cold start / 重连），那句话早被 ``compress_history`` 抹掉，模型会再次
-踩雷。所以把抽到的 term 持久化 3 天（``USER_DIRECTIVE_TTL_SECONDS``），
-``_build_initial_prompt`` 启动时拼一段注入 system prompt 尾部。
+The current-round LLM sees the user's original words; no intervention needed
+here. But on the next session restart (archive-triggered / cold start /
+reconnect), that message has long been wiped by ``compress_history`` and the
+model steps on the landmine again. So extracted terms are persisted, and
+``_build_initial_prompt`` splices a block into the system prompt tail at
+startup.
 
-设计要点
+Two things the startup injection alone does not cover, both wired on top of
+this module:
+- **Mid-session**: the system prompt is built once per session, so a directive
+  recorded at turn N does not reach the prompt until the next rebuild (up to
+  ~10 user turns away via hot-swap). ``mark_pending_injection`` /
+  ``take_pending_injection`` hand the "there is something new" flag to
+  ``main_logic`` (L4), which pushes the rendered block into the live session.
+  This module cannot do that itself — ``memory`` (L3) may not import upward.
+- **Proactive chat**: its Phase 2 prompt is assembled separately and never went
+  through ``_build_initial_prompt``. ``get_active_terms`` feeds both its prompt
+  section and its output-side drop gate.
+
+Design notes
 --------
-- **分发入口**：``dispatch_user_utterance`` fan-out。本模块 import 时自动调
-  ``register_user_utterance_sink``，与 ``plugin/core/state.py`` 同款 self-
-  registration（dedup-on-identity，重复注册不会重复触发）。
-- **抽取**：``config.prompts.prompts_directives.extract_directives`` 全 locale
-  并行跑（用户中英混说常见）；命中后 term 经 ``_trim_term`` 清洗。
-- **dedup 键**：``(kind, term.casefold())``。重复命中 → 刷新 ``last_seen_at`` /
-  ``expire_at`` + ``hit_count += 1``；新条目入库。
-- **存储**：``memory/{name}/user_directives.json``。schema 见 ``_DEFAULT_FILE``。
-- **TTL**：每条记录的 ``expire_at = last_seen_at + USER_DIRECTIVE_TTL_SECONDS``。
-  读取时过滤；``purge_expired`` 重写文件（可选，惰性即可）。
-- **prompt 注入**：``render_prompt_block(name, lang)`` 返回拼好的字符串（含
-  leading newline），空时返回 ""。调用方直接 ``prompt += ...``。
-- **并发**：per-character ``threading.Lock``，模式照搬 ``memory/cursors.py``。
+- **Dispatch entry**: ``dispatch_user_utterance`` fan-out. This module
+  self-registers via ``register_user_utterance_sink`` at import time, same
+  style as ``plugin/core/state.py`` (dedup-on-identity; repeated registration
+  doesn't re-fire).
+- **Extraction**: ``config.prompts.prompts_directives.extract_directives``
+  runs all locales in parallel (mixed Chinese/English speech is common); on a
+  hit the term is cleaned by ``_trim_term``.
+- **Dedup key**: ``(kind, term.casefold())``. Repeated hits → refresh
+  ``last_seen_at`` / ``expire_at`` + ``hit_count += 1``; new entries get stored.
+- **Storage**: ``memory/{name}/user_directives.json``. Schema: see ``_DEFAULT_FILE``.
+  Capped at ``USER_DIRECTIVE_MAX_STORED`` rows; overflow rotates the
+  least-recently-seen out (expired rows go first).
+- **TTL**: each record's ``expire_at = last_seen_at + _effective_ttl(hit_count)``
+  — the base window scaled by how many times the user has repeated it, capped
+  at ``USER_DIRECTIVE_TTL_MAX_SECONDS``. Filtered on read; ``purge_expired``
+  rewrites the file (optional; lazy is fine).
+- **Prompt injection**: ``render_prompt_block(name, lang)`` returns the
+  assembled string (with leading newline), "" when empty. Callers just do
+  ``prompt += ...``.
+- **Concurrency**: per-character ``threading.Lock``, pattern copied from
+  ``memory/cursors.py``.
 
-什么不抽取
+What is not extracted
 ----------
-- 无对象的"闭嘴/换话题/shut up"：本轮已经在 context 里，模型看得到；持久化又
-  没有具体话题，把这种意图塞到下一轮 prompt 里反而误伤。
-- 普通陈述句"我不喜欢西瓜"：不是显式 ban-topic 指令，让 fact/persona 流水线
-  处理偏好抽取。
+- Object-less "闭嘴/换话题/shut up": already in this round's context, the
+  model sees it; persisting carries no concrete topic, and pushing such intent
+  into the next round's prompt would backfire.
+- Plain statements like "我不喜欢西瓜" ("I don't like watermelon"): not an
+  explicit ban-topic directive; preference extraction belongs to the
+  fact/persona pipeline.
 
-错杀策略
+False-positive policy
 --------
-正则模板宽松。错杀代价 = 用户下次再说一次同义话；漏抽代价 = 用户被再次冒犯
-所以倾向错杀。term 长度 ∈ [2, 40] 才入库，超界丢弃。
-"""
+The regex templates are lenient. Cost of a false kill = the user says an
+equivalent sentence once more; cost of a miss = the user gets offended again —
+so we lean toward over-killing. Terms are stored only when length ∈ [2, 40];
+out-of-range ones are dropped.
+"""  # noqa: DOCSTRING_CJK
 from __future__ import annotations
 
 import os
@@ -45,7 +85,12 @@ import threading
 import time
 from typing import Any, Dict, List, Optional
 
-from config import USER_DIRECTIVE_MAX_ACTIVE, USER_DIRECTIVE_TTL_SECONDS
+from config import (
+    USER_DIRECTIVE_MAX_ACTIVE,
+    USER_DIRECTIVE_MAX_STORED,
+    USER_DIRECTIVE_TTL_MAX_SECONDS,
+    USER_DIRECTIVE_TTL_SECONDS,
+)
 from config.prompts.prompts_directives import (
     extract_directives,
     render_directives_block,
@@ -57,7 +102,7 @@ from utils.logger_config import get_module_logger
 logger = get_module_logger(__name__, "Memory")
 
 
-# 磁盘 schema 版本。改动 directive 字段语义时 bump，``_load_unlocked`` 拿来兼容旧文件。
+# Disk schema version: bump directive semantic changes; _load_unlocked handles legacy files.
 _SCHEMA_VERSION = 1
 
 
@@ -69,15 +114,15 @@ def _default_payload() -> Dict[str, Any]:
     return {"version": _SCHEMA_VERSION, "directives": []}
 
 
-# term 入库 / 出库共用的不变量：``str.strip()`` 后长度 ∈ [2, 40]。
-# 读盘与 ``record()`` 写入两侧都走这条 helper，磁盘态始终干净——历史文件里
-# 残留的过短 / 过长 / 非 str term 在下次 load 时被丢弃（CodeRabbit Minor）。
+# Shared storage invariant: stripped terms have length 2..40.
+# Both reads and record writes use this helper, dropping legacy
+# short/long/nonstring terms on next load to keep disk clean (CodeRabbit Minor).
 _TERM_MIN_LEN = 2
 _TERM_MAX_LEN = 40
 
 
 def _normalize_term(raw: Any) -> Optional[str]:
-    """归一化 term：``str.strip()`` 后强制长度 ∈ [2, 40]，否则 None。"""
+    """Normalize a term: ``str.strip()`` then enforce length ∈ [2, 40], else None."""
     if not isinstance(raw, str):
         return None
     term = raw.strip()
@@ -86,15 +131,35 @@ def _normalize_term(raw: Any) -> Optional[str]:
     return term
 
 
+def _effective_ttl(hit_count: Any) -> float:
+    """TTL for a directive repeated ``hit_count`` times, capped at the max.
+
+    Linear in the repeat count: saying it once buys the base window, saying it
+    again buys another one, and so on until the cap.
+    """
+    # Single mentions may reflect temporary emotions; repeated ones indicate stable preferences. Cap growth,
+    # or dozens of repeats create permanent personas without a current user-visible deletion UI.
+    # Use linear, not exponential growth: exponentials reach 30-day caps by hit_count=5,
+    # collapsing meaningful more-repeats/longer-memory distinctions too early.
+    try:
+        hits = int(hit_count)
+    except (TypeError, ValueError):
+        hits = 1
+    hits = max(1, hits)
+    return float(min(USER_DIRECTIVE_TTL_SECONDS * hits, USER_DIRECTIVE_TTL_MAX_SECONDS))
+
+
 def _normalize_entry(raw: Any) -> Optional[Dict[str, Any]]:
-    """把磁盘读上来的一条记录归一化为 dict；非法/缺字段 → None（丢弃）。
+    """Normalize one record read from disk into a dict; invalid / missing fields → None (dropped).
 
-    历史兼容：早期可能只有 ``term`` 和 ``created_at``——这里补齐
-    ``last_seen_at`` / ``expire_at`` / ``hit_count`` / ``kind`` / ``locale``。
+    Backward compat: early versions may have had only ``term`` and
+    ``created_at`` — this backfills ``last_seen_at`` / ``expire_at`` /
+    ``hit_count`` / ``kind`` / ``locale``.
 
-    ⚠️ 容错：单条脏数据（如 ``created_at: "abc"``）不应该让整份文件 load 失败、
-    把所有合法 directive 一起重置成空。整个函数包在一个 try/except 里，本条
-    返回 None 让 caller 丢弃但保留其它条目（CodeRabbit Minor）。
+    ⚠️ Fault tolerance: one dirty record (e.g. ``created_at: "abc"``) must not
+    fail the whole file load and reset every valid directive. The whole
+    function is wrapped in one try/except; this record returns None for the
+    caller to drop while keeping the others (CodeRabbit Minor).
     """
     if not isinstance(raw, dict):
         return None
@@ -114,17 +179,21 @@ def _normalize_entry(raw: Any) -> Optional[Dict[str, Any]]:
             last_seen_at = float(raw.get("last_seen_at") or created_at)
         except (TypeError, ValueError):
             last_seen_at = created_at
-        # 历史文件可能没写 expire_at；按 last_seen + TTL 补
-        try:
-            expire_at = float(raw.get("expire_at") or 0) or (
-                last_seen_at + USER_DIRECTIVE_TTL_SECONDS
-            )
-        except (TypeError, ValueError):
-            expire_at = last_seen_at + USER_DIRECTIVE_TTL_SECONDS
+        # Compute hit_count before expire_at because TTL now depends on it through
+        # _effective_ttl; legacy backfills need actual counts, or ten-repeat
+        # directives load as one-repeat expirations and instantly lose renewal duration.
         try:
             hit_count = int(raw.get("hit_count") or 1)
         except (TypeError, ValueError):
             hit_count = 1
+        hit_count = max(1, hit_count)
+        # Backfill missing legacy expire_at from last_seen plus each entry's own TTL.
+        try:
+            expire_at = float(raw.get("expire_at") or 0) or (
+                last_seen_at + _effective_ttl(hit_count)
+            )
+        except (TypeError, ValueError):
+            expire_at = last_seen_at + _effective_ttl(hit_count)
         return {
             "term": term,
             "kind": kind,
@@ -140,15 +209,16 @@ def _normalize_entry(raw: Any) -> Optional[Dict[str, Any]]:
 
 
 class UserDirectivesManager:
-    """Per-character ban-topic 存储（线程安全）。
+    """Per-character ban-topic store (thread-safe).
 
-    用法：
+    Usage:
         mgr = UserDirectivesManager()
         mgr.record_from_text(lanlan_name, raw_user_text)
         block = mgr.render_prompt_block(lanlan_name, lang='zh')
-        # 把 block 直接 concat 到 system prompt 末尾
+        # concat the block straight onto the system prompt tail
 
-    单进程内全局唯一实例 ``_GLOBAL_MANAGER``（见模块末尾）；sink 也基于它注册。
+    A single process-wide instance ``_GLOBAL_MANAGER`` (see module tail); the
+    sink is registered on it too.
     """
 
     def __init__(self) -> None:
@@ -156,11 +226,18 @@ class UserDirectivesManager:
         self._cache: Dict[str, List[Dict[str, Any]]] = {}
         self._locks: Dict[str, threading.Lock] = {}
         self._locks_guard = threading.Lock()
+        # Process-local flags for characters with newly persisted directives not yet injected into live sessions.
+        # Store names only, not term lists. Injection requires the complete active
+        # list, symmetric with _build_initial_prompt; render_prompt_block
+        # computes it fresh. Storing terms adds deduplication/cap handling and
+        # conflicts with complete-render semantics over new versus all terms.
+        self._pending_injection: set[str] = set()
+        self._pending_guard = threading.Lock()
 
     # ── path / lock ───────────────────────────────────────────
 
     def _file_path(self, name: str) -> str:
-        # 延迟 import 避开 memory/__init__.py 循环依赖（同 cursors.py 风格）
+        # Lazy imports avoid memory/__init__.py cycles, matching cursors.py.
         from memory import ensure_character_dir
         return os.path.join(
             ensure_character_dir(self._config_manager.memory_dir, name),
@@ -174,7 +251,7 @@ class UserDirectivesManager:
                     self._locks[name] = threading.Lock()
         return self._locks[name]
 
-    # ── load / save (锁由调用方持有) ──────────────────────────
+    # -- Load/save under caller-held locks --
 
     def _load_unlocked(self, name: str) -> List[Dict[str, Any]]:
         if name in self._cache:
@@ -192,7 +269,7 @@ class UserDirectivesManager:
                         norm = _normalize_entry(r)
                         if norm is not None:
                             directives.append(norm)
-            except Exception as exc:  # 文件损坏不致命，重启从空开始
+            except Exception as exc:  # Corrupt files are nonfatal; restart empty.
                 logger.warning(
                     "[UserDirectives] load failed for %s, starting empty: %s",
                     name, exc,
@@ -202,13 +279,34 @@ class UserDirectivesManager:
         return directives
 
     def _save_unlocked(self, name: str) -> None:
+        # Deliberately retain synchronous persistence on the event-loop thread:
+        #
+        # async _process_stream_data_internal calls
+        #   synchronous _publish_user_utterance_to_plugin_bus,
+        #   then synchronous fan-out dispatch_user_utterance,
+        #   then _on_user_utterance -> record_from_text -> here.
+        # dispatch_user_utterance promises synchronous fan-out with third-party plugin
+        # handlers in plugin.core.state/quota.dropper. Making this async moves every
+        # handler into worker threads, an event-bus architectural tradeoff that one disk
+        # write should not decide incidentally.
+        #
+        # Acceptable cost: write only on actual directive regex matches, such as topic bans,
+        # a handful per session with JSON payloads of hundreds of bytes.
+        #
+        # Future changes should mirror anti_repeat's stage/aflush split: update memory on
+        # caller threads so same-turn reads see fresh caches, offload fsync only,
+        # and add turn-lifecycle flush points.
+        #
+        # noqa currently suppresses no warning: check_async_blocking scans depth 1,
+        # missing this depth-6 call. Retain searchability and documentation for future
+        # deeper guards without renewed archaeology.
         path = self._file_path(name)
         payload = {
             "version": _SCHEMA_VERSION,
             "directives": self._cache.get(name, []),
         }
         try:
-            atomic_write_json(path, payload, indent=2, ensure_ascii=False)
+            atomic_write_json(path, payload, indent=2, ensure_ascii=False)  # noqa: ASYNC_BLOCK — Synchronous fan-out contract, documented above.
         except Exception as exc:
             logger.warning("[UserDirectives] save failed for %s: %s", name, exc)
 
@@ -224,14 +322,16 @@ class UserDirectivesManager:
         source: str = "regex",
         now: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """登记一条 directive；命中已有 ``(kind, term.casefold())`` 则刷新。
+        """Register a directive; an existing ``(kind, term.casefold())`` hit refreshes it.
 
-        返回最终存盘的 dict（含合并/刷新后的字段）；输入不合法（term 不是 str /
-        trim 后空 / 长度越界）返回空 dict。
+        Returns the final persisted dict (with merged/refreshed fields); invalid
+        input (term not a str / empty after trim / length out of range) returns
+        an empty dict.
 
-        ⚠️ 写盘 boundary 也走 ``_normalize_term`` —— 与 ``_normalize_entry`` 的
-        读盘校验共享同一份长度不变量，磁盘态始终满足 [_TERM_MIN_LEN, _TERM_MAX_LEN]
-        （CodeRabbit Minor）。
+        ⚠️ The write boundary also goes through ``_normalize_term`` — sharing
+        the same length invariant as ``_normalize_entry``'s read validation, so
+        the on-disk state always satisfies [_TERM_MIN_LEN, _TERM_MAX_LEN]
+        (CodeRabbit Minor).
         """
         if not name:
             return {}
@@ -240,31 +340,104 @@ class UserDirectivesManager:
             return {}
         term = term_norm
         ts = float(now if now is not None else _now())
-        expire = ts + USER_DIRECTIVE_TTL_SECONDS
         key = (kind, term.casefold())
         with self._get_lock(name):
             entries = self._load_unlocked(name)
             for e in entries:
                 if (e["kind"], e["term"].casefold()) == key:
+                    hits = int(e.get("hit_count", 1)) + 1
                     e["last_seen_at"] = ts
-                    e["expire_at"] = expire
-                    e["hit_count"] = int(e.get("hit_count", 1)) + 1
-                    # locale 不覆盖：首次命中的 locale 是更具诊断价值的信号
+                    # Renewal uses the incremented repeat count; this repetition itself
+                    # proves another user reminder and must affect current renewal,
+                    # not wait for another future hit.
+                    e["expire_at"] = ts + _effective_ttl(hits)
+                    e["hit_count"] = hits
+                    # Keep first-hit locale as the more diagnostic signal.
+                    # Rotate refreshed entries too; legacy files predate caps and may contain
+                    # hundreds of entries. Users only repeating old directives never reach
+                    # insertion branches, so without rotation here files never shrink,
+                    # and each record still fully reads/writes them synchronously
+                    # on every user-message chain.
+                    self._rotate_unlocked(name, now=ts)
                     self._save_unlocked(name)
-                    return dict(e)
+                    return self._report_if_kept(name, e)
             new_entry = {
                 "term": term,
                 "kind": kind,
                 "locale": locale,
                 "created_at": ts,
                 "last_seen_at": ts,
-                "expire_at": expire,
+                "expire_at": ts + _effective_ttl(1),
                 "hit_count": 1,
                 "source": source,
             }
             entries.append(new_entry)
+            self._rotate_unlocked(name, now=ts)
             self._save_unlocked(name)
-            return dict(new_entry)
+            return self._report_if_kept(name, new_entry)
+
+    def _report_if_kept(
+        self, name: str, entry: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Return ``entry`` only if rotate kept it; ``{}`` when it was evicted.
+
+        Caller holds the lock and has already rotated + persisted.
+        """
+        # Rotation can evict the just-written entry on both new/refresh branches: stable
+        # ties retain old order, placing appended new entries at the truncated tail;
+        # refresh timestamps may also precede existing ones. Existing cap-sized active
+        # sets whose last_seen all >=ts trigger this through
+        # NTP/resume/dual-boot timezone clock rollback in Windows desktop usage,
+        # or same-millisecond ties.
+        #
+        # Unconditional success makes record_from_text -> mark_pending_injection
+        # schedule rendering for terms absent from disk/memory,
+        # disabling repeated bans in both current and next sessions.
+        #
+        # Share one helper across both branches. Refresh initially omitted this check
+        # because its rotation was added later to fix oversized legacy files,
+        # without reevaluating return values, caught as greptile P1.
+        if any(item is entry for item in self._cache.get(name, ())):
+            return dict(entry)
+        # Never print raw banned terms: users explicitly rejected hearing them,
+        # e.g. ex-partners/illness/deceased names, and this logger persists to disk. The same
+        # proactive gate rule already replaced terms=%s with counts, but this
+        # helper reintroduced raw terms, caught by greptile P1. Character name and the
+        # diagnostic message suffice without exposing which term.
+        logger.warning(
+            "[UserDirectives] %s: a directive was rotated out immediately "
+            "(store at cap with newer timestamps); not reporting it as recorded",
+            name,
+        )
+        return {}
+
+    def _rotate_unlocked(self, name: str, *, now: float) -> int:
+        """Cap the stored list at ``USER_DIRECTIVE_MAX_STORED``, oldest first.
+
+        Returns the number of entries dropped. Caller holds the lock.
+        """
+        entries = self._cache.get(name)
+        if not entries or len(entries) <= USER_DIRECTIVE_MAX_STORED:
+            return 0
+        # Purge expired entries before last_seen eviction: get_active cannot see dead
+        # directives, so letting them displace live user intent substitutes
+        # dead data for actual preferences.
+        alive = [e for e in entries if float(e.get("expire_at", 0)) > now]
+        expired_dropped = len(entries) - len(alive)
+        if len(alive) > USER_DIRECTIVE_MAX_STORED:
+            # Keep latest N by last_seen_at, matching get_active ordering;
+            # injection takes newest while eviction removes least recently mentioned.
+            alive.sort(key=lambda e: float(e.get("last_seen_at", 0)), reverse=True)
+            alive = alive[:USER_DIRECTIVE_MAX_STORED]
+        dropped = len(entries) - len(alive)
+        self._cache[name] = alive
+        if dropped > expired_dropped:
+            logger.info(
+                "[UserDirectives] %s: rotated out %d directive(s) over the "
+                "%d cap (%d of them already expired)",
+                name, dropped, USER_DIRECTIVE_MAX_STORED, expired_dropped,
+            )
+        return dropped
 
     def record_from_text(
         self,
@@ -273,9 +446,9 @@ class UserDirectivesManager:
         *,
         now: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
-        """对一段 user 文本跑完整抽取 → 入库流水线。
+        """Run the full extract → store pipeline over a user text.
 
-        返回当次写入/刷新的 entry 列表（空 = 未命中任何 pattern）。
+        Returns the list of entries written/refreshed this time (empty = no pattern hit).
         """
         if not name or not text:
             return []
@@ -295,7 +468,35 @@ class UserDirectivesManager:
                     now=ts,
                 )
             )
+        # record returns {} for invalid terms; do not mark injection when all were dropped.
+        if any(out):
+            self.mark_pending_injection(name)
         return out
+
+    # -- Mid-session pending-injection flags --
+
+    def mark_pending_injection(self, name: str) -> None:
+        """Flag that ``name`` has fresh directives not yet pushed into a live session."""
+        if not name:
+            return
+        with self._pending_guard:
+            self._pending_injection.add(name)
+
+    def take_pending_injection(self, name: str) -> bool:
+        """Consume the pending flag for ``name``; True when there was one.
+
+        Take-once: the flag is cleared even if the caller then fails to inject.
+        A dropped injection costs at most the pre-existing behaviour (the block
+        still lands at the next session rebuild), whereas a flag that survives
+        a failure would re-inject the same block on every later turn.
+        """
+        if not name:
+            return False
+        with self._pending_guard:
+            if name not in self._pending_injection:
+                return False
+            self._pending_injection.discard(name)
+            return True
 
     def get_active(
         self,
@@ -304,7 +505,7 @@ class UserDirectivesManager:
         now: Optional[float] = None,
         limit: int = USER_DIRECTIVE_MAX_ACTIVE,
     ) -> List[Dict[str, Any]]:
-        """返回未过期、按 last_seen_at 倒序的最多 ``limit`` 条记录。"""
+        """Return up to ``limit`` unexpired records, sorted by last_seen_at descending."""
         if not name:
             return []
         ts = float(now if now is not None else _now())
@@ -317,7 +518,7 @@ class UserDirectivesManager:
         return alive
 
     def purge_expired(self, name: str, *, now: Optional[float] = None) -> int:
-        """惰性清理：删除过期条目并落盘；返回删除条数。"""
+        """Lazy cleanup: delete expired entries and persist; returns the number deleted."""
         if not name:
             return 0
         ts = float(now if now is not None else _now())
@@ -331,6 +532,15 @@ class UserDirectivesManager:
                 self._save_unlocked(name)
             return removed
 
+    def get_active_terms(
+        self,
+        name: str,
+        *,
+        now: Optional[float] = None,
+    ) -> List[str]:
+        """Active terms only, newest-first — the shape output-side filters want."""
+        return [e["term"] for e in self.get_active(name, now=now) if e.get("term")]
+
     def render_prompt_block(
         self,
         name: str,
@@ -338,23 +548,26 @@ class UserDirectivesManager:
         *,
         now: Optional[float] = None,
     ) -> str:
-        """把活跃 term 拼成 system prompt 片段。空时返回 ""。"""
-        active = self.get_active(name, now=now)
-        if not active:
+        """Render active terms into a system-prompt fragment. Returns "" when empty."""
+        terms = self.get_active_terms(name, now=now)
+        if not terms:
             return ""
-        terms = [e["term"] for e in active]
         return render_directives_block(terms, lang)
 
     def clear(self, name: str) -> None:
-        """测试 / 用户手动清空入口。"""
+        """Entry point for tests / manual user clearing."""
         if not name:
             return
         with self._get_lock(name):
             self._cache[name] = []
             self._save_unlocked(name)
+        # Clearing all injectable content must clear pending flags too, avoiding empty
+        # next-turn injections that waste take semantics.
+        with self._pending_guard:
+            self._pending_injection.discard(name)
 
 
-# ── 进程级单例 + 自注册 ──────────────────────────────────────
+# -- Process singleton and registration --
 _GLOBAL_MANAGER: Optional[UserDirectivesManager] = None
 _GLOBAL_MANAGER_LOCK = threading.Lock()
 
@@ -369,17 +582,21 @@ def get_user_directives_manager() -> UserDirectivesManager:
 
 
 def _on_user_utterance(bucket: str, event: Dict[str, Any]) -> None:
-    """user_utterance sink：抽取并落盘。错误吞掉（main_logic 已经在 dispatch
-    内部做了 per-sink try/except，这里再加一层防御）。
+    """user_utterance sink: extract and persist. Errors are swallowed (main_logic
+    already does a per-sink try/except inside dispatch; this is one more layer
+    of defense).
 
-    Dedup 规则：``dispatch_user_utterance`` 同次 dispatch 会向 ``"default"``
-    与角色名两个 bucket 都派一遍（见 ``main_logic/core.py`` 的
-    ``dict.fromkeys(("default", self.lanlan_name))`` 循环）。规则：
-      - event["lanlan"] 非空且非 "default" → 是真角色，"default" bucket 视
-        为重复，skip；只在 bucket == event["lanlan"] 时入库
-      - event["lanlan"] 为空 / 是 "default" → 整个 dispatch 只发了 "default"
-        一份（角色未配 / 角色名 literal 就是 "default"），bucket=="default"
-        进入正常处理，避免整段消息漏抽（codex P1）
+    Dedup rule: a single ``dispatch_user_utterance`` dispatch fans out to both
+    the ``"default"`` bucket and the character-name bucket (see the
+    ``dict.fromkeys(("default", self.lanlan_name))`` loop in
+    ``main_logic/core.py``). Rules:
+      - event["lanlan"] non-empty and not "default" → a real character; the
+        "default" bucket counts as the duplicate, skip; only store when
+        bucket == event["lanlan"]
+      - event["lanlan"] empty / "default" → the dispatch only sent the
+        "default" copy (character unconfigured / character literally named
+        "default"); bucket=="default" goes through normal processing, so the
+        whole message isn't missed (codex P1)
     """
     if not isinstance(event, dict):
         return
@@ -387,22 +604,22 @@ def _on_user_utterance(bucket: str, event: Dict[str, Any]) -> None:
     if not isinstance(canonical, str):
         canonical = ""
     if canonical and canonical != "default":
-        # 真角色：跳过 default 的重复分发，只处理角色 bucket
+        # Real characters skip duplicate default dispatch and process only character buckets.
         if bucket != canonical:
             return
         record_key = canonical
     else:
-        # 无 character 或 character literal == "default"：dispatch 只发了
-        # "default"，必须处理这一份
+        # Missing characters or literal default receive only default dispatch,
+        # which must be handled.
         if not bucket:
             return
-        record_key = bucket  # 当 lanlan_name 为空时只能落到 bucket（即 "default"）
+        record_key = bucket  # Empty lanlan_name can persist only to the default bucket.
     text = ""
     raw = event.get("content")
     if isinstance(raw, str):
         text = raw
     elif isinstance(raw, list):
-        # multimodal content list：拼 text 片段
+        # Multimodal content lists concatenate text parts.
         parts: List[str] = []
         for p in raw:
             if isinstance(p, dict):
@@ -420,13 +637,13 @@ def _on_user_utterance(bucket: str, event: Dict[str, Any]) -> None:
         logger.debug("[UserDirectives] sink failed: %s", exc)
 
 
-# 注意：sink 不能在这里 self-register。``memory`` 层在 ``main_logic`` 之下
-# （scripts/check_module_layering.py），向上 import ``main_logic.agent_event_bus``
-# 会触发 LAYER_CYCLE。所以本模块只导出 ``_on_user_utterance``；真正把它接到
-# event bus 的工作放到 ``app/runtime_bindings.py``（L6 app 层有权碰 L4
-# main_logic + L3 memory，是合法的接线点）。
+# Sinks cannot self-register here: memory lies below main_logic under
+# check_module_layering, and upward imports of main_logic.agent_event_bus
+# trigger LAYER_CYCLE. Export _on_user_utterance only; actual wiring belongs
+# in app/runtime_bindings.py, where L6 app may access both L4
+# main_logic and L3 memory.
 #
-# 副作用：直接 import 本模块的测试 / 临时脚本不会自动起 sink；测试通过
-# ``_on_user_utterance(bucket, event)`` 手动驱动验证抽取+落盘合同（见
+# Tests/ad-hoc scripts importing this module therefore do not start sinks automatically;
+# manually drive _on_user_utterance(bucket,event) to verify extraction/persistence.
 # ``tests/unit/test_user_directives.py::test_user_utterance_sink_records``）；
-# 集成路径靠 ``app.__init__`` → ``install_runtime_bindings`` 完成挂载。
+# Integration registers through app.__init__ -> install_runtime_bindings.

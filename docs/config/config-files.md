@@ -1,71 +1,48 @@
 # Config Files
 
-Configuration files are stored in the user's documents directory under `N.E.K.O/`.
+N.E.K.O. separates **writable user data** from **bundled repository defaults**.
 
-## File locations
+## Writable data root
+
+The storage-location policy selects the application data root. Defaults are:
+
+- Windows: `%LOCALAPPDATA%\N.E.K.O`
+- macOS: `~/Library/Application Support/N.E.K.O`
+- Linux: `$XDG_DATA_HOME/N.E.K.O`, or `~/.local/share/N.E.K.O`
+
+A user-selected location can replace the default. Inspect the storage-location UI/API when diagnosing another machine.
+
+The selected root's `config/` directory can contain:
 
 | File | Purpose |
-|------|---------|
-| `core_config.json` | API keys, provider selection, custom endpoints |
-| `characters.json` | Character definitions and personality data |
-| `user_preferences.json` | UI preferences, model choices |
-| `voice_storage.json` | Custom voice configurations |
-| `workshop_config.json` | Steam Workshop settings |
+| --- | --- |
+| `core_config.json` | Provider selection, credentials, role overrides, feature settings |
+| `characters.json` | Character definitions and reserved avatar data |
+| `user_preferences.json` | User/UI preferences |
+| `voice_storage.json` | Saved voice metadata |
+| `workshop_config.json` | Workshop settings |
 
-## `core_config.json`
+Features may add more runtime files. Prefer the Web UI because it writes the current schema.
 
-The primary runtime configuration file.
+## Bundled configuration
 
-```json
-{
-  "coreApiKey": "",
-  "coreApi": "qwen",
-  "assistApi": "qwen",
-  "assistApiKeyQwen": "",
-  "assistApiKeyOpenai": "",
-  "assistApiKeyGlm": "",
-  "assistApiKeyStep": "",
-  "assistApiKeySilicon": "",
-  "assistApiKeyGemini": "",
-  "mcpToken": "",
-  "agentModelUrl": "",
-  "agentModelId": "",
-  "agentModelApiKey": ""
-}
-```
+The repository `config/` directory is application data, not the normal user-data location.
 
-## `characters.json`
+- `config/api_providers.json` defines provider profiles and related catalogs.
+- `config/characters/*.json` contains defaults for the eight supported locales.
+- Python modules under `config/` provide validated defaults and constants.
 
-Defines all characters and the master (owner) profile.
+On first use, `utils/config_manager/` migrates or copies supported defaults into the writable root. Subsequent writes go to the writable root.
 
-```json
-{
-  "master": {
-    "档案名": "哥哥",
-    "性别": "男",
-    "昵称": "哥哥"
-  },
-  "catgirl": {
-    "小天": {
-      "性别": "女",
-      "年龄": 15,
-      "昵称": "T酱, 小T",
-      "live2d": "mao_pro",
-      "voice_id": "",
-      "system_prompt": "..."
-    }
-  }
-}
-```
+## Character schema
 
-Character fields are flexible — any key-value pair can be added and will be included in the character's context.
+Character identifiers and display names come from the active character data. Reserved multi-avatar settings live under `_reserved.avatar`; a legacy top-level `live2d` value may still appear for compatibility. The emergency code fallback and the locale JSON defaults are not identical, so never hardcode a translated character name as an identifier.
 
-## File discovery
+## Safe manual editing
 
-The `ConfigManager` class (`utils/config_manager.py`) handles file discovery:
+1. Stop the application.
+2. Back up the selected data root.
+3. Preserve JSON types and reserved fields.
+4. Restart and verify the owning UI.
 
-1. Check the user's documents directory (`~/Documents/N.E.K.O/`)
-2. Fall back to the project's `config/` directory
-3. Create default files if none exist
-
-On Windows, the documents directory is resolved via the Windows API. On macOS/Linux, it uses `~/Documents/`.
+Never commit personal `core_config.json`, character data, or credentials.

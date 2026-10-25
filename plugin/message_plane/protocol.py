@@ -15,9 +15,7 @@ RpcOp = Literal[
     "bus.list_topics",
     "bus.publish",
     "bus.get_recent",
-    "bus.get_since",
     "bus.query",
-    "bus.replay",
 ]
 
 
@@ -79,6 +77,12 @@ class BusQueryArgs(BaseModel):
     source: Optional[str] = Field(default=None, max_length=128)
     kind: Optional[str] = Field(default=None, max_length=64)
     type: Optional[str] = Field(default=None, max_length=64)
+    # ``conversation_id`` is not a payload top-level field like its neighbours
+    # here: the writer puts it in ``metadata`` and TopicStore._extract_index
+    # projects it into the index. It is declared as a filter because
+    # ConversationClient.get_by_id sends it -- and this model is extra="forbid",
+    # so an undeclared field is not "ignored", it is a BAD_ARGS rejection.
+    conversation_id: Optional[str] = Field(default=None, max_length=128)
     priority_min: Optional[int] = None
     since_ts: Optional[float] = None
     until_ts: Optional[float] = None
@@ -91,25 +95,6 @@ class BusQueryResult(BaseModel):
     topic: str
     items: List[Dict[str, Any]]
     light: bool
-
-
-class BusReplayArgs(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-    store: str = Field(min_length=1, max_length=32)
-    plan: Dict[str, Any]
-    limit: Optional[int] = Field(default=None, ge=1, le=10000)
-    topic: Optional[str] = Field(default=None, max_length=128)
-    light: Optional[bool] = None
-
-
-class BusReplayResult(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-    store: str
-    topic: Optional[str] = None
-    items: List[Dict[str, Any]]
-    diag: Optional[Dict[str, Any]] = None
 
 
 class IngestDeltaItem(BaseModel):
@@ -179,8 +164,6 @@ def export_json_schemas() -> Dict[str, Any]:
         "bus_get_recent_result": BusGetRecentResult.model_json_schema(),
         "bus_query_args": BusQueryArgs.model_json_schema(),
         "bus_query_result": BusQueryResult.model_json_schema(),
-        "bus_replay_args": BusReplayArgs.model_json_schema(),
-        "bus_replay_result": BusReplayResult.model_json_schema(),
         "ingest_delta_batch": IngestDeltaBatch.model_json_schema(),
         "ingest_snapshot": IngestSnapshot.model_json_schema(),
     }

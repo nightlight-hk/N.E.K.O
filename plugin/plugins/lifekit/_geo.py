@@ -1,4 +1,4 @@
-"""系统时区检测 + VPN 矛盾检测。"""
+"""System timezone detection and neutral timezone consistency checks."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 
 
 def get_system_timezone() -> Optional[str]:
-    """获取系统本地时区名称（IANA 格式）。"""
+    """Get the system local time zone name (IANA format)."""
     try:
         local_tz = datetime.now().astimezone().tzinfo
         if local_tz is None:
@@ -54,8 +54,8 @@ def _tz_offset_hours(tz_name: str) -> Optional[float]:
     return None
 
 
-def detect_vpn_conflict(ip_timezone: str, system_tz: Optional[str]) -> bool:
-    """IP 时区与系统时区偏差 ≥ 2h 视为 VPN。"""
+def detect_timezone_mismatch(ip_timezone: str, system_tz: Optional[str]) -> bool:
+    """Return whether IP and system timezone offsets differ materially."""
     if not ip_timezone or not system_tz:
         return False
     ip_off = _tz_offset_hours(ip_timezone)
@@ -63,3 +63,8 @@ def detect_vpn_conflict(ip_timezone: str, system_tz: Optional[str]) -> bool:
     if ip_off is None or sys_off is None:
         return False
     return abs(ip_off - sys_off) >= 2.0
+
+
+def detect_vpn_conflict(ip_timezone: str, system_tz: Optional[str]) -> bool:
+    """Compatibility alias; a timezone mismatch alone does not prove VPN use."""
+    return detect_timezone_mismatch(ip_timezone, system_tz)

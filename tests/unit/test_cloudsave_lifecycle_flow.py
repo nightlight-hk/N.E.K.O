@@ -109,7 +109,7 @@ def _write_runtime_state(cm, *, character_name: str, recent_message: str = "你�
 
 
 def _run_launcher_phase0(cm):
-    import launcher
+    from launcher_core import runtime as launcher
 
     emitted_events = []
     with patch.object(launcher, "get_config_manager", lambda _app_name, **_kwargs: cm), patch.object(
@@ -304,6 +304,11 @@ def test_full_cloudsave_chain_runtime_snapshot_steam_cloud_and_manual_apply():
 @pytest.mark.asyncio
 async def test_main_server_manual_startup_performs_fallback_import_and_continues_boot():
     from app import main_server
+    from utils import steam_state
+
+    leaked_steamworks = SimpleNamespace(source="prior-test")
+    main_server.steamworks = leaked_steamworks
+    steam_state.set_steamworks(leaked_steamworks)
 
     fake_config_manager = SimpleNamespace(
         app_docs_dir=Path("/tmp/N.E.K.O"),
@@ -329,10 +334,13 @@ async def test_main_server_manual_startup_performs_fallback_import_and_continues
             await bridge_start()
 
     with contextlib.ExitStack() as stack:
+        # This storage test does not own optional sync work on its temporary loop.
+        stack.enter_context(patch("services.chat_sync.runtime.schedule_desktop_chat_sync_start"))
         stack.enter_context(patch.object(main_server, "_IS_MAIN_PROCESS", True))
         stack.enter_context(patch.object(main_server, "_runtime_startup_init_completed", False))
         stack.enter_context(patch.object(main_server, "_preload_task", None))
         stack.enter_context(patch.object(main_server, "agent_event_bridge", None))
+        stack.enter_context(patch.object(main_server, "steamworks", None))
         stack.enter_context(patch.object(main_server, "_config_manager", fake_config_manager))
         stack.enter_context(
             patch.object(main_server, "get_storage_startup_blocking_reason", Mock(return_value=""))
@@ -361,6 +369,9 @@ async def test_main_server_manual_startup_performs_fallback_import_and_continues
         )
         mock_mount_workshop = stack.enter_context(
             patch.object(main_server, "_init_and_mount_workshop", AsyncMock(return_value=None))
+        )
+        mock_start_workers = stack.enter_context(
+            patch.object(main_server, "_start_neko_servers_integration_workers", Mock())
         )
         mock_set_steamworks = stack.enter_context(
             patch("main_routers.shared_state.set_steamworks", Mock())
@@ -393,6 +404,7 @@ async def test_main_server_manual_startup_performs_fallback_import_and_continues
         bridge_start.assert_awaited_once_with()
         mock_set_main_bridge.assert_called_once()
         mock_mount_workshop.assert_awaited_once_with()
+        mock_start_workers.assert_called_once_with()
         fake_tracker.start_periodic_save.assert_called_once_with()
         fake_tracker.record_app_start.assert_called_once_with(process="main_server")
         assert main_server._preload_task is not None
@@ -408,7 +420,8 @@ async def test_main_server_shutdown_does_not_reexport_runtime_into_cloudsave_sna
     with patch.object(main_server, "_IS_MAIN_PROCESS", True), \
          patch.object(main_server, "_preload_task", None), \
          patch.object(main_server, "agent_event_bridge", None), \
-         patch.object(main_server, "role_state", _role_state_from_session_managers({})), \
+         patch.object(main_server, "steamworks", None), \
+         patch.object(main_server.character_runtime, "role_state", _role_state_from_session_managers({})), \
          patch.object(main_server, "_run_cloudsave_manager_action", AsyncMock()) as run_cloudsave_action, \
          patch("utils.music_crawlers.close_all_crawlers", AsyncMock(return_value=None)), \
          patch("utils.token_tracker.TokenTracker.get_instance", return_value=fake_tracker):
@@ -419,6 +432,255 @@ async def test_main_server_shutdown_does_not_reexport_runtime_into_cloudsave_sna
         "upload_existing_snapshot",
         reason="main_server_shutdown_remote_upload",
         budget_seconds=5.0,
+    )
+
+
+_SHUTDOWN_CLEANUP_ORDER = [
+    "voice",
+    "cleanup",
+    "connectors",
+    "integration_workers",
+    "translation",
+    "token",
+    "music",
+    "cloudsave",
+    "internal_http",
+    "external_http",
+]
+
+
+@contextlib.contextmanager
+def _patched_shutdown_steps(cleanup_order: list[str], step_factory):
+    """Patch every on_shutdown cleanup with a recorder built by ``step_factory``."""
+    from app import main_server
+
+    fake_tracker = SimpleNamespace(
+        save=Mock(side_effect=lambda: cleanup_order.append("token"))
+    )
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(patch.object(main_server, "_IS_MAIN_PROCESS", True))
+        stack.enter_context(patch.object(main_server, "_preload_task", None))
+        stack.enter_context(patch.object(main_server, "_game_cleanup_task", None))
+        stack.enter_context(patch.object(main_server, "agent_event_bridge", None))
+        stack.enter_context(patch.object(main_server, "steamworks", None))
+        stack.enter_context(
+            patch.object(
+                main_server.character_runtime,
+                "role_state",
+                _role_state_from_session_managers({}),
+            )
+        )
+        stack.enter_context(
+            patch.object(
+                main_server,
+                "cleanup",
+                Mock(side_effect=lambda: cleanup_order.append("cleanup")),
+            )
+        )
+        stack.enter_context(
+            patch.object(
+                main_server,
+                "get_start_config",
+                Mock(return_value={"shutdown_memory_server_on_exit": False}),
+            )
+        )
+        for target, name in (
+            ("join_sync_connector_threads", "connectors"),
+            ("_stop_neko_servers_integration_workers", "integration_workers"),
+            ("_run_cloudsave_manager_action", "cloudsave"),
+        ):
+            stack.enter_context(
+                patch.object(
+                    main_server, target, AsyncMock(side_effect=step_factory(name))
+                )
+            )
+        for target, name in (
+            ("app.main_server.voice_identity_runtime.close_voice_identity_runtime", "voice"),
+            ("utils.language_utils.aclose_translation_service", "translation"),
+            ("utils.music_crawlers.close_all_crawlers", "music"),
+            ("utils.internal_http_client.aclose_internal_http_client", "internal_http"),
+            ("utils.external_http_client.aclose_external_http_client", "external_http"),
+        ):
+            stack.enter_context(
+                patch(
+                    target,
+                    AsyncMock(side_effect=step_factory(name)),
+                    create=target.startswith("utils.language_utils"),
+                )
+            )
+        stack.enter_context(
+            patch(
+                "utils.token_tracker.TokenTracker.get_instance",
+                return_value=fake_tracker,
+            )
+        )
+        yield
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancelled_step", ("voice", "connectors", "cloudsave"))
+async def test_main_server_shutdown_defers_cancellation_until_every_cleanup_ran(
+    cancelled_step,
+):
+    """A cancel delivered while one cleanup is awaited must not skip the rest.
+
+    ``except Exception`` does not catch ``CancelledError`` (a ``BaseException``),
+    so a bare await let it escape ``on_shutdown`` and skip every later cleanup.
+    The cancellation must still reach the caller once all cleanups have run --
+    including the Cloud Save upload when the cancel landed before it.
+    """
+    from app import main_server
+
+    cleanup_order: list[str] = []
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    def _record(name):
+        async def _step(*_args, **_kwargs):
+            cleanup_order.append(name)
+            if name == cancelled_step:
+                entered.set()
+                await release.wait()
+
+        return _step
+
+    with _patched_shutdown_steps(cleanup_order, _record):
+        shutdown_task = asyncio.create_task(main_server.on_shutdown())
+        await entered.wait()
+        shutdown_task.cancel()
+        await asyncio.sleep(0)
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await shutdown_task
+
+    assert cleanup_order == _SHUTDOWN_CLEANUP_ORDER
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_main_server_shutdown_cancel_gets_past_a_stuck_cloudsave_upload(
+    monkeypatch,
+):
+    """A stuck Steam call has no deadline; cancelling shutdown must still get out.
+
+    main let the cancel escape (skipping the HTTP pool cleanup); here the
+    upload gets its cancelled budget, then every later cleanup still runs
+    before the cancellation is re-raised.
+    """
+    from app import main_server
+
+    monkeypatch.setattr(
+        main_server, "_CLOUDSAVE_SHUTDOWN_UPLOAD_CANCELLED_BUDGET_SECONDS", 0.05
+    )
+    cleanup_order: list[str] = []
+    entered = asyncio.Event()
+    never = asyncio.Event()
+
+    def _record(name):
+        async def _step(*_args, **_kwargs):
+            cleanup_order.append(name)
+            if name == "cloudsave":
+                entered.set()
+                await never.wait()
+
+        return _step
+
+    with _patched_shutdown_steps(cleanup_order, _record):
+        shutdown_task = asyncio.create_task(main_server.on_shutdown())
+        await entered.wait()
+        shutdown_task.cancel()
+        done, _ = await asyncio.wait({shutdown_task}, timeout=5.0)
+        never.set()
+        await asyncio.gather(
+            shutdown_task,
+            *list(main_server._SHUTDOWN_STEP_TASKS),
+            return_exceptions=True,
+        )
+        assert done, "cancelling shutdown must get past a stuck Cloud Save upload"
+        with pytest.raises(asyncio.CancelledError):
+            shutdown_task.result()
+
+    assert cleanup_order == _SHUTDOWN_CLEANUP_ORDER
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_main_server_shutdown_step_failure_does_not_skip_later_cleanups():
+    from app import main_server
+
+    cleanup_order: list[str] = []
+
+    def _record(name):
+        async def _step(*_args, **_kwargs):
+            cleanup_order.append(name)
+            if name in ("connectors", "integration_workers"):
+                raise RuntimeError(f"{name} failed")
+
+        return _step
+
+    with _patched_shutdown_steps(cleanup_order, _record):
+        await main_server.on_shutdown()
+
+    assert cleanup_order == _SHUTDOWN_CLEANUP_ORDER
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_main_server_shutdown_logs_cloudsave_result_only_after_upload_succeeded():
+    from app import main_server
+
+    def _record(name):
+        async def _step(*_args, **_kwargs):
+            if name == "cloudsave":
+                raise RuntimeError("upload failed")
+
+        return _step
+
+    with _patched_shutdown_steps([], _record), \
+         patch.object(main_server.logger, "info") as info_log:
+        await main_server.on_shutdown()
+
+    assert not any(
+        "staged snapshot upload:" in str(c.args[0]) for c in info_log.call_args_list
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_main_server_shutdown_waits_for_cloudsave_upload_without_deadline():
+    """The upload writes Steam from a worker thread a cancel cannot stop.
+
+    A step deadline would only let shutdown move on while the remote snapshot
+    is still being written, so the step waits for the thread as it did before.
+    """
+    from app import main_server
+
+    real_run_step = main_server._run_shutdown_step
+    deadlines: dict[str, float | None] = {}
+
+    async def spy_run_step(factory, *, what, deadline_monotonic, **kwargs):
+        deadlines[what] = deadline_monotonic
+        return await real_run_step(
+            factory, what=what, deadline_monotonic=deadline_monotonic, **kwargs
+        )
+
+    def _record(name):
+        async def _step(*_args, **_kwargs):
+            return None
+
+        return _step
+
+    with _patched_shutdown_steps([], _record), \
+         patch.object(main_server, "_run_shutdown_step", spy_run_step):
+        await main_server.on_shutdown()
+
+    assert deadlines["Steam Auto-Cloud shutdown staged snapshot upload"] is None
+    assert deadlines["voice identity cleanup"] is None
+    assert all(
+        deadline is not None
+        for what, deadline in deadlines.items()
+        if what not in ("Steam Auto-Cloud shutdown staged snapshot upload", "voice identity cleanup")
     )
 
 
@@ -543,11 +805,109 @@ async def test_main_server_startup_stays_limited_when_storage_barrier_is_blockin
          patch.object(main_server, "role_state", {}), \
          patch.object(main_server, "_config_manager", SimpleNamespace()), \
          patch.object(main_server, "get_storage_startup_blocking_reason", Mock(return_value="selection_required")), \
+         patch.object(main_server, "_start_neko_servers_integration_workers", Mock()) as mock_start_workers, \
          patch.object(main_server, "_ensure_main_server_runtime_initialized", AsyncMock()) as mock_ensure_runtime:
         await main_server.on_startup()
         assert shared_state.get_templates() is sentinel_templates
 
     mock_ensure_runtime.assert_not_awaited()
+    mock_start_workers.assert_not_called()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_release_storage_startup_barrier_starts_integration_workers_after_runtime_init():
+    from app import main_server
+
+    with patch.object(
+        main_server,
+        "_request_memory_server_continue_startup",
+        AsyncMock(return_value=None),
+    ) as mock_continue, patch.object(
+        main_server,
+        "_ensure_main_server_runtime_initialized",
+        AsyncMock(return_value=True),
+    ) as mock_ensure, patch.object(
+        main_server,
+        "_start_neko_servers_integration_workers",
+        Mock(),
+    ) as mock_start_workers, patch(
+        # Sync startup and shutdown have their own lifecycle regression coverage.
+        "services.chat_sync.runtime.schedule_desktop_chat_sync_start",
+    ):
+        result = await main_server.release_storage_startup_barrier(reason="unit_test")
+
+    assert result == {"ok": True, "initialized": True}
+    mock_continue.assert_awaited_once_with("unit_test")
+    mock_ensure.assert_awaited_once_with(reason="unit_test")
+    mock_start_workers.assert_called_once_with()
+
+
+@pytest.mark.unit
+def test_facts_sync_worker_start_failure_is_logged_as_warning():
+    from app import main_server
+
+    facts_error = RuntimeError("facts worker failed")
+    create_task = Mock(side_effect=facts_error)
+
+    with (
+        patch(
+            "main_logic.facts_sync.start_facts_sync_worker",
+            Mock(return_value=object()),
+        ),
+        patch(
+            "main_logic.client_registration.ensure_client_registered",
+            Mock(return_value=object()),
+        ),
+        patch.object(main_server.asyncio, "create_task", create_task),
+        patch.object(main_server.logger, "warning") as warning,
+        patch.object(main_server, "_facts_sync_worker_task", None),
+        patch.object(main_server, "_client_registration_task", None),
+    ):
+        main_server._start_neko_servers_integration_workers()
+
+    # Both workers share the same create_task mock, both log warnings
+    assert warning.call_count == 2
+    warning.assert_any_call(
+        "[client_registration] bootstrap failed: %s",
+        facts_error,
+    )
+    warning.assert_any_call(
+        "[facts_sync] start worker failed: %s",
+        facts_error,
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_stop_integration_workers_cancels_facts_sync_task():
+    from app import main_server
+
+    async def wait_forever():
+        await asyncio.Event().wait()
+
+    facts_task = asyncio.create_task(wait_forever())
+    await asyncio.sleep(0)
+
+    with patch.object(main_server, "_facts_sync_worker_task", facts_task):
+        await main_server._stop_neko_servers_integration_workers()
+        assert main_server._facts_sync_worker_task is None
+
+    assert facts_task.cancelled()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "method",
+    ("GET", "POST", "OPTIONS"),
+)
+def test_card_drop_active_character_is_allowed_during_limited_mode(method):
+    from app import main_server
+
+    assert main_server._is_main_limited_mode_allowed_path(
+        "/api/card-drop/active-character",
+        method,
+    )
 
 
 @pytest.mark.unit
@@ -558,10 +918,13 @@ def test_main_server_limited_mode_middleware_blocks_runtime_routes():
          patch.object(main_server, "_runtime_startup_init_completed", False), \
          patch.object(main_server, "_main_runtime_limited_mode_enabled", True), \
          patch.object(main_server, "_main_runtime_limited_mode_reason", "selection_required"):
-        with TestClient(main_server.app) as client:
+        with TestClient(main_server.app, base_url="http://127.0.0.1:48911", client=("127.0.0.1", 50000)) as client:
             blocked_response = client.get("/api/config/page_config")
             health_response = client.get("/health")
             steam_language_response = client.get("/api/config/steam_language")
+            active_character_response = client.get(
+                "/api/card-drop/active-character"
+            )
 
     assert blocked_response.status_code == 409
     payload = blocked_response.json()
@@ -570,6 +933,52 @@ def test_main_server_limited_mode_middleware_blocks_runtime_routes():
     assert payload["limited_mode"] is True
     assert health_response.status_code == 200
     assert steam_language_response.status_code == 200
+    assert "uiLanguage" in steam_language_response.json()
+    assert active_character_response.status_code == 200
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("encoded_path", "escaped_control", "raw_control"),
+    [
+        ("/blocked/%1B%5B31m", r"\x1b", "\x1b"),
+        ("/blocked/%00", r"\x00", "\x00"),
+        ("/blocked/%C2%85", r"\x85", "\x85"),
+        ("/blocked/%E2%80%A8", r"\u2028", "\u2028"),
+    ],
+)
+def test_main_server_limited_mode_log_escapes_control_characters(
+    encoded_path,
+    escaped_control,
+    raw_control,
+):
+    from app import main_server
+
+    with (
+        patch.object(main_server, "_IS_MAIN_PROCESS", False),
+        patch.object(main_server, "_runtime_startup_init_completed", False),
+        patch.object(main_server, "_main_runtime_limited_mode_enabled", True),
+        patch.object(
+            main_server,
+            "_main_runtime_limited_mode_reason",
+            "selection_required",
+        ),
+        patch.object(main_server.logger, "info") as mock_info,
+    ):
+        with TestClient(main_server.app, base_url="http://127.0.0.1:48911", client=("127.0.0.1", 50000)) as client:
+            response = client.get(encoded_path)
+
+    log_call = next(
+        call
+        for call in mock_info.call_args_list
+        if call.args
+        and call.args[0].startswith("[Main] limited-mode blocks request path=")
+    )
+    rendered = log_call.args[0] % log_call.args[1:]
+
+    assert response.status_code == 409
+    assert raw_control not in rendered
+    assert escaped_control in rendered
 
 
 @pytest.mark.unit
@@ -590,6 +999,119 @@ async def test_release_storage_startup_barrier_restores_memory_limited_mode_when
 
     mock_continue.assert_awaited_once_with("unit_test")
     mock_ensure.assert_awaited_once_with(reason="unit_test")
+    mock_block.assert_awaited_once_with("unit_test:main_server_init_failed")
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_release_storage_startup_barrier_reblocks_memory_before_propagating_cancellation():
+    """Cancellation must not expose initialized memory against rolled-back storage."""
+    from app import main_server
+
+    init_started = asyncio.Event()
+    block_started = asyncio.Event()
+    allow_block = asyncio.Event()
+
+    async def _wait_for_cancel(*, reason: str):
+        init_started.set()
+        await asyncio.Event().wait()
+
+    async def _block_memory(reason: str):
+        block_started.set()
+        await allow_block.wait()
+
+    with patch.object(
+        main_server,
+        "_request_memory_server_continue_startup",
+        AsyncMock(return_value=None),
+    ), patch.object(
+        main_server,
+        "_ensure_main_server_runtime_initialized",
+        side_effect=_wait_for_cancel,
+    ), patch.object(
+        main_server,
+        "_request_memory_server_block_startup",
+        side_effect=_block_memory,
+    ) as mock_block, patch.object(
+        main_server,
+        "_main_runtime_limited_mode_enabled",
+        False,
+    ), patch.object(
+        main_server,
+        "_main_runtime_limited_mode_reason",
+        "",
+    ):
+        task = asyncio.create_task(
+            main_server.release_storage_startup_barrier(reason="unit_test")
+        )
+        await init_started.wait()
+        task.cancel()
+        await block_started.wait()
+
+        # A second cancellation must not let the storage router roll back its
+        # blocking snapshot before memory_server has restored its own guard.
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+
+        allow_block.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    mock_block.assert_awaited_once_with("unit_test:main_server_init_failed")
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_release_storage_startup_barrier_compensates_ambiguous_continue_cancellation():
+    """A cancelled continue response may hide an already-applied server request."""
+    from app import main_server
+
+    continue_applied = asyncio.Event()
+    block_started = asyncio.Event()
+
+    async def _continue_without_response(reason: str):
+        continue_applied.set()
+        await asyncio.Event().wait()
+
+    async def _block_memory(reason: str):
+        block_started.set()
+
+    with patch.object(
+        main_server,
+        "_request_memory_server_continue_startup",
+        side_effect=_continue_without_response,
+    ), patch.object(
+        main_server,
+        "_ensure_main_server_runtime_initialized",
+        AsyncMock(),
+    ) as mock_ensure, patch.object(
+        main_server,
+        "_request_memory_server_block_startup",
+        side_effect=_block_memory,
+    ) as mock_block, patch.object(
+        main_server,
+        "_main_runtime_limited_mode_enabled",
+        False,
+    ), patch.object(
+        main_server,
+        "_main_runtime_limited_mode_reason",
+        "",
+    ):
+        task = asyncio.create_task(
+            main_server.release_storage_startup_barrier(reason="unit_test")
+        )
+        await continue_applied.wait()
+        task.cancel()
+
+        [outcome] = await asyncio.gather(task, return_exceptions=True)
+        assert isinstance(outcome, asyncio.CancelledError)
+
+        assert block_started.is_set()
+        assert main_server._main_runtime_limited_mode_enabled is True
+        assert main_server._main_runtime_limited_mode_reason == "runtime_initialization_failed"
+
+    mock_ensure.assert_not_awaited()
     mock_block.assert_awaited_once_with("unit_test:main_server_init_failed")
 
 
@@ -626,9 +1148,9 @@ async def test_memory_server_continue_startup_preserves_409_blocking_payload():
 async def test_memory_server_startup_stays_limited_when_storage_barrier_is_blocking():
     from app import memory_server
 
-    with patch.object(memory_server, "_config_manager", SimpleNamespace()), \
-         patch.object(memory_server, "get_storage_startup_blocking_reason", Mock(return_value="selection_required")), \
-         patch.object(memory_server, "ensure_memory_server_runtime_initialized", AsyncMock()) as mock_ensure_runtime:
+    with patch.object(memory_server.runtime, "_config_manager", SimpleNamespace()), \
+         patch.object(memory_server.runtime, "get_storage_startup_blocking_reason", Mock(return_value="selection_required")), \
+         patch.object(memory_server.runtime, "ensure_memory_server_runtime_initialized", AsyncMock()) as mock_ensure_runtime:
         await memory_server.startup_event_handler()
 
     mock_ensure_runtime.assert_not_awaited()
@@ -639,9 +1161,9 @@ async def test_memory_server_startup_stays_limited_when_storage_barrier_is_block
 async def test_memory_server_continue_startup_refuses_active_storage_barrier():
     from app import memory_server
 
-    with patch.object(memory_server, "_config_manager", SimpleNamespace()), \
-         patch.object(memory_server, "get_storage_startup_blocking_reason", Mock(return_value="migration_pending")), \
-         patch.object(memory_server, "ensure_memory_server_runtime_initialized", AsyncMock()) as mock_ensure_runtime:
+    with patch.object(memory_server.runtime, "_config_manager", SimpleNamespace()), \
+         patch.object(memory_server.runtime, "get_storage_startup_blocking_reason", Mock(return_value="migration_pending")), \
+         patch.object(memory_server.runtime, "ensure_memory_server_runtime_initialized", AsyncMock()) as mock_ensure_runtime:
         response = await memory_server.continue_storage_startup(None)
 
     assert response.status_code == 409
@@ -655,9 +1177,9 @@ async def test_memory_server_continue_startup_refuses_active_storage_barrier():
 def test_memory_server_limited_mode_middleware_blocks_runtime_routes():
     from app import memory_server
 
-    with patch.object(memory_server, "_config_manager", SimpleNamespace()), \
-         patch.object(memory_server, "get_storage_startup_blocking_reason", Mock(return_value="selection_required")):
-        with TestClient(memory_server.app) as client:
+    with patch.object(memory_server.runtime, "_config_manager", SimpleNamespace()), \
+         patch.object(memory_server.runtime, "get_storage_startup_blocking_reason", Mock(return_value="selection_required")):
+        with TestClient(memory_server.app, base_url="http://127.0.0.1:48912", client=("127.0.0.1", 50000)) as client:
             response = client.get("/get_settings/小满")
 
     assert response.status_code == 409
@@ -671,10 +1193,10 @@ def test_memory_server_limited_mode_middleware_blocks_runtime_routes():
 def test_memory_server_limited_mode_middleware_blocks_until_runtime_init_completes():
     from app import memory_server
 
-    with patch.object(memory_server, "_config_manager", SimpleNamespace()), \
-         patch.object(memory_server, "_memory_runtime_init_completed", False), \
-         patch.object(memory_server, "get_storage_startup_blocking_reason", Mock(side_effect=["selection_required", ""])):
-        with TestClient(memory_server.app) as client:
+    with patch.object(memory_server.runtime, "_config_manager", SimpleNamespace()), \
+         patch.object(memory_server.runtime, "_memory_runtime_init_completed", False), \
+         patch.object(memory_server.runtime, "get_storage_startup_blocking_reason", Mock(side_effect=["selection_required", ""])):
+        with TestClient(memory_server.app, base_url="http://127.0.0.1:48912", client=("127.0.0.1", 50000)) as client:
             response = client.get("/get_settings/小满")
 
     assert response.status_code == 409
@@ -688,16 +1210,16 @@ def test_memory_server_limited_mode_middleware_blocks_until_runtime_init_complet
 def test_memory_server_block_startup_endpoint_restores_limited_mode():
     from app import memory_server
 
-    with patch.object(memory_server, "_memory_runtime_init_completed", True), \
-         patch.object(memory_server, "_memory_storage_blocked_after_init", False), \
-         patch.object(memory_server, "get_storage_startup_blocking_reason", Mock(return_value="")):
-        with TestClient(memory_server.app) as client:
+    with patch.object(memory_server.runtime, "_memory_runtime_init_completed", True), \
+         patch.object(memory_server.runtime, "_memory_storage_blocked_after_init", False), \
+         patch.object(memory_server.runtime, "get_storage_startup_blocking_reason", Mock(return_value="")):
+        with TestClient(memory_server.app, base_url="http://127.0.0.1:48912", client=("127.0.0.1", 50000)) as client:
             response = client.post(
                 "/internal/storage/startup/block",
                 json={"reason": "main_failed"},
             )
             blocked_response = client.get("/get_settings/小满")
-            runtime_completed_during_block = memory_server._memory_runtime_init_completed
+            runtime_completed_during_block = memory_server.runtime._memory_runtime_init_completed
 
     assert response.status_code == 200
     payload = response.json()
@@ -730,9 +1252,9 @@ async def test_main_server_cancel_workshop_background_tasks_uses_public_api():
 
 @pytest.mark.unit
 def test_main_server_resets_sync_shutdown_events_after_startup_rollback():
-    """``_reset_sync_connector_shutdown_events`` 现在是 no-op：cross_server 改成
-    主 loop 上的 asyncio.Task 后，没有 ThreadEvent 可以 reset。函数保留是为了
-    避免改动文件内众多调用点，本测试只验证它仍可调用且不会抛异常。
+    """``_reset_sync_connector_shutdown_events`` is now a no-op: after cross_server became
+    an asyncio.Task on the main loop, no ThreadEvent remains to reset. Retain the function
+    to avoid changing its many call sites in this file; verify only that it remains callable without raising.
     """
     from app import main_server
     from app.main_server import _SyncMessageQueue
@@ -744,9 +1266,9 @@ def test_main_server_resets_sync_shutdown_events_after_startup_rollback():
         )
     }
 
-    with patch.object(main_server, "role_state", role_state):
-        # 不抛异常即视为通过；旧版会清 threading.Event，新版无状态可清。
-        # 显式断言返回值为 None，未来若改成有副作用返回时能更早暴露。
+    with patch.object(main_server.character_runtime, "role_state", role_state):
+        # Passing means no exception: the old version cleared threading.Event, while the new one has no state to clear.
+        # Explicitly assert a None return so future changes to a side-effect-bearing return surface earlier.
         assert main_server._reset_sync_connector_shutdown_events() is None
 
 
@@ -764,7 +1286,7 @@ async def test_main_server_shutdown_releases_live_sessions_then_uploads_existing
          patch.object(main_server, "_preload_task", None), \
          patch.object(main_server, "agent_event_bridge", None), \
          patch.object(main_server, "steamworks", existing_steamworks), \
-         patch.object(main_server, "role_state", _role_state_from_session_managers({"角色A": manager_with_resampler, "角色B": object(), "空槽": None})), \
+         patch.object(main_server.character_runtime, "role_state", _role_state_from_session_managers({"角色A": manager_with_resampler, "角色B": object(), "空槽": None})), \
          patch.object(main_server, "_run_cloudsave_manager_action", run_cloudsave_action), \
          patch("main_routers.characters_router.release_memory_server_character", AsyncMock(return_value=True)) as mock_release, \
          patch("utils.language_utils.aclose_translation_service", AsyncMock(return_value=None), create=True), \
@@ -795,7 +1317,7 @@ async def test_main_server_shutdown_continues_when_memory_release_returns_false(
          patch.object(main_server, "_preload_task", None), \
          patch.object(main_server, "agent_event_bridge", None), \
          patch.object(main_server, "steamworks", None), \
-         patch.object(main_server, "role_state", _role_state_from_session_managers({"角色A": object(), "角色B": object()})), \
+         patch.object(main_server.character_runtime, "role_state", _role_state_from_session_managers({"角色A": object(), "角色B": object()})), \
          patch.object(main_server, "_run_cloudsave_manager_action", AsyncMock()) as run_cloudsave_action, \
          patch("main_routers.characters_router.release_memory_server_character", AsyncMock(side_effect=[True, False])) as mock_release, \
          patch("utils.language_utils.aclose_translation_service", AsyncMock(return_value=None), create=True), \
@@ -861,7 +1383,7 @@ async def test_main_server_shutdown_requests_memory_server_stop_after_snapshot_u
          patch.object(main_server, "_preload_task", None), \
          patch.object(main_server, "agent_event_bridge", None), \
          patch.object(main_server, "steamworks", None), \
-         patch.object(main_server, "role_state", _role_state_from_session_managers({})), \
+         patch.object(main_server.character_runtime, "role_state", _role_state_from_session_managers({})), \
          patch.object(main_server, "_run_cloudsave_manager_action", AsyncMock()) as run_cloudsave_action, \
          patch.object(main_server, "get_start_config", Mock(return_value=start_config)), \
          patch.object(main_server, "_request_memory_server_shutdown", AsyncMock(side_effect=_fake_request_shutdown)) as mock_request_shutdown, \
@@ -877,3 +1399,92 @@ async def test_main_server_shutdown_requests_memory_server_stop_after_snapshot_u
     )
     assert start_config["shutdown_memory_server_on_exit"] is False
     mock_request_shutdown.assert_awaited_once_with()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_main_shutdown_uses_one_cancel_budget_for_all_steps(monkeypatch):
+    """Budget exhaustion skips later async cleanup and preserves the cancel."""
+    from app import main_server
+
+    monkeypatch.setattr(main_server, "_SHUTDOWN_CANCELLED_BUDGET_SECONDS", 0.05)
+    cleanup_order = []
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    def record(name):
+        async def step(*args, **kwargs):
+            cleanup_order.append(name)
+            if name == "voice":
+                entered.set()
+                await release.wait()
+        return step
+
+    with _patched_shutdown_steps(cleanup_order, record):
+        caller = asyncio.create_task(main_server.on_shutdown())
+        await entered.wait()
+        caller.cancel("exit")
+        done, _ = await asyncio.wait({caller}, timeout=0.5)
+        try:
+            assert done, "on_shutdown must pass the shared budget to every step"
+            with pytest.raises(asyncio.CancelledError, match="exit"):
+                caller.result()
+            assert cleanup_order == ["voice", "cleanup", "token"]
+        finally:
+            release.set()
+            await asyncio.gather(
+                caller, *list(main_server._SHUTDOWN_STEP_TASKS), return_exceptions=True
+            )
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_cloudsave_budget_exceeded_logs_only_the_specific_warning():
+    from app import main_server
+
+    def record(name):
+        async def step(*args, **kwargs):
+            if name == "cloudsave":
+                raise main_server.CloudsaveDeadlineExceeded(operation="upload_existing_snapshot", stage="write")
+        return step
+
+    with _patched_shutdown_steps([], record), \
+         patch.object(main_server.logger, "warning") as warning_log, \
+         patch.object(main_server.logger, "info") as info_log:
+        await main_server.on_shutdown()
+    assert len(warning_log.call_args_list) == 1
+    assert "upload exceeded 5.0s budget" in warning_log.call_args.args[0]
+    assert not any("staged snapshot upload:" in str(c.args[0]) for c in info_log.call_args_list)
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_normal_shutdown_waits_for_slow_voice_cleanup():
+    """Multi-manager voice cleanup must finish before later resources close."""
+    from app import main_server
+
+    cleanup_order: list[str] = []
+    voice_finished = False
+
+    def _record(name):
+        async def _step(*_args, **_kwargs):
+            nonlocal voice_finished
+            cleanup_order.append(name)
+            if name == "voice":
+                await asyncio.sleep(5.1)
+                voice_finished = True
+            else:
+                assert voice_finished, "later cleanup raced unfinished voice cleanup"
+
+        return _step
+
+    def _cleanup():
+        assert voice_finished, "synchronous cleanup raced unfinished voice cleanup"
+        cleanup_order.append("cleanup")
+
+    with _patched_shutdown_steps(cleanup_order, _record), patch.object(
+        main_server, "cleanup", Mock(side_effect=_cleanup),
+    ):
+        await asyncio.wait_for(main_server.on_shutdown(), timeout=10.0)
+
+    assert voice_finished
+    assert cleanup_order == _SHUTDOWN_CLEANUP_ORDER

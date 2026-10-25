@@ -1,71 +1,19 @@
 # 設定ファイル
 
-設定ファイルはユーザーのドキュメントディレクトリ内の `N.E.K.O/` に保存されます。
+N.E.K.O. は書き込み可能な user data と repository 同梱 defaults を分離します。
 
-## ファイルの場所
+既定の data root:
 
-| ファイル | 用途 |
-|----------|------|
-| `core_config.json` | API キー、プロバイダー選択、カスタムエンドポイント |
-| `characters.json` | キャラクター定義とパーソナリティデータ |
-| `user_preferences.json` | UI 設定、モデル選択 |
-| `voice_storage.json` | カスタム音声設定 |
-| `workshop_config.json` | Steam Workshop 設定 |
+- Windows: `%LOCALAPPDATA%\N.E.K.O`
+- macOS: `~/Library/Application Support/N.E.K.O`
+- Linux: `$XDG_DATA_HOME/N.E.K.O`、未設定時 `~/.local/share/N.E.K.O`
 
-## `core_config.json`
+ユーザーが別の保存場所を選んでいる場合があります。診断時は現在の storage location を確認してください。
 
-主要なランタイム設定ファイルです。
+選択した root の `config/` には `core_config.json`、`characters.json`、`user_preferences.json`、`voice_storage.json`、`workshop_config.json` などがあります。機能が追加ファイルを作る場合もあります。通常は current schema を扱う Web UI で編集します。
 
-```json
-{
-  "coreApiKey": "",
-  "coreApi": "qwen",
-  "assistApi": "qwen",
-  "assistApiKeyQwen": "",
-  "assistApiKeyOpenai": "",
-  "assistApiKeyGlm": "",
-  "assistApiKeyStep": "",
-  "assistApiKeySilicon": "",
-  "assistApiKeyGemini": "",
-  "mcpToken": "",
-  "agentModelUrl": "",
-  "agentModelId": "",
-  "agentModelApiKey": ""
-}
-```
+Repository の `config/` は user data ではありません。`api_providers.json`、8 locale の `characters/*.json`、Python defaults を含みます。`utils/config_manager/` が初回に対応 defaults を移行し、その後は data root に書き込みます。
 
-## `characters.json`
+Character identifier/display name は active data から来ます。予約済み avatar data は `_reserved.avatar` にあり、legacy top-level `live2d` は互換用に残る場合があります。翻訳表示名を stable ID にしないでください。
 
-すべてのキャラクターとマスター（オーナー）プロフィールを定義します。
-
-```json
-{
-  "master": {
-    "档案名": "哥哥",
-    "性别": "男",
-    "昵称": "哥哥"
-  },
-  "catgirl": {
-    "小天": {
-      "性别": "女",
-      "年龄": 15,
-      "昵称": "T酱, 小T",
-      "live2d": "mao_pro",
-      "voice_id": "",
-      "system_prompt": "..."
-    }
-  }
-}
-```
-
-キャラクターフィールドは柔軟で、任意のキーと値のペアを追加でき、キャラクターのコンテキストに含まれます。
-
-## ファイル検出
-
-`ConfigManager` クラス（`utils/config_manager.py`）がファイル検出を処理します：
-
-1. ユーザーのドキュメントディレクトリを確認（`~/Documents/N.E.K.O/`）
-2. プロジェクトの `config/` ディレクトリにフォールバック
-3. 存在しない場合はデフォルトファイルを作成
-
-Windows ではドキュメントディレクトリは Windows API で解決されます。macOS/Linux では `~/Documents/` を使用します。
+手動編集前に app を停止し、data root を backup してください。個人設定と secrets は commit しません。

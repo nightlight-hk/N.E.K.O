@@ -1,31 +1,48 @@
 # -*- coding: utf-8 -*-
-"""Temporal helpers for fact / reflection 时间衰减 + 过时 block.
+# Copyright 2025-2026 Project N.E.K.O. Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
-Schema v2 contract (fact + reflection 共用，详见 config.MEMORY_SCHEMA_VERSION_CURRENT)：
+"""Temporal helpers for fact / reflection time decay + the stale block.
+
+Schema v2 contract (shared by fact + reflection; see config.MEMORY_SCHEMA_VERSION_CURRENT):
 
 - ``event_when_raw``: dict | None
-    LLM 原始输出（相对时间，不是 ISO），结构::
+    Raw LLM output (relative time, not ISO), shaped::
 
         {"start": {"offset": <int>, "unit": "minute|hour|day|week|month|year"},
          "end":   {"offset": <int>, "unit": "..."} | None}
 
-    offset 是相对 ``added_at``（即 ``created_at``）的偏移量，负数表示过去、
-    正数表示未来、0 表示"当下"。LLM 一律输出相对时间，绝不要求 ISO。
+    offset is relative to ``added_at`` (i.e. ``created_at``); negative = the
+    past, positive = the future, 0 = "now". The LLM always outputs relative
+    times, never ISO.
 - ``event_start_at`` / ``event_end_at``: ISO str | None
-    系统从 ``event_when_raw`` + ``added_at`` 计算后写盘，便于消费侧无需重新
-    解析。``state`` / ``episode`` 在缺失时由调用方兜底成 ``added_at``；
-    ``pattern`` 允许两个都为 None。
+    Computed by the system from ``event_when_raw`` + ``added_at`` and
+    persisted, so consumers need not re-parse. For ``state`` / ``episode`` the
+    caller falls back to ``added_at`` when missing; ``pattern`` may leave both
+    None.
 
-Reflection 专用字段：
+Reflection-specific field:
 
 - ``temporal_scope``: 'pattern' | 'state' | 'episode' | 'past'
-    - pattern: 持续模式 / 性格特质 / 长期偏好，永不过时
-    - state:   当前持续情境（如"最近压力大"），超 STATE_PAST_DAYS 后过时
-    - episode: 一次具体事件（如"今天通宵"），超 EPISODE_PAST_DAYS 后过时
-    - past:    历史兼容值（legacy 旧数据可能存了），render 时直接进过时 block
+    - pattern: ongoing pattern / personality trait / long-term preference, never stale
+    - state:   current ongoing situation (e.g. "stressed lately"), stale after STATE_PAST_DAYS
+    - episode: one concrete event (e.g. "pulled an all-nighter today"), stale after EPISODE_PAST_DAYS
+    - past:    legacy compatibility value (old data may carry it); rendered straight into the stale block
 
-旧数据兜底：``schema_version < 2`` 或缺失时，``temporal_scope`` 视为
-``pattern``（保守不淡出），等慢速重判循环升版本号修正。
+Legacy fallback: when ``schema_version < 2`` or missing, ``temporal_scope`` is
+treated as ``pattern`` (conservative, no fade-out) until the slow recheck loop
+upgrades the schema version.
 """
 from __future__ import annotations
 
@@ -36,7 +53,7 @@ from datetime import datetime, timedelta
 
 ALLOWED_UNITS = frozenset({'minute', 'hour', 'day', 'week', 'month', 'year'})
 
-# 月 / 年用平均日近似（reflection scope 不需要日历级别精度，差几小时无影响）
+# Approximate months/years using average days; reflection scope needs no calendar-level precision, so hours of error do not matter
 _UNIT_TO_SECONDS = {
     'minute': 60,
     'hour':   3600,
@@ -46,11 +63,11 @@ _UNIT_TO_SECONDS = {
     'year':   86400 * 365,
 }
 
-# Schema v1 (legacy) temporal_scope 值。render 时按 pattern 兜底。
+# Schema v1 legacy temporal_scope values; rendering falls back by pattern.
 LEGACY_TEMPORAL_SCOPES = frozenset({'current', 'ongoing'})
-# Schema v2 active 标签（LLM 可主动输出的）
+# Schema v2 active labels that the LLM may emit explicitly
 ACTIVE_TEMPORAL_SCOPES = frozenset({'pattern', 'state', 'episode'})
-# 全部合法 temporal_scope（含 past 派生 / legacy / new + None）
+# All valid temporal_scope values, including derived past / legacy / new + None
 ALL_TEMPORAL_SCOPES = (
     ACTIVE_TEMPORAL_SCOPES | LEGACY_TEMPORAL_SCOPES | {'past'}
 )
@@ -61,18 +78,21 @@ def cooldown_elapsed(
     cooldown_seconds: float,
     now: datetime | None = None,
 ) -> bool:
-    """dead-letter 时间冷却自愈判定：距上次失败是否已过 ``cooldown_seconds``。
+    """Dead-letter time-based self-healing check: has ``cooldown_seconds`` passed since the last failure?
 
-    用于 reflection synth / schema recheck / refine 这些"达 N 次冻结"的
-    dead-letter——冻结后每过冷却窗口放行一次 probe，让一次性持续故障
-    （模型宕机 / 维护态 / 只读 FS）恢复后自愈。memory_review **不**用本机制
-    （它靠 fingerprint 变化复位，挂机期间应一直停）。
+    For the "frozen after N attempts" dead-letters — reflection synth / schema
+    recheck / refine: once frozen, let one probe through per cooldown window so
+    that a one-off persistent failure (model down / maintenance mode /
+    read-only FS) self-heals after recovery. memory_review does **not** use
+    this mechanism (it resets via fingerprint changes and should stay stopped
+    while idle).
 
-    返回 True = 冷却已过 / 无时间基准，可放行 probe。
+    Returns True = cooldown elapsed / no time basis; the probe may pass.
 
-    ``last_at_iso`` 为空或无法解析 → 返回 True：没有时间戳通常是旧数据或
-    首次冻结前的遗留，给一次 probe 比永久冻死更安全（probe 失败会写回
-    时间戳，下次就按正常冷却计时）。
+    Empty or unparsable ``last_at_iso`` → True: a missing timestamp is usually
+    legacy data or pre-first-freeze leftovers; granting one probe is safer
+    than freezing forever (a failed probe writes the timestamp back, and the
+    next round follows the normal cooldown).
     """
     if not last_at_iso:
         return True
@@ -82,20 +102,20 @@ def cooldown_elapsed(
         return True
     if now is None:
         now = datetime.now()
-    # aware/naive 归一：写入路径都用 datetime.now()（naive），但迁移 / import
-    # 数据可能塞进 +00:00 / Z 的 aware ISO，直接和 naive now 相减会抛
-    # TypeError 中断冷却判定。复用全项目 tz 归一口径 to_naive_local（保瞬时）。
+    # Normalize aware/naive times: writes use naive datetime.now(), but migration/import
+    # may provide aware ISO values with +00:00 / Z; subtracting naive now directly raises
+    # TypeError and interrupts cooldown checks. Reuse project-wide to_naive_local normalization, preserving the instant.
     last = to_naive_local(last)
     now = to_naive_local(now)
     return (now - last).total_seconds() >= cooldown_seconds
 
 
-# ── offset spec 解析 ──────────────────────────────────────────────────
+# ── Offset-spec parsing ──────────────────────────────────────────────────
 
 def _validate_offset_spec(spec: object) -> dict | None:
     """Validate ``{'offset': int, 'unit': str}``. Returns canonical dict or None.
 
-    Tolerant to ``offset=0`` (= 当下) and negative offsets (= 过去)。
+    Tolerant to ``offset=0`` (= now) and negative offsets (= the past).
     """
     if not isinstance(spec, dict):
         return None
@@ -147,14 +167,16 @@ def compute_event_timestamps(
 ) -> tuple[str | None, str | None]:
     """Compute ``(event_start_at, event_end_at)`` from raw + anchor.
 
-    Fallback semantics（写入时由调用方指定）:
+    Fallback semantics (specified by the caller at write time):
 
     - ``pattern``: fallback_start=True, fallback_end=False
-        （持续模式可无 end；start 缺失也兜底成 added_at 以便统一时间标签）
+        (an ongoing pattern may lack an end; a missing start still falls back
+        to added_at for uniform time labels)
     - ``state`` / ``episode``: fallback_start=True, fallback_end=True
-        （TTL 判定需要 end；end 缺失时与 start 同值 = "事件当下结束"）
-    - ``fact``: 通常 fallback_start=True, fallback_end=False
-        （fact 没有 temporal_scope，事件 end 可选）
+        (the TTL judgment needs an end; a missing end takes the start value =
+        "the event ends right then")
+    - ``fact``: usually fallback_start=True, fallback_end=False
+        (facts have no temporal_scope; the event end is optional)
     """
     norm = normalize_event_when(event_when_raw)
     start_iso = _offset_to_iso(added_at_iso, norm['start']) if norm else None
@@ -162,12 +184,12 @@ def compute_event_timestamps(
     if start_iso is None and fallback_start:
         start_iso = added_at_iso
     if end_iso is None and fallback_end:
-        # end 兜底优先用 start，再回退 added_at
+        # For end fallback, prefer start, then added_at
         end_iso = start_iso or added_at_iso
     return start_iso, end_iso
 
 
-# ── past 派生判定 ─────────────────────────────────────────────────────
+# ── Derived-past evaluation ─────────────────────────────────────────────────────
 
 def _parse_iso_safe(iso: str | None) -> datetime | None:
     if not iso:
@@ -179,30 +201,61 @@ def _parse_iso_safe(iso: str | None) -> datetime | None:
 
 
 def to_naive_local(dt: datetime | None) -> datetime | None:
-    """aware datetime → 本地 naive（先 astimezone 转本地再剥 tz，保留瞬时
-    而非墙钟）；naive / None 原样返回。
+    """aware datetime → local naive (astimezone to local first, then strip tz —
+    preserving the instant rather than the wall clock); naive / None returned
+    as-is.
 
-    全项目 tz 归一口径：本仓库时间戳都按 naive 本地时钟写盘，但 import /
-    迁移路径可能塞进 ``+00:00`` / ``Z`` 的 aware 值。直接 ``replace(tzinfo
-    =None)`` 会把 UTC 墙钟当本地用，在非 UTC 机器上整体偏移一个 offset，
-    害 day 级窗口/排序在日界处归错天（Codex）。这里统一转换。
+    Project-wide tz normalization: this repo persists timestamps as naive
+    local-clock values, but import / migration paths may inject aware values
+    with ``+00:00`` / ``Z``. A bare ``replace(tzinfo=None)`` would treat the
+    UTC wall clock as local, shifting everything by an offset on non-UTC
+    machines and mis-bucketing day-level windows/sorts at day boundaries
+    (Codex). Convert uniformly here.
     """
     if dt is not None and dt.tzinfo is not None:
         try:
             return dt.astimezone().replace(tzinfo=None)
         except (OverflowError, OSError, ValueError):
-            # 边界 aware 值（如 0001-01-01+14:00 / 9999-12-31-14:00）astimezone
-            # 加减 offset 会越过 datetime.min/max 抛 OverflowError，不能让它冒到
-            # parse_time_window / 渲染链路（Codex）。退而求其次直接剥 tz（保墙钟）。
+            # With boundary aware values (such as 0001-01-01+14:00 / 9999-12-31-14:00), astimezone's
+            # offset arithmetic can exceed datetime.min/max and raise OverflowError; do not propagate into
+            # parse_time_window or rendering (Codex). Fall back to stripping timezone while preserving wall-clock time.
             return dt.replace(tzinfo=None)
     return dt
 
 
-def _past_anchor(entry: dict) -> datetime | None:
-    """past 判定用的时间锚点（end > start > added > created）。
+def explicit_event_window(entry: dict) -> tuple[str | None, str | None]:
+    """Return persisted event bounds, excluding synthesis-time fallbacks.
 
-    优先级和 ``time_since_label`` 一致——past 是"距 anchor 多久"，渲染时也
-    用同一 anchor 算"多久前"，保证两者口径一致。
+    Reflection synthesis fills missing bounds from ``created_at`` so render
+    and expiry code always has an anchor.  Those ingestion timestamps are not
+    an explicit event window and must not become one merely because a derived
+    row receives a newer ``created_at``.
+    """
+    if not isinstance(entry, dict):
+        return None, None
+    raw_start = entry.get('event_start_at')
+    raw_end = entry.get('event_end_at')
+    start = to_naive_local(_parse_iso_safe(raw_start))
+    end = to_naive_local(_parse_iso_safe(raw_end))
+    created = to_naive_local(_parse_iso_safe(entry.get('created_at')))
+    if (
+        not entry.get('event_when_raw')
+        and start == created
+        and (end is None or end == created)
+    ):
+        return None, None
+    return (
+        raw_start if start is not None else None,
+        raw_end if end is not None else None,
+    )
+
+
+def _past_anchor(entry: dict) -> datetime | None:
+    """Time anchor for past judgment (end > start > added > created).
+
+    The priority matches ``time_since_label`` — past is "how long since the
+    anchor", and rendering computes "how long ago" with the same anchor,
+    keeping the two consistent.
     """
     return (
         _parse_iso_safe(entry.get('event_end_at'))
@@ -213,16 +266,16 @@ def _past_anchor(entry: dict) -> datetime | None:
 
 
 def is_past_for_render(entry: dict, now: datetime | None = None) -> bool:
-    """根据 temporal_scope + event 时间戳推导是否进过时 block。
+    """Derive from temporal_scope + event timestamps whether the entry goes into the stale block.
 
     Rules:
 
-    - ``stored temporal_scope == 'past'`` (legacy 或新写入) → True
-    - ``state``    + (event_end_at or event_start_at) 距今 > STATE_PAST_DAYS → True
-    - ``episode``  + 同上 > EPISODE_PAST_DAYS → True
-    - ``pattern``  → False（持续模式永不过时，除非显式存 past）
-    - ``current`` / ``ongoing`` / None (legacy v1) → False（按 pattern 兜底，
-      等慢速循环重判）
+    - ``stored temporal_scope == 'past'`` (legacy or newly written) → True
+    - ``state``    + (event_end_at or event_start_at) older than STATE_PAST_DAYS → True
+    - ``episode``  + same, older than EPISODE_PAST_DAYS → True
+    - ``pattern``  → False (ongoing patterns never go stale unless explicitly stored as past)
+    - ``current`` / ``ongoing`` / None (legacy v1) → False (falls back to
+      pattern until the slow loop re-judges)
     """
     from config import MEMORY_STATE_PAST_DAYS, MEMORY_EPISODE_PAST_DAYS
     if now is None:
@@ -238,22 +291,23 @@ def is_past_for_render(entry: dict, now: datetime | None = None) -> bool:
     ttl_days = ttl_by_scope.get(ts)
     if ttl_days is None:
         return False
-    # to_naive_local：anchor 可能是 import/迁移写进来的 aware 值，和 naive
-    # now 相减会 TypeError 把过时判定/渲染链路打断（CodeRabbit）。
+    # to_naive_local: anchors may be aware values from imports/migrations; subtracting naive
+    # now raises TypeError, interrupting staleness evaluation/rendering (CodeRabbit).
     anchor = to_naive_local(_past_anchor(entry))
     if anchor is None:
         return False
     return (now - anchor).total_seconds() > ttl_days * 86400
 
 
-# ── 距今多久 label（per Q-α: 0-6d 天 / 7-29d 周 / 30d+ 月） ──────────
+# ── Time-since labels (Q-α: 0–6d days / 7–29d weeks / 30d+ months) ──────────
 
 def days_since(anchor_iso: str | None, now: datetime | None = None) -> int | None:
-    """Return integer days from anchor to now（向下取整，0 day 也合法）。
+    """Return integer days from anchor to now (floored; 0 days is valid).
 
-    anchor 可能是 tz-aware（import / 迁移路径会写 ``...+00:00`` / ``...Z``），
-    而 ``now`` 是 naive 本地时钟——直接相减会 ``TypeError``。这里把 aware
-    anchor 先转本地再剥 tz，naive 的照旧，保证两侧同为 naive 可减（Codex）。
+    anchor may be tz-aware (import / migration paths write ``...+00:00`` /
+    ``...Z``) while ``now`` is the naive local clock — subtracting directly
+    would ``TypeError``. Convert an aware anchor to local then strip tz, leave
+    naive ones alone, so both sides are naive and subtractable (Codex).
     """
     if now is None:
         now = datetime.now()
@@ -264,8 +318,14 @@ def days_since(anchor_iso: str | None, now: datetime | None = None) -> int | Non
     return max(0, int((now - anchor).total_seconds() // 86400))
 
 
+# Mixed key forms are intentional: other locales use short codes, traditional Chinese uses full 'zh-TW'. Both callers
+# (get_global_language_full() in memory/persona/rendering.py and _normalize_memory_prompt_lang
+# (keep_traditional=True) in main_logic/core/tool_calling.py) supply
+# 'zh-TW'; shortening to 'zh' makes traditional entries unreachable. Do not unify these into short codes.
+# Simplified Chinese supplies 'zh-CN' and reaches 'zh' through time_since_label's or-fallback; no separate entry is needed.
 _TIME_LABELS = {
     'zh': {'now': '当下',  'day': '{n} 天前',   'week': '{n} 周前',   'month': '{n} 月前'},
+    'zh-TW': {'now': '當下', 'day': '{n} 天前',  'week': '{n} 週前',   'month': '{n} 個月前'},
     'en': {'now': 'now',    'day': '{n}d ago',   'week': '{n}w ago',   'month': '{n}mo ago'},
     'ja': {'now': '今',    'day': '{n} 日前',   'week': '{n} 週間前', 'month': '{n} ヶ月前'},
     'ko': {'now': '지금',  'day': '{n}일 전',   'week': '{n}주 전',   'month': '{n}개월 전'},
@@ -281,15 +341,15 @@ def time_since_label(
     now: datetime | None = None,
     lang: str = 'zh',
 ) -> str:
-    """格式化 [距今多久] 标签（Q-α 决策的口径）。
+    """Format the [time since] label (semantics decided in Q-α).
 
-    - 0 天     → "当下"（locale 化）
-    - 1-6 天   → "{n} 天前"
-    - 7-29 天  → "{n // 7} 周前"
-    - 30 天+   → "{n // 30} 月前"
+    - 0 days    → \"当下\" (localized \"right now\")
+    - 1-6 days  → \"{n} 天前\" (n days ago)
+    - 7-29 days → \"{n // 7} 周前\" (weeks ago)
+    - 30+ days  → \"{n // 30} 月前\" (months ago)
 
-    anchor 无法解析时返回空字符串。
-    """
+    Returns an empty string when the anchor cannot be parsed.
+    """  # noqa: DOCSTRING_CJK
     days = days_since(anchor_iso, now=now)
     if days is None:
         return ""
@@ -303,19 +363,19 @@ def time_since_label(
     return table['month'].format(n=days // 30)
 
 
-# ── 时间窗口解析（recall_memory 的 time 参数 / 按时间回溯反思） ────────
+# ── Time-window parsing (recall_memory time parameter / historical reflection lookup) ────────
 
 def _token_window(token: str) -> tuple[datetime, datetime] | None:
-    """把单个时间 token 解析成 [start, end) 半开区间（naive 本地时钟）。
+    """Parse a single time token into a [start, end) half-open interval (naive local clock).
 
-    粒度由 token 形态决定（从细到粗）：
-      - ``YYYY-MM-DDTHH`` / ``YYYY-MM-DD HH`` → 整点小时 [HH:00, HH+1:00)
-      - 带分秒的 ISO（``2026-05-01T14:30:00``）→ 向下取整到所在那一小时
-      - ``YYYY-MM-DD`` → 当日 [d 00:00, 次日 00:00)
-      - ``YYYY-MM``    → 整月 [月初, 次月初)
-      - ``YYYY``       → 整年 [年初, 次年初)
+    Granularity follows the token shape (fine to coarse):
+      - ``YYYY-MM-DDTHH`` / ``YYYY-MM-DD HH`` → the whole hour [HH:00, HH+1:00)
+      - ISO with minutes/seconds (``2026-05-01T14:30:00``) → floored to its hour
+      - ``YYYY-MM-DD`` → that day [d 00:00, next day 00:00)
+      - ``YYYY-MM``    → the whole month [month start, next month start)
+      - ``YYYY``       → the whole year [year start, next year start)
 
-    无法解析返回 None。
+    Returns None when unparsable.
     """
     token = (token or "").strip()
     if not token:
@@ -326,22 +386,22 @@ def _token_window(token: str) -> tuple[datetime, datetime] | None:
             else x.replace(month=x.month + 1)
 
     def _commit(start: datetime, end_fn) -> tuple[datetime, datetime] | None:
-        # 一旦某个格式 strptime 命中，就锁定该粒度：右界运算（+1 小时/天 /
-        # 年月进位）越过 datetime.max 抛 OverflowError/ValueError 时返回 None，
-        # 不再降级到更细粒度（否则 9999-12-31 会被下面的小时兜底误救成 1 小时
-        # 窗），也不把异常冒到上层（Codex）。
+        # Once strptime matches a format, lock its granularity: if right-bound arithmetic (+1 hour/day /
+        # month/year carry) exceeds datetime.max and raises OverflowError/ValueError, return None,
+        # without falling back to finer granularity (which would incorrectly rescue 9999-12-31 as a one-hour
+        # window through the hourly fallback below), and without propagating exceptions (Codex).
         try:
             return (start, end_fn(start))
         except (ValueError, OverflowError):
             return None
 
-    # 精确格式从粗到细试，strptime 命中即 _commit 锁定粒度。
+    # Try exact formats from coarse to fine; a strptime match locks granularity via _commit.
     for fmt, end_fn in (
-        ('%Y-%m-%d',     lambda x: x + timedelta(days=1)),    # 整日
-        ('%Y-%m-%dT%H',  lambda x: x + timedelta(hours=1)),   # 整点小时（T）
-        ('%Y-%m-%d %H',  lambda x: x + timedelta(hours=1)),   # 整点小时（空格）
-        ('%Y-%m',        _next_month),                        # 整月
-        ('%Y',           lambda x: x.replace(year=x.year + 1)),  # 整年
+        ('%Y-%m-%d',     lambda x: x + timedelta(days=1)),    # Full day
+        ('%Y-%m-%dT%H',  lambda x: x + timedelta(hours=1)),   # Whole hour (T separator)
+        ('%Y-%m-%d %H',  lambda x: x + timedelta(hours=1)),   # Whole hour (space separator)
+        ('%Y-%m',        _next_month),                        # Full month
+        ('%Y',           lambda x: x.replace(year=x.year + 1)),  # Full year
     ):
         try:
             start = datetime.strptime(token, fmt)
@@ -349,7 +409,7 @@ def _token_window(token: str) -> tuple[datetime, datetime] | None:
             continue
         return _commit(start, end_fn)
 
-    # 兜底：带分秒的完整 ISO（含 tz）→ 向下取整到所在那一小时，精度到小时。
+    # Fallback: complete ISO with minutes/seconds and timezone → floor to its hour, yielding hourly precision.
     parsed = to_naive_local(_parse_iso_safe(token))
     if parsed is not None:
         hour = parsed.replace(minute=0, second=0, microsecond=0)
@@ -358,13 +418,15 @@ def _token_window(token: str) -> tuple[datetime, datetime] | None:
 
 
 def parse_time_window(spec: str | None) -> tuple[datetime, datetime] | None:
-    """把 recall 的 ``time`` 参数解析成 [start, end) 半开区间。
+    """Parse recall's ``time`` argument into a [start, end) half-open interval.
 
-    支持单 token（见 ``_token_window``，粒度可到小时如 ``2026-05-01T14``）或
-    区间——用 ``/`` 或 ``..`` 分隔两个 token，窗口取两端的并集
-    [min(start), max(end))，所以 ``2026-05-01/2026-05-07`` 是含两端的整周、
-    ``2026-05/2026-06`` 是两个整月、``2026-05-01T09/2026-05-01T18`` 是当天
-    9 点到 19 点。任一端解析失败则整体返回 None（调用方据此回退语义检索）。
+    Supports a single token (see ``_token_window``; granularity down to the
+    hour, e.g. ``2026-05-01T14``) or a range — two tokens separated by ``/`` or
+    ``..``, the window being the union of both ends [min(start), max(end)), so
+    ``2026-05-01/2026-05-07`` is the full week including both ends,
+    ``2026-05/2026-06`` is two whole months, ``2026-05-01T09/2026-05-01T18`` is
+    9:00 to 19:00 that day. If either end fails to parse, the whole call
+    returns None (callers then fall back to semantic recall).
     """
     if not isinstance(spec, str):
         return None
@@ -391,14 +453,16 @@ def weighted_sample_no_replace(
     *,
     rng: random.Random | None = None,
 ) -> list:
-    """无放回加权抽样 k 个。
+    """Weighted sampling of k items without replacement.
 
-    使用 Efraimidis–Spirakis 的 reservoir 算法（每条计算 ``random ** (1/w)``
-    作为 key，取最大的 k 个）—— O(n) 无需逐次重新归一化权重。
+    Uses the Efraimidis–Spirakis reservoir algorithm (compute
+    ``random ** (1/w)`` as the key per item, take the k largest) — O(n), no
+    repeated weight renormalization.
 
-    - ``weights[i] <= 0`` 的条目被强制排除（避免 ZeroDivision / 负权）。
-    - ``k >= len(items)`` 直接返回（仍按 key 排序，保证调用方拿到的顺序
-      和加权选 1 时一致）。
+    - Items with ``weights[i] <= 0`` are forcibly excluded (avoiding
+      ZeroDivision / negative weights).
+    - ``k >= len(items)`` returns directly (still sorted by key, so callers
+      get the same ordering as a weighted pick-1).
     """
     if not items:
         return []
